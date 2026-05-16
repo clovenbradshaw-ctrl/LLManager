@@ -1,5 +1,12 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import Markdown from "./Markdown.jsx";
+import {
+  AUTO_MODEL, INTENTS, INTENT_ORDER, DEFAULT_PRIORITY,
+  classifyIntent, routeModel, hashPrompt, uuid,
+  loadLog, loadWeights, saveWeights, loadPrefs, savePrefs,
+  appendLog, appendSignal, recordAlternateModel, recordFailure,
+  processImplicitSignals, runREC, shouldRunREC, routerStats, resetRouter,
+} from "./router.js";
 
 const MODEL_CATALOG = [
   { id: "gemma2:2b", params: "2B", vram: 1.5, speed: "fast", use: "Light tasks, quick responses" },
@@ -89,6 +96,11 @@ const ActBtn = ({ onClick, disabled, color, children }) => (
   }}>{children}</button>
 );
 
+const btnStyle = (bg) => ({
+  padding: "7px 14px", fontSize: 11, fontWeight: 600, borderRadius: 7, border: "none",
+  cursor: "pointer", background: bg, color: bg === C.s2 ? C.dim : "#fff",
+});
+
 const ThinkingBar = ({ label }) => (
   <div style={{ marginBottom: 12 }}>
     <div style={{ fontSize: 11, fontFamily: mono, color: C.accent, marginBottom: 5 }}>{label}</div>
@@ -106,14 +118,44 @@ const Box = ({ title, sub, children }) => (
   </div>
 );
 
-const ChatBubble = ({ message, copy, copied }) => {
+const RoutingPill = ({ routing }) => {
+  const intent = INTENTS[routing.intent] || INTENTS.general;
+  const high = routing.confidence >= 3;
+  return (
+    <span title={`confidence: ${routing.confidence} ${high ? "(high)" : "(low)"}`} style={{
+      display: "inline-flex", alignItems: "center", gap: 5, fontSize: 10, fontFamily: mono,
+      padding: "2px 8px", borderRadius: 99, background: intent.color + "22", color: intent.color, fontWeight: 600,
+    }}>
+      <span style={{ width: 6, height: 6, borderRadius: 99, boxSizing: "border-box",
+        background: high ? intent.color : "transparent", border: `1.5px solid ${intent.color}` }} />
+      {intent.icon} {intent.label} → {routing.model}
+    </span>
+  );
+};
+
+const FeedbackBtn = ({ onClick, children }) => (
+  <button onClick={onClick} style={{
+    fontSize: 11, fontFamily: mono, padding: "3px 9px", borderRadius: 6, border: `1px solid ${C.border}`,
+    cursor: "pointer", background: "transparent", color: C.dim,
+  }}>{children}</button>
+);
+
+const ChatBubble = ({ message, copy, copied, userMsgsAfter, installed, onFeedback, onRegenerate, onWrongModel, wrongModelOpen, setWrongModelFor }) => {
   const isUser = message.role === "user";
   const isAssistant = message.role === "assistant";
+  const routing = message.routing;
+  const canLearn = installed.length > 1;
+  const showFeedback = isAssistant && routing && !routing.evalDone && !routing.feedback
+    && message.content && !message.streaming && !message.error && canLearn && userMsgsAfter < 2;
   return (
     <div style={{ display: "flex", justifyContent: isUser ? "flex-end" : "flex-start", padding: "8px 0" }}>
       <div style={{ maxWidth: isUser ? "78%" : "100%", minWidth: 0 }}>
-        <div style={{ display: "flex", alignItems: "center", gap: 8, justifyContent: isUser ? "flex-end" : "flex-start", marginBottom: 4 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 8, justifyContent: isUser ? "flex-end" : "flex-start", marginBottom: 4, flexWrap: "wrap" }}>
           <span style={{ fontSize: 10, fontFamily: mono, color: C.dim, textTransform: "uppercase", letterSpacing: 0.5 }}>{isUser ? "You" : "Assistant"}</span>
+          {isAssistant && routing && <RoutingPill routing={routing} />}
+          {isAssistant && !routing && message.model && (
+            <span style={{ fontSize: 10, fontFamily: mono, color: C.dim }}>{message.model}</span>
+          )}
           {message.elapsed && <span style={{ fontSize: 10, fontFamily: mono, color: C.dim }}>{message.elapsed}s</span>}
         </div>
         <div style={{
@@ -145,6 +187,31 @@ const ChatBubble = ({ message, copy, copied }) => {
               padding: "4px 10px", fontSize: 10, fontFamily: mono, borderRadius: 6, border: "none", cursor: "pointer",
               background: copied === `msg-${message.id}` ? C.green : C.s2, color: copied === `msg-${message.id}` ? "#000" : C.dim,
             }}>{copied === `msg-${message.id}` ? "✓" : "copy"}</button>
+            <button onClick={() => onRegenerate(message)} style={{
+              padding: "4px 10px", fontSize: 10, fontFamily: mono, borderRadius: 6, border: "none", cursor: "pointer",
+              background: C.s2, color: C.dim,
+            }}>↻ regenerate</button>
+          </div>
+        )}
+        {showFeedback && (
+          <div style={{ display: "flex", gap: 6, marginTop: 6, alignItems: "center" }}>
+            <FeedbackBtn onClick={() => onFeedback(message, "up")}>👍</FeedbackBtn>
+            <FeedbackBtn onClick={() => onFeedback(message, "down")}>👎</FeedbackBtn>
+            {wrongModelOpen ? (
+              <select autoFocus defaultValue="" onChange={e => e.target.value && onWrongModel(message, e.target.value)}
+                onBlur={() => setWrongModelFor(null)}
+                style={{ fontSize: 11, fontFamily: mono, padding: "3px 6px", borderRadius: 6, background: C.s1, color: C.text, border: `1px solid ${C.border}` }}>
+                <option value="">pick correct model…</option>
+                {installed.filter(m => m.name !== routing.model).map(m => <option key={m.name} value={m.name}>{m.name}</option>)}
+              </select>
+            ) : (
+              <FeedbackBtn onClick={() => setWrongModelFor(message.id)}>🔄 Wrong model</FeedbackBtn>
+            )}
+          </div>
+        )}
+        {isAssistant && routing && routing.feedback && (
+          <div style={{ fontSize: 10, fontFamily: mono, color: C.dim, marginTop: 6 }}>
+            feedback recorded · {routing.feedback === "up" ? "👍 helpful" : "👎 not helpful"}
           </div>
         )}
       </div>
@@ -161,7 +228,7 @@ export default function App() {
   const [running, setRunning] = useState([]);
   const [hw, setHw] = useState(null);
 
-  const [model, setModel] = useState("");
+  const [model, setModel] = useState(() => (loadPrefs().autoMode ? AUTO_MODEL : ""));
   const [prompt, setPrompt] = useState("");
   const [generating, setGenerating] = useState(false);
   const [threads, setThreads] = useState(loadStoredThreads);
@@ -170,6 +237,24 @@ export default function App() {
   const [copied, setCopied] = useState(null);
   const [pulling, setPulling] = useState({}); // { [name]: { status, completed, total, error } }
   const [busy, setBusy] = useState({});       // { [name]: "load" | "unload" | "delete" }
+
+  // ── Auto-router state ──
+  const [routerWeights, setRouterWeights] = useState(loadWeights);
+  const [routerLog, setRouterLog] = useState(loadLog);
+  const [wrongModelFor, setWrongModelFor] = useState(null); // assistant message id
+  const [showLog, setShowLog] = useState(false);
+  const recRan = useRef(false);
+
+  const refreshRouter = useCallback(() => {
+    setRouterWeights(loadWeights());
+    setRouterLog(loadLog());
+  }, []);
+
+  // Run REC if enough new evaluations have accrued; refresh state afterwards.
+  const maybeRunREC = useCallback(() => {
+    if (shouldRunREC(loadWeights(), loadLog())) runREC(installed);
+    refreshRouter();
+  }, [installed, refreshRouter]);
 
   const sortedThreads = useMemo(() => [...threads].sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0)), [threads]);
   const activeThread = useMemo(() => threads.find(t => t.id === activeThreadId) || null, [threads, activeThreadId]);
@@ -241,43 +326,35 @@ export default function App() {
 
   useEffect(() => { probe(); }, [probe]);
 
-  // ── Generate (streaming) ──
-  const generate = async () => {
-    const userText = prompt.trim();
-    if (!userText || !model || generating) return;
+  // REC on app load: refresh weights once installed models are known and the
+  // log has unevaluated entries (also prunes uninstalled models / old entries).
+  useEffect(() => {
+    if (recRan.current || !installed.length) return;
+    recRan.current = true;
+    const log = loadLog();
+    if (log.length) { runREC(installed); refreshRouter(); }
+  }, [installed, refreshRouter]);
 
-    const now = Date.now();
-    const thread = activeThread || makeThread(model);
-    const threadId = thread.id;
-    const userMessage = { id: `user-${now}`, role: "user", content: userText, createdAt: now };
-    const assistantMessage = { id: `assistant-${now}`, role: "assistant", content: "", createdAt: now + 1, streaming: true, model };
-    const priorMessages = thread.messages.filter(m => !m.error && !m.streaming).map(({ role, content }) => ({ role, content }));
+  // Persist Auto-mode on/off whenever the model selection changes.
+  useEffect(() => {
+    const prefs = loadPrefs();
+    const autoMode = model === AUTO_MODEL;
+    if (model && prefs.autoMode !== autoMode) savePrefs({ ...prefs, autoMode });
+  }, [model]);
 
-    setGenerating(true);
-    setPrompt("");
-    setActiveThreadId(threadId);
-    setThreads(prev => {
-      const exists = prev.some(t => t.id === threadId);
-      const nextThread = {
-        ...thread,
-        title: thread.messages.length ? thread.title : shortTitle(userText),
-        model,
-        updatedAt: now,
-        messages: [...thread.messages, userMessage, assistantMessage],
-      };
-      return (exists ? prev.map(t => t.id === threadId ? nextThread : t) : [nextThread, ...prev]).slice(0, MAX_SAVED_THREADS);
-    });
-
+  // ── Streaming core (shared by generate + regenerate) ──
+  const streamChat = async ({ threadId, assistantId, modelName, messages }) => {
     const t0 = Date.now();
+    let full = "", usage = {};
     try {
       const r = await fetch(`${ollamaUrl}/api/chat`, {
         method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ model, messages: [...priorMessages, { role: "user", content: userText }], stream: true }),
+        body: JSON.stringify({ model: modelName, messages, stream: true }),
       });
       if (!r.ok || !r.body) throw new Error(`HTTP ${r.status}`);
       const reader = r.body.getReader();
       const decoder = new TextDecoder();
-      let buf = "", full = "", usage = {};
+      let buf = "";
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
@@ -292,9 +369,8 @@ export default function App() {
           if (j.message?.content) {
             full += j.message.content;
             updateThread(threadId, t => ({
-              ...t,
-              updatedAt: Date.now(),
-              messages: t.messages.map(m => m.id === assistantMessage.id ? { ...m, content: full, streaming: true } : m),
+              ...t, updatedAt: Date.now(),
+              messages: t.messages.map(m => m.id === assistantId ? { ...m, content: full, streaming: true } : m),
             }));
           }
           if (j.done) {
@@ -306,20 +382,199 @@ export default function App() {
           }
         }
       }
-      const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
-      updateThread(threadId, t => ({
-        ...t,
-        updatedAt: Date.now(),
-        messages: t.messages.map(m => m.id === assistantMessage.id ? { ...m, content: full, streaming: false, elapsed, usage } : m),
-      }));
+      return { ok: true, full, usage, elapsed: ((Date.now() - t0) / 1000).toFixed(1) };
     } catch (e) {
-      updateThread(threadId, t => ({
-        ...t,
-        updatedAt: Date.now(),
-        messages: t.messages.map(m => m.id === assistantMessage.id ? { ...m, content: `Error: ${e.message}`, streaming: false, error: true } : m),
-      }));
+      return { ok: false, full, error: e.message, elapsed: ((Date.now() - t0) / 1000).toFixed(1) };
     }
+  };
+
+  // ── Generate (streaming, with Auto-routing DEF phase) ──
+  const generate = async () => {
+    const userText = prompt.trim();
+    const autoMode = model === AUTO_MODEL;
+    if (!userText || generating) return;
+    if (autoMode ? installed.length === 0 : !model) return;
+
+    const now = Date.now();
+    const thread = activeThread || makeThread(model);
+    const threadId = thread.id;
+    const priorMessages = thread.messages.filter(m => !m.error && !m.streaming).map(({ role, content }) => ({ role, content }));
+
+    // EVA: implicit signals about prior auto-routed responses in this thread.
+    const implicitResults = processImplicitSignals(thread, userText, autoMode);
+    const evalDoneIds = new Set(implicitResults.map(r => r.routingId));
+
+    // DEF: classify the prompt and commit to a model when in Auto mode.
+    let routing = null, candidates = [];
+    if (autoMode) {
+      const weights = loadWeights();
+      const cls = classifyIntent(userText, installed, weights);
+      const r = routeModel(cls.intent, installed, weights);
+      candidates = r.candidates;
+      routing = { id: uuid(), intent: cls.intent, confidence: cls.confidence, model: r.model, candidates };
+      appendLog({
+        id: routing.id, timestamp: new Date().toISOString(), threadId,
+        promptHash: await hashPrompt(userText), promptLength: userText.length,
+        intent: cls.intent, confidence: cls.confidence, modelChosen: r.model,
+        candidates, evaluated: false, signals: [], alternateModel: null,
+      });
+    }
+    const chosenModel = autoMode ? routing.model : model;
+
+    const userMessage = { id: `user-${now}`, role: "user", content: userText, createdAt: now };
+    const assistantMessage = { id: `assistant-${now}`, role: "assistant", content: "", createdAt: now + 1, streaming: true, model: chosenModel, routing };
+
+    setGenerating(true);
+    setPrompt("");
+    setActiveThreadId(threadId);
+    setThreads(prev => {
+      const exists = prev.some(t => t.id === threadId);
+      const baseMessages = thread.messages.map(m =>
+        (m.routing && evalDoneIds.has(m.routing.id))
+          ? { ...m, routing: { ...m.routing, evalDone: true } } : m
+      );
+      const nextThread = {
+        ...thread,
+        title: thread.messages.length ? thread.title : shortTitle(userText),
+        model,
+        updatedAt: now,
+        messages: [...baseMessages, userMessage, assistantMessage],
+      };
+      return (exists ? prev.map(t => t.id === threadId ? nextThread : t) : [nextThread, ...prev]).slice(0, MAX_SAVED_THREADS);
+    });
+
+    // Run the chat; in Auto mode fall back to the next candidate once on failure.
+    const attempts = autoMode ? candidates.slice(0, 2) : [chosenModel];
+    let result, usedModel = chosenModel;
+    for (let i = 0; i < attempts.length; i++) {
+      usedModel = attempts[i];
+      if (i > 0) {
+        updateThread(threadId, t => ({
+          ...t,
+          messages: t.messages.map(m => m.id === assistantMessage.id
+            ? { ...m, model: usedModel, content: "", routing: m.routing ? { ...m.routing, model: usedModel } : m.routing }
+            : m),
+        }));
+      }
+      result = await streamChat({
+        threadId, assistantId: assistantMessage.id, modelName: usedModel,
+        messages: [...priorMessages, { role: "user", content: userText }],
+      });
+      if (result.ok || result.full) break;
+      if (autoMode && routing) recordFailure(routing.id, usedModel);
+      probe(); // a routing attempt failed — the model may have been removed
+    }
+
+    updateThread(threadId, t => ({
+      ...t, updatedAt: Date.now(),
+      messages: t.messages.map(m => m.id === assistantMessage.id
+        ? (result.ok
+            ? { ...m, content: result.full, streaming: false, elapsed: result.elapsed, usage: result.usage, model: usedModel }
+            : { ...m, content: result.full || `Error: ${result.error}`, streaming: false, error: !result.full, elapsed: result.elapsed })
+        : m),
+    }));
     setGenerating(false);
+    maybeRunREC();
+  };
+
+  // Re-run a response. forcedModel set => "Wrong model" pick; otherwise a plain
+  // regenerate, which counts as a weak negative EVA signal in Auto mode.
+  const regenerate = async (message, forcedModel) => {
+    if (generating || !activeThread) return;
+    const thread = activeThread;
+    const idx = thread.messages.findIndex(m => m.id === message.id);
+    if (idx < 1) return;
+    let userIdx = idx - 1;
+    while (userIdx >= 0 && thread.messages[userIdx].role !== "user") userIdx--;
+    if (userIdx < 0) return;
+    const userText = thread.messages[userIdx].content;
+    const priorMessages = thread.messages.slice(0, userIdx)
+      .filter(m => !m.error && !m.streaming).map(({ role, content }) => ({ role, content }));
+    const threadId = thread.id;
+    const modelName = forcedModel || message.model;
+
+    if (!forcedModel && message.routing && !message.routing.evalDone) {
+      appendSignal(message.routing.id, { type: "implicit", value: -0.3, action: "regenerate", model: message.routing.model });
+    }
+
+    setGenerating(true);
+    updateThread(threadId, t => ({
+      ...t, updatedAt: Date.now(),
+      messages: t.messages.map(m => m.id === message.id
+        ? { ...m, content: "", streaming: true, error: false, elapsed: undefined, model: modelName,
+            routing: m.routing ? { ...m.routing, evalDone: true, model: forcedModel || m.routing.model } : m.routing }
+        : m),
+    }));
+
+    const result = await streamChat({
+      threadId, assistantId: message.id, modelName,
+      messages: [...priorMessages, { role: "user", content: userText }],
+    });
+    updateThread(threadId, t => ({
+      ...t, updatedAt: Date.now(),
+      messages: t.messages.map(m => m.id === message.id
+        ? (result.ok
+            ? { ...m, content: result.full, streaming: false, elapsed: result.elapsed, usage: result.usage }
+            : { ...m, content: result.full || `Error: ${result.error}`, streaming: false, error: !result.full, elapsed: result.elapsed })
+        : m),
+    }));
+    setGenerating(false);
+    maybeRunREC();
+  };
+
+  // ── EVA: explicit feedback ──
+  const handleFeedback = (message, action) => {
+    const r = message.routing;
+    if (!r || r.evalDone || !activeThread) return;
+    if (action === "up") appendSignal(r.id, { type: "explicit", value: 1.0, action: "thumbs-up", model: r.model });
+    else if (action === "down") appendSignal(r.id, { type: "explicit", value: -0.5, action: "thumbs-down", model: r.model });
+    updateThread(activeThread.id, t => ({
+      ...t,
+      messages: t.messages.map(m => m.id === message.id
+        ? { ...m, routing: { ...m.routing, evalDone: true, feedback: action } } : m),
+    }));
+    maybeRunREC();
+  };
+
+  const handleWrongModel = (message, altModel) => {
+    const r = message.routing;
+    setWrongModelFor(null);
+    if (!r || r.evalDone || !altModel) return;
+    appendSignal(r.id, { type: "explicit", value: -1.0, action: "wrong-model", model: r.model });
+    appendSignal(r.id, { type: "explicit", value: 0.5, action: "wrong-model-alt", model: altModel });
+    recordAlternateModel(r.id, altModel);
+    regenerate(message, altModel);
+  };
+
+  // ── Optimize tab: manual weight control ──
+  const effectiveWeights = useMemo(() => {
+    const w = {};
+    for (const it of INTENT_ORDER) w[it] = (routerWeights && routerWeights[it]) || DEFAULT_PRIORITY[it];
+    return w;
+  }, [routerWeights]);
+
+  // Manual reorder is the strongest REC signal — it writes weights directly.
+  const reorderWeight = (intent, idx, dir) => {
+    const j = idx + dir;
+    const current = effectiveWeights[intent];
+    if (j < 0 || j >= current.length) return;
+    const next = [...current];
+    [next[idx], next[j]] = [next[j], next[idx]];
+    const updated = { ...(routerWeights || {}) };
+    for (const it of INTENT_ORDER) updated[it] = updated[it] || DEFAULT_PRIORITY[it];
+    updated[intent] = next;
+    updated.lastUpdated = new Date().toISOString();
+    updated.totalEvaluations = (routerWeights && routerWeights.totalEvaluations) || 0;
+    saveWeights(updated);
+    refreshRouter();
+  };
+
+  const triggerREC = () => { runREC(installed); refreshRouter(); };
+
+  const resetRouterState = () => {
+    if (!window.confirm("Reset routing? This clears the routing log and learned weights, reverting to defaults.")) return;
+    resetRouter();
+    refreshRouter();
   };
 
   // ── Model management ──
@@ -467,7 +722,7 @@ OLLAMA_ORIGINS="http://localhost:3000,https://myapp.com" ollama serve`;
           </div>
         </div>
         <div style={{ display: "flex", gap: 6 }}>
-          {["status", "run", "models", "connect"].map(t => (
+          {["status", "run", "models", "optimize", "connect"].map(t => (
             <button key={t} onClick={() => setTab(t)} style={{
               padding: "7px 16px", fontSize: 12, fontWeight: 600, borderRadius: 8, cursor: "pointer", textTransform: "capitalize",
               border: `1px solid ${tab === t ? C.accent : C.border}`, background: tab === t ? C.accent : "transparent", color: tab === t ? "#fff" : C.dim,
@@ -574,10 +829,20 @@ OLLAMA_ORIGINS="http://localhost:3000,https://myapp.com" ollama serve`;
 
             <main style={{ display: "flex", flexDirection: "column", minHeight: 0, background: C.bg }}>
               <div style={{ padding: "12px 18px", borderBottom: `1px solid ${C.border}`, display: "flex", gap: 10, alignItems: "center" }}>
-                <select value={model} onChange={e => setModel(e.target.value)} style={{ flex: 1, maxWidth: 420, padding: "8px 12px", fontSize: 12, fontFamily: mono, background: C.s1, color: C.text, border: `1px solid ${C.border}`, borderRadius: 8 }}>
-                  {installed.length === 0 && <option value="">no models installed</option>}
-                  {installed.map(m => <option key={m.name} value={m.name}>{m.name} ({fmtB(m.size)})</option>)}
-                </select>
+                <div style={{ display: "flex", alignItems: "center", gap: 8, flex: 1, maxWidth: 460 }}>
+                  <select value={model} onChange={e => setModel(e.target.value)} style={{
+                    flex: 1, padding: "8px 12px", fontSize: 12, fontFamily: mono, background: C.s1, color: C.text, borderRadius: 8,
+                    border: model === AUTO_MODEL ? `1px solid ${C.accent}` : `1px solid ${C.border}`,
+                    boxShadow: model === AUTO_MODEL ? `0 0 0 1px ${C.accent}55` : "none",
+                  }}>
+                    {installed.length > 0 && <option value={AUTO_MODEL}>⚡ Auto — route per message</option>}
+                    {installed.length === 0 && <option value="">no models installed</option>}
+                    {installed.map(m => <option key={m.name} value={m.name}>{m.name} ({fmtB(m.size)})</option>)}
+                  </select>
+                  {model === AUTO_MODEL && (
+                    <span title="Auto-routing active" style={{ width: 8, height: 8, borderRadius: 99, background: C.accent, animation: "llm-pulse 1.4s ease-in-out infinite", flexShrink: 0 }} />
+                  )}
+                </div>
                 <div style={{ fontSize: 11, color: C.dim, fontFamily: mono, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
                   {activeThread ? activeThread.title : "New chat"}
                 </div>
@@ -597,9 +862,15 @@ OLLAMA_ORIGINS="http://localhost:3000,https://myapp.com" ollama serve`;
                             <div style={{ fontSize: 13 }}>Send a message to start a threaded chat. Older messages stay above as the conversation scrolls.</div>
                           </div>
                         </div>
-                      ) : activeThread.messages.map(m => (
-                        <ChatBubble key={m.id} message={m} copy={copy} copied={copied} />
-                      ))}
+                      ) : activeThread.messages.map((m, i) => {
+                        const userMsgsAfter = activeThread.messages.slice(i + 1).filter(x => x.role === "user").length;
+                        return (
+                          <ChatBubble key={m.id} message={m} copy={copy} copied={copied}
+                            userMsgsAfter={userMsgsAfter} installed={installed}
+                            onFeedback={handleFeedback} onRegenerate={regenerate} onWrongModel={handleWrongModel}
+                            wrongModelOpen={wrongModelFor === m.id} setWrongModelFor={setWrongModelFor} />
+                        );
+                      })}
                       <div ref={chatEndRef} />
                     </div>
                   </div>
@@ -675,6 +946,112 @@ OLLAMA_ORIGINS="http://localhost:3000,https://myapp.com" ollama serve`;
             })}
           </Box>
         </>)}
+
+        {/* ═══ OPTIMIZE ═══ */}
+        {tab === "optimize" && (() => {
+          const stats = routerStats(routerLog);
+          const conf = stats.confidence;
+          const confTotal = conf.high + conf.low + conf.zero;
+          const recentLog = [...routerLog].slice(-20).reverse();
+          const maxIntent = Math.max(1, ...INTENT_ORDER.map(i => stats.byIntent[i]));
+          return (<>
+            <Box title="Auto-Routing" sub="With the model selector set to ⚡ Auto, each prompt is classified by intent and routed to the best installed model. Feedback tunes these rankings over time.">
+              <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                <button onClick={triggerREC} style={btnStyle(C.accent)}>↬ Recalculate now</button>
+                <button onClick={resetRouterState} style={btnStyle(C.red)}>Reset to defaults</button>
+              </div>
+              {routerWeights?.lastUpdated && (
+                <div style={{ fontSize: 10, fontFamily: mono, color: C.dim, marginTop: 8 }}>
+                  weights updated {formatTime(new Date(routerWeights.lastUpdated).getTime())} · {routerWeights.totalEvaluations || 0} evaluations applied
+                </div>
+              )}
+            </Box>
+
+            <Box title="Stats">
+              <div style={{ fontFamily: mono, fontSize: 12, color: C.dim }}>
+                <div style={{ marginBottom: 8 }}>
+                  <span style={{ color: C.text }}>{stats.total}</span> routed messages ·{" "}
+                  <span style={{ color: C.text }}>{stats.satisfaction == null ? "—" : `${Math.round(stats.satisfaction * 100)}%`}</span> satisfaction
+                  {stats.evaluated > 0 ? ` (${stats.evaluated} evaluated)` : ""}
+                </div>
+                {INTENT_ORDER.map(i => (
+                  <div key={i} style={{ display: "flex", alignItems: "center", gap: 8, padding: "2px 0" }}>
+                    <span style={{ width: 96, color: INTENTS[i].color }}>{INTENTS[i].icon} {INTENTS[i].label}</span>
+                    <div style={{ flex: 1, height: 8, background: C.s3, borderRadius: 4, overflow: "hidden" }}>
+                      <div style={{ height: "100%", width: `${stats.byIntent[i] / maxIntent * 100}%`, background: INTENTS[i].color }} />
+                    </div>
+                    <span style={{ width: 30, textAlign: "right", color: C.text }}>{stats.byIntent[i]}</span>
+                  </div>
+                ))}
+              </div>
+            </Box>
+
+            <Box title="Classifier confidence" sub="How decisive intent detection has been">
+              {confTotal === 0 ? (
+                <div style={{ fontSize: 12, color: C.dim }}>No routing decisions logged yet.</div>
+              ) : (<>
+                <div style={{ fontFamily: mono, fontSize: 12, color: C.dim, lineHeight: 1.9 }}>
+                  <div><span style={{ color: C.green }}>● high</span> (3+ matches): {conf.high} · {Math.round(conf.high / confTotal * 100)}%</div>
+                  <div><span style={{ color: C.orange }}>○ low</span> (1-2 matches): {conf.low} · {Math.round(conf.low / confTotal * 100)}%</div>
+                  <div><span style={{ color: C.dim }}>○ none</span> (fallback): {conf.zero} · {Math.round(conf.zero / confTotal * 100)}%</div>
+                </div>
+                {(conf.low + conf.zero) > conf.high && confTotal >= 5 && (
+                  <div style={{ marginTop: 8, fontSize: 11, color: C.orange }}>
+                    Low confidence is frequent — installing more specialized models (e.g. a dedicated coder or reasoning model) would let the router make sharper choices.
+                  </div>
+                )}
+              </>)}
+            </Box>
+
+            <Box title="Learned weights" sub="Routing order per intent — the first installed match wins. Reorder to override.">
+              {INTENT_ORDER.map(intent => (
+                <div key={intent} style={{ marginBottom: 12 }}>
+                  <div style={{ fontSize: 12, fontWeight: 700, color: INTENTS[intent].color, marginBottom: 4 }}>
+                    {INTENTS[intent].icon} {INTENTS[intent].label}
+                  </div>
+                  {effectiveWeights[intent].map((m, idx) => {
+                    const inst = installed.some(i => i.name.toLowerCase().includes(m.toLowerCase()));
+                    return (
+                      <div key={m + idx} style={{ display: "flex", alignItems: "center", gap: 6, padding: "3px 0" }}>
+                        <span style={{ width: 18, fontSize: 10, fontFamily: mono, color: C.dim }}>{idx + 1}.</span>
+                        <span style={{ flex: 1, fontSize: 12, fontFamily: mono, color: inst ? C.text : C.dim }}>
+                          {m}{inst ? "" : " · not installed"}
+                        </span>
+                        <ActBtn onClick={() => reorderWeight(intent, idx, -1)} disabled={idx === 0}>↑</ActBtn>
+                        <ActBtn onClick={() => reorderWeight(intent, idx, 1)} disabled={idx === effectiveWeights[intent].length - 1}>↓</ActBtn>
+                      </div>
+                    );
+                  })}
+                </div>
+              ))}
+            </Box>
+
+            <Box title="Routing log">
+              <button onClick={() => setShowLog(s => !s)} style={btnStyle(C.s2)}>{showLog ? "Hide" : "Show"} recent decisions ({routerLog.length})</button>
+              {showLog && (
+                <div style={{ marginTop: 10 }}>
+                  {recentLog.length === 0 ? (
+                    <div style={{ fontSize: 12, color: C.dim }}>No decisions logged yet.</div>
+                  ) : recentLog.map(e => {
+                    const net = (e.signals || []).reduce((a, s) => a + (s.value || 0), 0);
+                    return (
+                      <div key={e.id} style={{ fontFamily: mono, fontSize: 10, color: C.dim, padding: "4px 0", borderBottom: `1px solid ${C.s3}` }}>
+                        <span style={{ color: INTENTS[e.intent]?.color || C.dim }}>{INTENTS[e.intent]?.icon} {e.intent}</span>
+                        {" → "}<span style={{ color: C.text }}>{e.modelChosen}</span>
+                        {" · conf "}{e.confidence}
+                        {" · "}{e.evaluated
+                          ? <span style={{ color: net >= 0 ? C.green : C.red }}>{net >= 0 ? "+" : ""}{net.toFixed(1)}</span>
+                          : "pending"}
+                        {e.alternateModel ? <span style={{ color: C.orange }}> · picked {e.alternateModel}</span> : ""}
+                        {e.failures?.length ? <span style={{ color: C.red }}> · failed: {e.failures.join(", ")}</span> : ""}
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </Box>
+          </>);
+        })()}
 
         {/* ═══ CONNECT ═══ */}
         {tab === "connect" && (<>
