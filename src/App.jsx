@@ -1,4 +1,8 @@
 import { useState, useEffect, useCallback } from "react";
+import {
+  loadGraph, saveGraph, emptyGraph, graphStats, mergeExtraction,
+  findPaths, pathToText, pathsToContext, degree, EXTRACTION_PROMPT, parseExtraction,
+} from "./graph";
 
 const MODEL_CATALOG = [
   { id: "gemma2:2b", params: "2B", vram: 1.5, speed: "fast", use: "Light tasks, quick responses" },
@@ -41,6 +45,19 @@ export default function App() {
   const [response, setResponse] = useState(null);
   const [history, setHistory] = useState([]);
   const [copied, setCopied] = useState(null);
+
+  // ── Content graph ──
+  const [graph, setGraph] = useState(loadGraph);
+  const [ingestText, setIngestText] = useState("");
+  const [extracting, setExtracting] = useState(false);
+  const [extractMsg, setExtractMsg] = useState(null);
+  const [pathFrom, setPathFrom] = useState("");
+  const [pathTo, setPathTo] = useState("");
+  const [pathResults, setPathResults] = useState(null);
+  const [explaining, setExplaining] = useState(false);
+  const [explainResult, setExplainResult] = useState(null);
+
+  const updateGraph = (g) => { setGraph(g); saveGraph(g); };
 
   // ── Hardware ──
   useEffect(() => {
@@ -109,6 +126,68 @@ export default function App() {
       setResponse({ id: "err", content: `Error: ${e.message}`, error: true });
     }
     setGenerating(false);
+  };
+
+  // ── Graph: extract structured data from text ──
+  const extractToGraph = async (text, label) => {
+    if (!model || extracting || !text.trim()) return;
+    setExtracting(true); setExtractMsg(null);
+    try {
+      const r = await fetch(`${ollamaUrl}/v1/chat/completions`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model,
+          messages: [{ role: "user", content: EXTRACTION_PROMPT.replace("{TEXT}", text.slice(0, 6000)) }],
+          temperature: 0, stream: false,
+        }),
+      });
+      const data = await r.json();
+      const parsed = parseExtraction(data.choices?.[0]?.message?.content || "");
+      if (!parsed) {
+        setExtractMsg({ error: true, text: "Could not parse JSON from the model — try a stronger model." });
+      } else {
+        const { graph: next, addedNodes, addedEdges } = mergeExtraction(
+          graph, parsed, { id: `s${Date.now()}`, label: label?.slice(0, 80) || "" }
+        );
+        updateGraph(next);
+        setExtractMsg({ text: `+${addedNodes} entities, +${addedEdges} relations.` });
+      }
+    } catch (e) {
+      setExtractMsg({ error: true, text: `Error: ${e.message}` });
+    }
+    setExtracting(false);
+  };
+
+  // ── Graph: mechanical connection query — no LLM call ──
+  const findConnections = () => {
+    setExplainResult(null);
+    if (!pathFrom || !pathTo) { setPathResults(null); return; }
+    setPathResults({ from: pathFrom, to: pathTo, paths: findPaths(graph, pathFrom, pathTo) });
+  };
+
+  // ── Graph: ask the LLM using ONLY the traversed paths as context ──
+  const explainPaths = async () => {
+    if (!pathResults?.paths.length || !model || explaining) return;
+    setExplaining(true); setExplainResult(null);
+    const fromL = graph.nodes[pathResults.from]?.label || pathResults.from;
+    const toL = graph.nodes[pathResults.to]?.label || pathResults.to;
+    const ctx = pathsToContext(graph, pathResults.paths);
+    const q = `Known connections (graph traversal):\n${ctx}\n\nUsing only these connections, explain in 2-3 sentences how "${fromL}" relates to "${toL}".`;
+    try {
+      const r = await fetch(`${ollamaUrl}/v1/chat/completions`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ model, messages: [{ role: "user", content: q }], temperature: 0.2, stream: false }),
+      });
+      const data = await r.json();
+      setExplainResult({
+        text: data.choices?.[0]?.message?.content || JSON.stringify(data),
+        promptChars: q.length,
+        usage: data.usage || {},
+      });
+    } catch (e) {
+      setExplainResult({ text: `Error: ${e.message}`, error: true });
+    }
+    setExplaining(false);
   };
 
   // ── Helpers ──
@@ -206,6 +285,9 @@ OLLAMA_ORIGINS="*" ollama serve
 # Or restrict to specific origins:
 OLLAMA_ORIGINS="http://localhost:3000,https://myapp.com" ollama serve`;
 
+  const gStats = graphStats(graph);
+  const nodeList = Object.values(graph.nodes).sort((a, b) => a.label.localeCompare(b.label));
+
   return (
     <div style={{ fontFamily: sans, background: C.bg, color: C.text, minHeight: "100vh" }}>
       <div style={{ padding: "16px 20px 12px", borderBottom: `1px solid ${C.border}`, display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 10 }}>
@@ -216,7 +298,7 @@ OLLAMA_ORIGINS="http://localhost:3000,https://myapp.com" ollama serve`;
           </div>
         </div>
         <div style={{ display: "flex", gap: 6 }}>
-          {["status", "run", "models", "connect"].map(t => (
+          {["status", "run", "models", "graph", "connect"].map(t => (
             <button key={t} onClick={() => setTab(t)} style={{
               padding: "7px 16px", fontSize: 12, fontWeight: 600, borderRadius: 8, cursor: "pointer", textTransform: "capitalize",
               border: `1px solid ${tab === t ? C.accent : C.border}`, background: tab === t ? C.accent : "transparent", color: tab === t ? "#fff" : C.dim,
@@ -320,7 +402,14 @@ OLLAMA_ORIGINS="http://localhost:3000,https://myapp.com" ollama serve`;
                     padding: "6px 14px", fontSize: 11, fontFamily: mono, borderRadius: 6, border: "none", cursor: "pointer",
                     background: copied === "json" ? C.green : C.s2, color: copied === "json" ? "#000" : C.dim,
                   }}>{copied === "json" ? "✓" : "copy JSON"}</button>
+                  <button onClick={() => extractToGraph(`${response.prompt}\n\n${response.content}`, response.prompt)} disabled={extracting} style={{
+                    padding: "6px 14px", fontSize: 11, fontFamily: mono, borderRadius: 6, border: "none", cursor: extracting ? "wait" : "pointer",
+                    background: C.accent, color: "#fff", opacity: extracting ? 0.5 : 1,
+                  }}>{extracting ? "extracting…" : "→ graph"}</button>
                 </div>
+              )}
+              {extractMsg && (
+                <div style={{ fontSize: 11, fontFamily: mono, marginTop: 8, color: extractMsg.error ? C.red : C.green }}>{extractMsg.text}</div>
               )}
             </Box>
           )}
@@ -365,6 +454,102 @@ OLLAMA_ORIGINS="http://localhost:3000,https://myapp.com" ollama serve`;
               );
             })}
           </Box>
+        </>)}
+
+        {/* ═══ GRAPH ═══ */}
+        {tab === "graph" && (<>
+          <Box title="Content Graph" sub={`${gStats.nodes} entities · ${gStats.edges} relations · ${gStats.sources} sources ingested`}>
+            <div style={{ fontSize: 12, color: C.dim, lineHeight: 1.6, marginBottom: 12 }}>
+              Process text into structured nodes and edges. Once the graph holds your content,
+              connection questions are answered by <strong style={{ color: C.text }}>traversal — no prompt</strong>.
+            </div>
+            {ollamaUp === false && <div style={{ fontSize: 12, color: C.red, marginBottom: 10 }}>Ollama offline — extraction needs a running model.</div>}
+            <textarea
+              value={ingestText} onChange={e => setIngestText(e.target.value)}
+              placeholder="Paste any text — an article, notes, a transcript…"
+              rows={4}
+              style={{ width: "100%", padding: "10px 14px", fontSize: 13, background: C.bg, color: C.text, border: `1px solid ${C.border}`, borderRadius: 8, resize: "vertical", boxSizing: "border-box", lineHeight: 1.5, fontFamily: sans }}
+            />
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: 8 }}>
+              <span style={{ fontSize: 11, fontFamily: mono, color: extractMsg ? (extractMsg.error ? C.red : C.green) : C.dim }}>
+                {extractMsg ? extractMsg.text : (model ? `extract with ${model}` : "no model selected")}
+              </span>
+              <button onClick={() => { extractToGraph(ingestText, ingestText); setIngestText(""); }} disabled={extracting || !model || !ingestText.trim()} style={{
+                padding: "9px 24px", fontSize: 13, fontWeight: 700, borderRadius: 8, border: "none",
+                cursor: extracting ? "wait" : "pointer", background: extracting ? C.s2 : C.accent,
+                color: extracting ? C.dim : "#fff", opacity: (!model || !ingestText.trim()) ? 0.4 : 1,
+              }}>{extracting ? "Extracting…" : "Extract"}</button>
+            </div>
+          </Box>
+
+          <Box title="Connection Finder" sub="Find every path between two entities by graph traversal">
+            {gStats.nodes < 2 ? (
+              <div style={{ fontSize: 12, color: C.dim }}>Ingest some text first — the graph needs at least two entities.</div>
+            ) : (<>
+              <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+                <select value={pathFrom} onChange={e => setPathFrom(e.target.value)} style={{ flex: 1, minWidth: 140, padding: "8px 12px", fontSize: 12, fontFamily: mono, background: C.bg, color: C.text, border: `1px solid ${C.border}`, borderRadius: 6 }}>
+                  <option value="">from…</option>
+                  {nodeList.map(n => <option key={n.id} value={n.id}>{n.label}</option>)}
+                </select>
+                <span style={{ color: C.dim, fontFamily: mono }}>→</span>
+                <select value={pathTo} onChange={e => setPathTo(e.target.value)} style={{ flex: 1, minWidth: 140, padding: "8px 12px", fontSize: 12, fontFamily: mono, background: C.bg, color: C.text, border: `1px solid ${C.border}`, borderRadius: 6 }}>
+                  <option value="">to…</option>
+                  {nodeList.map(n => <option key={n.id} value={n.id}>{n.label}</option>)}
+                </select>
+                <button onClick={findConnections} disabled={!pathFrom || !pathTo} style={{
+                  padding: "8px 16px", fontSize: 12, fontWeight: 600, borderRadius: 6, border: "none", cursor: "pointer",
+                  background: C.accent, color: "#fff", opacity: (!pathFrom || !pathTo) ? 0.4 : 1,
+                }}>Find</button>
+              </div>
+
+              {pathResults && (
+                <div style={{ marginTop: 14 }}>
+                  {pathResults.paths.length === 0 ? (
+                    <div style={{ fontSize: 12, color: C.orange }}>No path found within 4 hops.</div>
+                  ) : (<>
+                    <div style={{ fontSize: 11, fontFamily: mono, color: C.green, marginBottom: 8 }}>
+                      {pathResults.paths.length} path{pathResults.paths.length > 1 ? "s" : ""} found · 0 tokens — answered by traversal
+                    </div>
+                    {pathResults.paths.map((p, i) => (
+                      <div key={i} style={{ fontSize: 12, fontFamily: mono, color: C.text, background: C.bg, border: `1px solid ${C.border}`, borderRadius: 6, padding: "8px 12px", marginBottom: 6, lineHeight: 1.5, wordBreak: "break-word" }}>
+                        {pathToText(graph, p)}
+                      </div>
+                    ))}
+                    <button onClick={explainPaths} disabled={explaining} style={{
+                      marginTop: 6, padding: "7px 14px", fontSize: 11, fontFamily: mono, fontWeight: 600, borderRadius: 6, border: "none",
+                      cursor: explaining ? "wait" : "pointer", background: C.s2, color: C.dim,
+                    }}>{explaining ? "asking…" : "explain with LLM (paths only)"}</button>
+                  </>)}
+                </div>
+              )}
+
+              {explainResult && (
+                <div style={{ marginTop: 12, background: C.bg, border: `1px solid ${C.border}`, borderRadius: 8, padding: "10px 14px" }}>
+                  <pre style={{ fontFamily: sans, fontSize: 13, lineHeight: 1.6, whiteSpace: "pre-wrap", wordBreak: "break-word", color: explainResult.error ? C.red : C.text, margin: 0 }}>{explainResult.text}</pre>
+                  {!explainResult.error && (
+                    <div style={{ fontSize: 10, fontFamily: mono, color: C.dim, marginTop: 8 }}>
+                      context sent: {explainResult.promptChars} chars (paths only — not full history) · {explainResult.usage.prompt_tokens || "?"} prompt tokens
+                    </div>
+                  )}
+                </div>
+              )}
+            </>)}
+          </Box>
+
+          {nodeList.length > 0 && (
+            <Box title={`Entities (${nodeList.length})`}>
+              {nodeList.map(n => (
+                <div key={n.id} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "6px 0", fontSize: 12, borderBottom: `1px solid ${C.s3}` }}>
+                  <span><span style={{ fontFamily: mono }}>{n.label}</span> <Pill color={C.dim}>{n.type}</Pill></span>
+                  <span style={{ fontSize: 10, fontFamily: mono, color: C.dim }}>{degree(graph, n.id)} link{degree(graph, n.id) === 1 ? "" : "s"}</span>
+                </div>
+              ))}
+              <button onClick={() => { if (confirm("Clear the entire content graph?")) { updateGraph(emptyGraph()); setPathResults(null); setExplainResult(null); } }} style={{
+                marginTop: 12, padding: "6px 14px", fontSize: 11, fontFamily: mono, borderRadius: 6, border: `1px solid ${C.border}`, cursor: "pointer",
+                background: "transparent", color: C.dim,
+              }}>clear graph</button>
+            </Box>
+          )}
         </>)}
 
         {/* ═══ CONNECT ═══ */}
