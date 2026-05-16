@@ -49,6 +49,15 @@ const ActBtn = ({ onClick, disabled, color, children }) => (
   }}>{children}</button>
 );
 
+const ThinkingBar = ({ label }) => (
+  <div style={{ marginBottom: 12 }}>
+    <div style={{ fontSize: 11, fontFamily: mono, color: C.accent, marginBottom: 5 }}>{label}</div>
+    <div style={{ position: "relative", height: 5, background: C.s3, borderRadius: 3, overflow: "hidden" }}>
+      <div style={{ position: "absolute", top: 0, height: "100%", width: "45%", borderRadius: 3, background: C.accent, animation: "llm-indeterminate 1.1s ease-in-out infinite" }} />
+    </div>
+  </div>
+);
+
 const Box = ({ title, sub, children }) => (
   <div style={{ background: C.s1, border: `1px solid ${C.border}`, borderRadius: 10, padding: "14px 18px", marginBottom: 10 }}>
     <div style={{ fontSize: 13, fontWeight: 700, color: C.text, marginBottom: sub ? 2 : 10 }}>{title}</div>
@@ -119,23 +128,47 @@ export default function App() {
 
   useEffect(() => { probe(); }, [probe]);
 
-  // ── Generate ──
+  // ── Generate (streaming) ──
   const generate = async () => {
     if (!prompt.trim() || !model) return;
-    setGenerating(true); setResponse(null);
+    setGenerating(true);
+    setResponse({ id: "stream", prompt, model, content: "", streaming: true });
     const t0 = Date.now();
     try {
-      const r = await fetch(`${ollamaUrl}/v1/chat/completions`, {
+      const r = await fetch(`${ollamaUrl}/api/chat`, {
         method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ model, messages: [{ role: "user", content: prompt }], stream: false }),
+        body: JSON.stringify({ model, messages: [{ role: "user", content: prompt }], stream: true }),
       });
-      const data = await r.json();
+      if (!r.ok || !r.body) throw new Error(`HTTP ${r.status}`);
+      const reader = r.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = "", full = "", usage = {};
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        const lines = buf.split("\n");
+        buf = lines.pop();
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          let j;
+          try { j = JSON.parse(line); } catch { continue; }
+          if (j.error) throw new Error(j.error);
+          if (j.message?.content) {
+            full += j.message.content;
+            setResponse(prev => ({ ...prev, content: full, streaming: true }));
+          }
+          if (j.done) {
+            usage = {
+              prompt_tokens: j.prompt_eval_count,
+              completion_tokens: j.eval_count,
+              total_tokens: (j.prompt_eval_count || 0) + (j.eval_count || 0),
+            };
+          }
+        }
+      }
       const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
-      const result = {
-        id: Date.now().toString(), prompt, model, elapsed,
-        content: data.choices?.[0]?.message?.content || JSON.stringify(data),
-        usage: data.usage || {},
-      };
+      const result = { id: Date.now().toString(), prompt, model, elapsed, content: full, usage };
       setResponse(result);
       setHistory(prev => [result, ...prev].slice(0, 50));
     } catch (e) {
@@ -389,17 +422,28 @@ OLLAMA_ORIGINS="http://localhost:3000,https://myapp.com" ollama serve`;
           </Box>
 
           {response && (
-            <Box title={response.error ? "Error" : "Response"} sub={response.error ? null : `${response.model} · ${response.elapsed}s · ${response.usage.total_tokens || "?"} tokens`}>
+            <Box
+              title={response.error ? "Error" : "Response"}
+              sub={response.error ? null : response.streaming ? "streaming…" : `${response.model} · ${response.elapsed}s · ${response.usage.total_tokens || "?"} tokens`}
+            >
               {response.error ? (
                 <pre style={{ fontFamily: sans, fontSize: 13, lineHeight: 1.6, whiteSpace: "pre-wrap", wordBreak: "break-word", color: C.red, margin: 0, maxHeight: 400, overflowY: "auto" }}>
                   {response.content}
                 </pre>
               ) : (
-                <div style={{ maxHeight: 400, overflowY: "auto" }}>
-                  <Markdown text={response.content} />
-                </div>
+                <>
+                  {response.streaming && (
+                    <ThinkingBar label={response.content ? "Generating…" : "Thinking…"} />
+                  )}
+                  <div style={{ maxHeight: 400, overflowY: "auto" }}>
+                    <Markdown text={response.content} />
+                    {response.streaming && (
+                      <span style={{ display: "inline-block", width: 8, height: 15, marginLeft: 1, background: C.accent, verticalAlign: "text-bottom", animation: "llm-cursor-blink 1s step-start infinite" }} />
+                    )}
+                  </div>
+                </>
               )}
-              {!response.error && (
+              {!response.error && !response.streaming && (
                 <div style={{ display: "flex", gap: 8, marginTop: 12 }}>
                   <button onClick={() => copy(response.content, "resp")} style={{
                     padding: "6px 14px", fontSize: 11, fontFamily: mono, borderRadius: 6, border: "none", cursor: "pointer",
