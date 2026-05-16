@@ -56,18 +56,34 @@ export async function discoverHomeserver(input) {
 }
 
 export async function login(homeserver, user, password) {
-  const r = await fetch(`${homeserver}${API}/login`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      type: "m.login.password",
-      identifier: { type: "m.id.user", user },
-      password,
-      initial_device_display_name: "LLM Manager",
-    }),
-  });
+  let r;
+  try {
+    r = await fetch(`${homeserver}${API}/login`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        type: "m.login.password",
+        identifier: { type: "m.id.user", user },
+        password,
+        initial_device_display_name: "LLM Manager",
+      }),
+    });
+  } catch {
+    // fetch only rejects for network-level failures (DNS, TLS, connection
+    // reset, or a CORS rejection) — never for HTTP error statuses.
+    throw new Error(
+      `Couldn't reach the Matrix server at ${homeserver}. The connection ` +
+      `failed before the server replied. Likely causes: the homeserver ` +
+      `address is wrong (try its real base URL, e.g. https://matrix.<domain>), ` +
+      `the server doesn't allow browser/CORS requests, or a VPN, firewall, or ` +
+      `browser shield/extension is blocking it. Open the Console tab for the ` +
+      `exact net:: error code.`,
+    );
+  }
   const j = await r.json().catch(() => ({}));
-  if (!r.ok) throw new Error(j.error || `Login failed (HTTP ${r.status})`);
+  if (!r.ok) {
+    throw new Error(j.error || `Login rejected by the server (HTTP ${r.status})`);
+  }
   const session = {
     homeserver,
     accessToken: j.access_token,
