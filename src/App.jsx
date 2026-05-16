@@ -1,5 +1,12 @@
-import { useState, useEffect, useCallback, useMemo, useRef } from "react";
-import Markdown from "./Markdown.jsx";
+import { useState, useEffect, useCallback, useRef } from "react";
+import Chat from "./Chat.jsx";
+import RoutingPanel from "./RoutingPanel.jsx";
+import MatrixGate from "./MatrixGate.jsx";
+import MatrixChat from "./MatrixChat.jsx";
+import { loadLog, runREC } from "./router.js";
+import { loadSession } from "./matrix.js";
+
+const GATE_SKIP_KEY = "llm-manager-gate-skipped";
 
 const MODEL_CATALOG = [
   { id: "gemma2:2b", params: "2B", vram: 1.5, speed: "fast", use: "Light tasks, quick responses" },
@@ -19,52 +26,30 @@ const MODEL_CATALOG = [
   { id: "starcoder2:7b", params: "7B", vram: 4.5, speed: "medium", use: "Code completion" },
 ];
 
+const QUANT_LEVELS = [
+  { q: "Q2_K", bpw: 2.6, note: "Heavy quality loss — only worth it to squeeze a 70B in", tone: "bad" },
+  { q: "Q3_K_M", bpw: 3.4, note: "Noticeable loss — last resort on tight memory", tone: "warn" },
+  { q: "Q4_0", bpw: 4.5, note: "Legacy 4-bit — fine, slightly behind K-quants", tone: "ok" },
+  { q: "Q4_K_M", bpw: 4.8, note: "Sweet spot — best speed/quality balance", tone: "best" },
+  { q: "Q5_K_M", bpw: 5.7, note: "Higher quality, a little slower & larger", tone: "best" },
+  { q: "Q6_K", bpw: 6.6, note: "Near-lossless — diminishing returns", tone: "ok" },
+  { q: "Q8_0", bpw: 8.5, note: "Minimal loss but ~2x the memory bandwidth cost", tone: "warn" },
+  { q: "F16", bpw: 16, note: "Full precision — rarely worth it for local inference", tone: "warn" },
+];
+
+const SPEED_TIERS = [
+  { tier: "gemma2:2b", tps: "100+ tok/s", note: "Fastest — light tasks, quick replies" },
+  { tier: "llama3.2:3b · phi3:mini", tps: "60–80 tok/s", note: "Noticeably smarter, still snappy" },
+  { tier: "mistral · llama3.1:8b", tps: "30–40 tok/s", note: "Strong quality, comfortable" },
+  { tier: "qwen2.5:14b", tps: "15–20 tok/s", note: "Best quality you can run comfortably" },
+];
+
 const mono = `'SF Mono','Menlo','Consolas',monospace`;
 const sans = `-apple-system,system-ui,sans-serif`;
 const C = {
   bg: "#0b0b0f", s1: "#131318", s2: "#1b1b22", s3: "#232330",
   border: "#282838", text: "#d4d4e4", dim: "#65657e", accent: "#6e56cf",
   green: "#30a46c", red: "#e5484d", orange: "#f76b15",
-};
-
-const CHAT_STORE_KEY = "llm-manager-chat-threads";
-const MAX_SAVED_THREADS = 30;
-
-const makeThread = (model = "") => {
-  const now = Date.now();
-  return {
-    id: `thread-${now}-${Math.random().toString(36).slice(2, 8)}`,
-    title: "New chat",
-    model,
-    createdAt: now,
-    updatedAt: now,
-    messages: [],
-  };
-};
-
-const shortTitle = (text) => {
-  const cleaned = text.replace(/\s+/g, " ").trim();
-  return cleaned.length > 38 ? `${cleaned.slice(0, 38)}…` : cleaned || "New chat";
-};
-
-const formatTime = (ts) => {
-  if (!ts) return "";
-  return new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" }).format(ts);
-};
-
-const loadStoredThreads = () => {
-  try {
-    const raw = localStorage.getItem(CHAT_STORE_KEY);
-    if (!raw) return [];
-    const parsed = JSON.parse(raw);
-    if (!Array.isArray(parsed)) return [];
-    return parsed
-      .filter(t => t && typeof t.id === "string" && Array.isArray(t.messages))
-      .map(t => ({ ...t, title: t.title || "New chat", messages: t.messages.filter(m => m && m.role && typeof m.content === "string") }))
-      .slice(0, MAX_SAVED_THREADS);
-  } catch {
-    return [];
-  }
 };
 
 const Pill = ({ color, children }) => (
@@ -89,15 +74,6 @@ const ActBtn = ({ onClick, disabled, color, children }) => (
   }}>{children}</button>
 );
 
-const ThinkingBar = ({ label }) => (
-  <div style={{ marginBottom: 12 }}>
-    <div style={{ fontSize: 11, fontFamily: mono, color: C.accent, marginBottom: 5 }}>{label}</div>
-    <div style={{ position: "relative", height: 5, background: C.s3, borderRadius: 3, overflow: "hidden" }}>
-      <div style={{ position: "absolute", top: 0, height: "100%", width: "45%", borderRadius: 3, background: C.accent, animation: "llm-indeterminate 1.1s ease-in-out infinite" }} />
-    </div>
-  </div>
-);
-
 const Box = ({ title, sub, children }) => (
   <div style={{ background: C.s1, border: `1px solid ${C.border}`, borderRadius: 10, padding: "14px 18px", marginBottom: 10 }}>
     <div style={{ fontSize: 13, fontWeight: 700, color: C.text, marginBottom: sub ? 2 : 10 }}>{title}</div>
@@ -106,63 +82,12 @@ const Box = ({ title, sub, children }) => (
   </div>
 );
 
-const ChatBubble = ({ message, copy, copied, fork }) => {
-  const isUser = message.role === "user";
-  const isAssistant = message.role === "assistant";
-  return (
-    <div style={{ display: "flex", justifyContent: isUser ? "flex-end" : "flex-start", padding: "8px 0" }}>
-      <div style={{ maxWidth: isUser ? "78%" : "100%", minWidth: 0 }}>
-        <div style={{ display: "flex", alignItems: "center", gap: 8, justifyContent: isUser ? "flex-end" : "flex-start", marginBottom: 4 }}>
-          <span style={{ fontSize: 10, fontFamily: mono, color: C.dim, textTransform: "uppercase", letterSpacing: 0.5 }}>{isUser ? "You" : "Assistant"}</span>
-          {message.elapsed && <span style={{ fontSize: 10, fontFamily: mono, color: C.dim }}>{message.elapsed}s</span>}
-        </div>
-        <div style={{
-          background: isUser ? C.accent : "transparent",
-          border: isUser ? "none" : `1px solid ${C.border}`,
-          color: isUser ? "#fff" : C.text,
-          borderRadius: isUser ? "18px 18px 4px 18px" : "18px 18px 18px 4px",
-          padding: isUser ? "10px 14px" : "12px 14px",
-          boxShadow: isUser ? "0 8px 24px #00000020" : "none",
-          wordBreak: "break-word",
-        }}>
-          {message.error ? (
-            <pre style={{ fontFamily: sans, fontSize: 13, lineHeight: 1.6, whiteSpace: "pre-wrap", wordBreak: "break-word", color: C.red, margin: 0 }}>{message.content}</pre>
-          ) : isAssistant ? (
-            <>
-              {message.streaming && <ThinkingBar label={message.content ? "Generating…" : "Thinking…"} />}
-              <Markdown text={message.content} />
-              {message.streaming && (
-                <span style={{ display: "inline-block", width: 8, height: 15, marginLeft: 1, background: C.accent, verticalAlign: "text-bottom", animation: "llm-cursor-blink 1s step-start infinite" }} />
-              )}
-            </>
-          ) : (
-            <div style={{ fontSize: 13, lineHeight: 1.5, whiteSpace: "pre-wrap" }}>{message.content}</div>
-          )}
-        </div>
-        {!message.streaming && (
-          <div style={{ display: "flex", gap: 8, marginTop: 6, justifyContent: isUser ? "flex-end" : "flex-start" }}>
-            {isAssistant && message.content && !message.error && (
-              <button onClick={() => copy(message.content, `msg-${message.id}`)} style={{
-                padding: "4px 10px", fontSize: 10, fontFamily: mono, borderRadius: 6, border: "none", cursor: "pointer",
-                background: copied === `msg-${message.id}` ? C.green : C.s2, color: copied === `msg-${message.id}` ? "#000" : C.dim,
-              }}>{copied === `msg-${message.id}` ? "✓" : "copy"}</button>
-            )}
-            {fork && (
-              <button onClick={() => fork(message.id)} title="Branch a new chat from this point"
-                style={{
-                  padding: "4px 10px", fontSize: 10, fontFamily: mono, borderRadius: 6, border: "none", cursor: "pointer",
-                  background: C.s2, color: C.dim,
-                }}>⑂ fork</button>
-            )}
-          </div>
-        )}
-      </div>
-    </div>
-  );
-};
-
 export default function App() {
   const [tab, setTab] = useState("status");
+  const [matrixSession, setMatrixSession] = useState(loadSession);
+  const [gateDone, setGateDone] = useState(
+    () => !!loadSession() || localStorage.getItem(GATE_SKIP_KEY) === "1",
+  );
   const [ollamaUrl, setOllamaUrl] = useState("http://localhost:11434");
   const [ollamaUp, setOllamaUp] = useState(null);
   const [ollamaVer, setOllamaVer] = useState("");
@@ -171,63 +96,10 @@ export default function App() {
   const [hw, setHw] = useState(null);
 
   const [model, setModel] = useState("");
-  const [prompt, setPrompt] = useState("");
-  const [generating, setGenerating] = useState(false);
-  const [threads, setThreads] = useState(loadStoredThreads);
-  const [activeThreadId, setActiveThreadId] = useState(() => loadStoredThreads()[0]?.id || null);
-  const chatEndRef = useRef(null);
+  const [keepAlivePref, setKeepAlivePref] = useState("10m");
   const [copied, setCopied] = useState(null);
   const [pulling, setPulling] = useState({}); // { [name]: { status, completed, total, error } }
   const [busy, setBusy] = useState({});       // { [name]: "load" | "unload" | "delete" }
-
-  const sortedThreads = useMemo(() => [...threads].sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0)), [threads]);
-  const activeThread = useMemo(() => threads.find(t => t.id === activeThreadId) || null, [threads, activeThreadId]);
-
-  useEffect(() => {
-    localStorage.setItem(CHAT_STORE_KEY, JSON.stringify(sortedThreads.slice(0, MAX_SAVED_THREADS)));
-  }, [sortedThreads]);
-
-  useEffect(() => {
-    if (!activeThreadId && sortedThreads.length) setActiveThreadId(sortedThreads[0].id);
-  }, [activeThreadId, sortedThreads]);
-
-  useEffect(() => {
-    chatEndRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
-  }, [activeThread?.messages, generating]);
-
-  const startNewChat = () => {
-    const thread = makeThread(model);
-    setThreads(prev => [thread, ...prev].slice(0, MAX_SAVED_THREADS));
-    setActiveThreadId(thread.id);
-    setPrompt("");
-  };
-
-  const updateThread = (threadId, updater) => {
-    setThreads(prev => prev.map(t => t.id === threadId ? updater(t) : t));
-  };
-
-  const forkThread = (messageId) => {
-    if (!activeThread) return;
-    const idx = activeThread.messages.findIndex(m => m.id === messageId);
-    if (idx < 0) return;
-    const now = Date.now();
-    const messages = activeThread.messages
-      .slice(0, idx + 1)
-      .map(m => ({ ...m, streaming: false }));
-    const baseTitle = activeThread.title.replace(/\s*\(fork\)$/, "");
-    const trimmedBase = baseTitle.length > 30 ? `${baseTitle.slice(0, 30)}…` : baseTitle;
-    const fork = {
-      id: `thread-${now}-${Math.random().toString(36).slice(2, 8)}`,
-      title: `${trimmedBase} (fork)`,
-      model: activeThread.model,
-      createdAt: now,
-      updatedAt: now,
-      messages,
-    };
-    setThreads(prev => [fork, ...prev].slice(0, MAX_SAVED_THREADS));
-    setActiveThreadId(fork.id);
-    setPrompt("");
-  };
 
   // ── Hardware ──
   useEffect(() => {
@@ -268,91 +140,30 @@ export default function App() {
       }
       const pR = await fetch(`${ollamaUrl}/api/ps`, { signal: AbortSignal.timeout(3000) });
       if (pR.ok) setRunning((await pR.json()).models || []);
-    } catch { setOllamaUp(false); }
-  }, [ollamaUrl]);
+    } catch {
+      // A normal fetch fails both when the server is down AND when it's up
+      // but rejecting this page's origin (CORS). A no-cors request still
+      // resolves (as an opaque response) if something is actually listening,
+      // so it tells the two cases apart.
+      try {
+        await fetch(`${ollamaUrl}/api/version`, { mode: "no-cors", signal: AbortSignal.timeout(3000) });
+        setOllamaUp("cors");
+      } catch {
+        setOllamaUp(false);
+      }
+    }
+  }, [ollamaUrl]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => { probe(); }, [probe]);
 
-  // ── Generate (streaming) ──
-  const generate = async () => {
-    const userText = prompt.trim();
-    if (!userText || !model || generating) return;
-
-    const now = Date.now();
-    const thread = activeThread || makeThread(model);
-    const threadId = thread.id;
-    const userMessage = { id: `user-${now}`, role: "user", content: userText, createdAt: now };
-    const assistantMessage = { id: `assistant-${now}`, role: "assistant", content: "", createdAt: now + 1, streaming: true, model };
-    const priorMessages = thread.messages.filter(m => !m.error && !m.streaming).map(({ role, content }) => ({ role, content }));
-
-    setGenerating(true);
-    setPrompt("");
-    setActiveThreadId(threadId);
-    setThreads(prev => {
-      const exists = prev.some(t => t.id === threadId);
-      const nextThread = {
-        ...thread,
-        title: thread.messages.length ? thread.title : shortTitle(userText),
-        model,
-        updatedAt: now,
-        messages: [...thread.messages, userMessage, assistantMessage],
-      };
-      return (exists ? prev.map(t => t.id === threadId ? nextThread : t) : [nextThread, ...prev]).slice(0, MAX_SAVED_THREADS);
-    });
-
-    const t0 = Date.now();
-    try {
-      const r = await fetch(`${ollamaUrl}/api/chat`, {
-        method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ model, messages: [...priorMessages, { role: "user", content: userText }], stream: true }),
-      });
-      if (!r.ok || !r.body) throw new Error(`HTTP ${r.status}`);
-      const reader = r.body.getReader();
-      const decoder = new TextDecoder();
-      let buf = "", full = "", usage = {};
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buf += decoder.decode(value, { stream: true });
-        const lines = buf.split("\n");
-        buf = lines.pop();
-        for (const line of lines) {
-          if (!line.trim()) continue;
-          let j;
-          try { j = JSON.parse(line); } catch { continue; }
-          if (j.error) throw new Error(j.error);
-          if (j.message?.content) {
-            full += j.message.content;
-            updateThread(threadId, t => ({
-              ...t,
-              updatedAt: Date.now(),
-              messages: t.messages.map(m => m.id === assistantMessage.id ? { ...m, content: full, streaming: true } : m),
-            }));
-          }
-          if (j.done) {
-            usage = {
-              prompt_tokens: j.prompt_eval_count,
-              completion_tokens: j.eval_count,
-              total_tokens: (j.prompt_eval_count || 0) + (j.eval_count || 0),
-            };
-          }
-        }
-      }
-      const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
-      updateThread(threadId, t => ({
-        ...t,
-        updatedAt: Date.now(),
-        messages: t.messages.map(m => m.id === assistantMessage.id ? { ...m, content: full, streaming: false, elapsed, usage } : m),
-      }));
-    } catch (e) {
-      updateThread(threadId, t => ({
-        ...t,
-        updatedAt: Date.now(),
-        messages: t.messages.map(m => m.id === assistantMessage.id ? { ...m, content: `Error: ${e.message}`, streaming: false, error: true } : m),
-      }));
-    }
-    setGenerating(false);
-  };
+  // REC on app load: refresh routing weights once installed models are known
+  // (prunes uninstalled models and log entries older than 30 days).
+  const recRan = useRef(false);
+  useEffect(() => {
+    if (recRan.current || !installed.length) return;
+    recRan.current = true;
+    if (loadLog().length) runREC(installed);
+  }, [installed]);
 
   // ── Model management ──
   const pullModel = async (name) => {
@@ -400,7 +211,7 @@ export default function App() {
     setBusy(b => { const n = { ...b }; delete n[name]; return n; });
     probe();
   };
-  const loadModel = (name) => setKeepAlive(name, "10m", "load");
+  const loadModel = (name) => setKeepAlive(name, keepAlivePref === "-1" ? -1 : keepAlivePref, "load");
   const unloadModel = (name) => setKeepAlive(name, 0, "unload");
 
   const deleteModel = async (name) => {
@@ -483,23 +294,51 @@ async function askLLMStream(prompt, onToken) {
 //   document.getElementById("output").textContent = soFar;
 // });`;
 
-  const corsNote = `# If other browser apps get CORS errors, restart Ollama with:
+  const pageOrigin = typeof window !== "undefined" ? window.location.origin : "";
+
+  // OLLAMA_ORIGINS setup for the official desktop app, which ignores your
+  // shell environment — the variable has to be set at the OS level.
+  const originFix = {
+    macOS: `launchctl setenv OLLAMA_ORIGINS "*"
+# then fully quit Ollama (menu-bar icon → Quit) and reopen it`,
+    Windows: `setx OLLAMA_ORIGINS "*"
+:: then quit Ollama from the system tray and reopen it`,
+    Linux: `systemctl edit ollama.service
+# add under [Service]:   Environment="OLLAMA_ORIGINS=*"
+sudo systemctl daemon-reload && sudo systemctl restart ollama`,
+  };
+  // Detected OS first, then the rest.
+  const originFixOrder = ["macOS", "Windows", "Linux"]
+    .sort((a, b) => (a === hw?.os ? -1 : b === hw?.os ? 1 : 0));
+
+  const corsNote = `# Terminal users: start Ollama with the origins allowed
 OLLAMA_ORIGINS="*" ollama serve
 
 # Or restrict to specific origins:
-OLLAMA_ORIGINS="http://localhost:3000,https://myapp.com" ollama serve`;
+OLLAMA_ORIGINS="${pageOrigin || "https://myapp.com"},http://localhost:3000" ollama serve`;
+
+  if (!gateDone) {
+    return (
+      <MatrixGate
+        onLogin={s => { setMatrixSession(s); setGateDone(true); }}
+        onSkip={() => { localStorage.setItem(GATE_SKIP_KEY, "1"); setGateDone(true); }}
+      />
+    );
+  }
 
   return (
-    <div style={{ fontFamily: sans, background: C.bg, color: C.text, minHeight: "100vh" }}>
-      <div style={{ padding: "16px 20px 12px", borderBottom: `1px solid ${C.border}`, display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 10 }}>
+    <div style={{ fontFamily: sans, background: C.bg, color: C.text, height: "100vh", display: "flex", flexDirection: "column" }}>
+      <div style={{ padding: "16px 20px 12px", borderBottom: `1px solid ${C.border}`, display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 10, flexShrink: 0 }}>
         <div>
           <div style={{ fontSize: 18, fontWeight: 700 }}><span style={{ color: C.accent }}>◆</span> LLM Manager</div>
           <div style={{ fontSize: 11, fontFamily: mono, color: C.dim, marginTop: 2 }}>
-            {ollamaUp === true ? "🟢" : ollamaUp === false ? "🔴" : "⏳"} Ollama {ollamaUp ? `v${ollamaVer}` : "offline"} · {installed.length} models
+            {ollamaUp === true ? "🟢" : ollamaUp === "cors" ? "🟠" : ollamaUp === false ? "🔴" : "⏳"}
+            {" Ollama "}
+            {ollamaUp === true ? `v${ollamaVer}` : ollamaUp === "cors" ? "blocked" : "offline"} · {installed.length} models
           </div>
         </div>
         <div style={{ display: "flex", gap: 6 }}>
-          {["status", "run", "models", "connect"].map(t => (
+          {["status", "chat", "matrix", "models", "optimize", "connect"].map(t => (
             <button key={t} onClick={() => setTab(t)} style={{
               padding: "7px 16px", fontSize: 12, fontWeight: 600, borderRadius: 8, cursor: "pointer", textTransform: "capitalize",
               border: `1px solid ${tab === t ? C.accent : C.border}`, background: tab === t ? C.accent : "transparent", color: tab === t ? "#fff" : C.dim,
@@ -508,7 +347,25 @@ OLLAMA_ORIGINS="http://localhost:3000,https://myapp.com" ollama serve`;
         </div>
       </div>
 
-      <div style={{ padding: tab === "run" ? 0 : "16px 20px", maxWidth: tab === "run" ? "none" : 820, margin: "0 auto" }}>
+      {tab === "chat" ? (
+        <div style={{ flex: 1, minHeight: 0 }}>
+          <Chat ollamaUrl={ollamaUrl} installed={installed} ollamaUp={ollamaUp} />
+        </div>
+      ) : tab === "matrix" ? (
+        <div style={{ flex: 1, minHeight: 0, overflowY: "auto" }}>
+          <MatrixChat
+            session={matrixSession}
+            onLogin={setMatrixSession}
+            onLogout={() => setMatrixSession(null)}
+            ollamaUrl={ollamaUrl}
+            ollamaUp={ollamaUp}
+            model={model}
+            models={installed}
+          />
+        </div>
+      ) : (
+      <div style={{ flex: 1, overflowY: "auto" }}>
+      <div style={{ padding: "16px 20px", maxWidth: 820, margin: "0 auto" }}>
 
         {/* ═══ STATUS ═══ */}
         {tab === "status" && (<>
@@ -533,9 +390,45 @@ OLLAMA_ORIGINS="http://localhost:3000,https://myapp.com" ollama serve`;
             {ollamaUp === false && (
               <div style={{ background: C.red + "12", border: `1px solid ${C.red}30`, borderRadius: 8, padding: "12px 16px" }}>
                 <div style={{ fontSize: 12, fontWeight: 600, color: C.red, marginBottom: 8 }}>Not reachable</div>
-                <CopyBlock copy={copy} copied={copied} text="brew install ollama" id="inst" label="1. Install" />
-                <CopyBlock copy={copy} copied={copied} text="ollama serve" id="srv" label="2. Start server" />
-                <CopyBlock copy={copy} copied={copied} text="ollama pull gemma2:2b" id="fp" label="3. Pull a model" />
+                <div style={{ fontSize: 12, color: C.dim, lineHeight: 1.6, marginBottom: 10 }}>
+                  Install the <strong style={{ color: C.text }}>official Ollama app</strong> from{" "}
+                  <a href="https://ollama.com/download" target="_blank" rel="noopener noreferrer" style={{ color: C.accent }}>ollama.com/download</a>.
+                  It runs the server as a background service automatically — a menu-bar icon on
+                  macOS, a system-tray icon on Windows — so you don't need to keep a terminal open.
+                </div>
+                <CopyBlock copy={copy} copied={copied} text="ollama pull gemma2:2b" id="fp" label="Then pull your first model" />
+                <div style={{ fontSize: 11, color: C.dim, marginTop: 8, lineHeight: 1.6 }}>
+                  Prefer the terminal? Run <code style={{ fontFamily: mono, color: C.accent }}>OLLAMA_ORIGINS="*" ollama serve</code> —
+                  the origins flag lets this page reach it.
+                </div>
+              </div>
+            )}
+            {ollamaUp === "cors" && (
+              <div style={{ background: C.orange + "12", border: `1px solid ${C.orange}40`, borderRadius: 8, padding: "12px 16px" }}>
+                <div style={{ fontSize: 12, fontWeight: 600, color: C.orange, marginBottom: 8 }}>Running — but blocking this page</div>
+                <div style={{ fontSize: 12, color: C.dim, lineHeight: 1.6, marginBottom: 12 }}>
+                  Ollama is up at <code style={{ fontFamily: mono, color: C.text }}>{ollamaUrl}</code>, but it's
+                  refusing requests from this page's origin
+                  (<code style={{ fontFamily: mono, color: C.text }}>{pageOrigin}</code>).
+                  The official desktop app ignores your shell environment, so set{" "}
+                  <code style={{ fontFamily: mono, color: C.accent }}>OLLAMA_ORIGINS</code> at the OS level,
+                  then fully quit and reopen Ollama.
+                </div>
+                {originFixOrder.map(os => (
+                  <CopyBlock key={os} copy={copy} copied={copied} id={`fix-${os}`} text={originFix[os]}
+                    label={os === hw?.os ? `${os} (your system)` : os} />
+                ))}
+                <div style={{ fontSize: 11, color: C.dim, marginTop: 8, lineHeight: 1.6 }}>
+                  Running both the Ollama app and <code style={{ fontFamily: mono, color: C.accent }}>ollama serve</code> at
+                  once? Only one process can own port 11434 — the app takes it, and the terminal
+                  server (with your origins flag) never sees the request. Either configure the app
+                  above, or quit the app and use the terminal server.
+                </div>
+                <div style={{ marginTop: 10 }}>
+                  <button onClick={probe} style={{ padding: "6px 14px", fontSize: 11, fontWeight: 600, background: C.s2, color: C.text, border: `1px solid ${C.border}`, borderRadius: 6, cursor: "pointer" }}>
+                    Re-check connection
+                  </button>
+                </div>
               </div>
             )}
             {ollamaUp === true && (<>
@@ -550,6 +443,17 @@ OLLAMA_ORIGINS="http://localhost:3000,https://myapp.com" ollama serve`;
                   ))}
                 </div>
               )}
+              <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
+                <span style={{ fontSize: 11, color: C.dim, fontFamily: mono }}>Keep loaded for</span>
+                <select value={keepAlivePref} onChange={e => setKeepAlivePref(e.target.value)} style={{ padding: "5px 10px", fontSize: 11, fontFamily: mono, background: C.bg, color: C.text, border: `1px solid ${C.border}`, borderRadius: 6 }}>
+                  <option value="5m">5m — Ollama default</option>
+                  <option value="10m">10m</option>
+                  <option value="1h">1h</option>
+                  <option value="24h">24h — stays warm all day</option>
+                  <option value="-1">forever (until unload)</option>
+                </select>
+                <span style={{ fontSize: 10, color: C.dim }}>longer = no cold-load delay</span>
+              </div>
               <div style={{ fontSize: 11, color: C.dim, marginBottom: 4 }}>Installed ({installed.length}):</div>
               {installed.map(m => {
                 const loaded = running.some(r => r.name === m.name);
@@ -570,98 +474,6 @@ OLLAMA_ORIGINS="http://localhost:3000,https://myapp.com" ollama serve`;
             </>)}
           </Box>
         </>)}
-
-        {/* ═══ RUN ═══ */}
-        {tab === "run" && (
-          <div style={{ display: "grid", gridTemplateColumns: "280px minmax(0, 1fr)", height: "calc(100vh - 67px)", minHeight: 520 }}>
-            <aside style={{ borderRight: `1px solid ${C.border}`, background: C.s1, display: "flex", flexDirection: "column", minHeight: 0 }}>
-              <div style={{ padding: 14, borderBottom: `1px solid ${C.border}` }}>
-                <button onClick={startNewChat} style={{ width: "100%", padding: "10px 12px", borderRadius: 9, border: `1px solid ${C.border}`, background: C.s2, color: C.text, cursor: "pointer", fontWeight: 700, fontSize: 12 }}>
-                  + New chat
-                </button>
-              </div>
-              <div style={{ padding: "10px 10px 6px", fontSize: 10, fontFamily: mono, color: C.dim, textTransform: "uppercase", letterSpacing: 0.7 }}>History</div>
-              <div style={{ overflowY: "auto", padding: "0 8px 12px", flex: 1 }}>
-                {sortedThreads.length === 0 ? (
-                  <div style={{ color: C.dim, fontSize: 12, lineHeight: 1.5, padding: "8px 10px" }}>Start a chat to build a threaded conversation history.</div>
-                ) : sortedThreads.map(t => {
-                  const active = t.id === activeThreadId;
-                  const last = t.messages[t.messages.length - 1];
-                  return (
-                    <button key={t.id} onClick={() => setActiveThreadId(t.id)} style={{
-                      display: "block", width: "100%", textAlign: "left", padding: "10px 11px", marginBottom: 6, borderRadius: 9,
-                      border: `1px solid ${active ? C.accent : "transparent"}`, background: active ? C.accent + "20" : "transparent", color: C.text, cursor: "pointer",
-                    }}>
-                      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, marginBottom: 3 }}>
-                        <span style={{ fontSize: 12, fontWeight: 700, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{t.title}</span>
-                        <span style={{ fontSize: 9, fontFamily: mono, color: C.dim, flexShrink: 0 }}>{t.messages.length}</span>
-                      </div>
-                      <div style={{ fontSize: 10, color: C.dim, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{last?.content || "No messages yet"}</div>
-                      <div style={{ fontSize: 9, color: C.dim, marginTop: 4, fontFamily: mono }}>{formatTime(t.updatedAt)}</div>
-                    </button>
-                  );
-                })}
-              </div>
-            </aside>
-
-            <main style={{ display: "flex", flexDirection: "column", minHeight: 0, background: C.bg }}>
-              <div style={{ padding: "12px 18px", borderBottom: `1px solid ${C.border}`, display: "flex", gap: 10, alignItems: "center" }}>
-                <select value={model} onChange={e => setModel(e.target.value)} style={{ flex: 1, maxWidth: 420, padding: "8px 12px", fontSize: 12, fontFamily: mono, background: C.s1, color: C.text, border: `1px solid ${C.border}`, borderRadius: 8 }}>
-                  {installed.length === 0 && <option value="">no models installed</option>}
-                  {installed.map(m => <option key={m.name} value={m.name}>{m.name} ({fmtB(m.size)})</option>)}
-                </select>
-                <div style={{ fontSize: 11, color: C.dim, fontFamily: mono, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                  {activeThread ? activeThread.title : "New chat"}
-                </div>
-              </div>
-
-              {ollamaUp === false ? (
-                <div style={{ margin: 20, fontSize: 12, color: C.red }}>Ollama not running — check the Status tab for setup.</div>
-              ) : (
-                <>
-                  <div style={{ flex: 1, overflowY: "auto", padding: "22px 24px", minHeight: 0 }}>
-                    <div style={{ maxWidth: 820, margin: "0 auto" }}>
-                      {!activeThread || activeThread.messages.length === 0 ? (
-                        <div style={{ minHeight: "45vh", display: "flex", alignItems: "center", justifyContent: "center", textAlign: "center", color: C.dim }}>
-                          <div>
-                            <div style={{ fontSize: 30, marginBottom: 10 }}>◆</div>
-                            <div style={{ fontSize: 20, fontWeight: 700, color: C.text, marginBottom: 6 }}>How can I help?</div>
-                            <div style={{ fontSize: 13 }}>Send a message to start a threaded chat. Older messages stay above as the conversation scrolls.</div>
-                          </div>
-                        </div>
-                      ) : activeThread.messages.map(m => (
-                        <ChatBubble key={m.id} message={m} copy={copy} copied={copied} fork={generating ? null : forkThread} />
-                      ))}
-                      <div ref={chatEndRef} />
-                    </div>
-                  </div>
-
-                  <div style={{ borderTop: `1px solid ${C.border}`, padding: "14px 24px 18px", background: C.bg }}>
-                    <div style={{ maxWidth: 820, margin: "0 auto" }}>
-                      <div style={{ background: C.s1, border: `1px solid ${C.border}`, borderRadius: 14, padding: 10, boxShadow: "0 -8px 30px #00000022" }}>
-                        <textarea
-                          value={prompt} onChange={e => setPrompt(e.target.value)}
-                          onKeyDown={e => { if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) generate(); }}
-                          placeholder="Message LLM Manager… ⌘/Ctrl+Enter to send"
-                          rows={3}
-                          style={{ width: "100%", padding: "8px 10px", fontSize: 14, background: "transparent", color: C.text, border: "none", outline: "none", resize: "none", boxSizing: "border-box", lineHeight: 1.5, fontFamily: sans }}
-                        />
-                        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10 }}>
-                          <span style={{ fontSize: 10, color: C.dim, fontFamily: mono }}>{activeThread?.messages.length || 0} messages in thread</span>
-                          <button onClick={generate} disabled={generating || !model || !prompt.trim()} style={{
-                            padding: "8px 18px", fontSize: 12, fontWeight: 700, borderRadius: 9, border: "none",
-                            cursor: generating ? "wait" : "pointer", background: generating ? C.s2 : C.accent,
-                            color: generating ? C.dim : "#fff", opacity: (!model || !prompt.trim()) ? 0.4 : 1,
-                          }}>{generating ? "Generating…" : "Send"}</button>
-                        </div>
-                      </div>
-                    </div>
-                  </div>
-                </>
-              )}
-            </main>
-          </div>
-        )}
 
         {/* ═══ MODELS ═══ */}
         {tab === "models" && (<>
@@ -708,6 +520,86 @@ OLLAMA_ORIGINS="http://localhost:3000,https://myapp.com" ollama serve`;
           </Box>
         </>)}
 
+        {/* ═══ OPTIMIZE ═══ */}
+        {tab === "optimize" && (() => {
+          const tone = { best: C.green, ok: C.accent, warn: C.orange, bad: C.red };
+          const serverEnv = `# Keep models warm across requests (default 5m)
+launchctl setenv OLLAMA_KEEP_ALIVE 24h
+
+# Flash attention — faster, smaller KV cache
+launchctl setenv OLLAMA_FLASH_ATTENTION 1
+
+# Quantize the KV cache to halve its memory footprint
+launchctl setenv OLLAMA_KV_CACHE_TYPE q8_0
+
+# Then restart the server for the env vars to take effect
+ollama serve`;
+          return (<>
+            <RoutingPanel installed={installed} />
+
+            <Box title="Quantization" sub="The biggest speed lever. Fewer bits per weight = less memory to move per token = faster.">
+              <div style={{ fontSize: 12, color: C.dim, lineHeight: 1.6, marginBottom: 12 }}>
+                A 7B model is ~14&nbsp;GB at F16 but only ~4.4&nbsp;GB at Q4_K_M — and runs 3–4x faster.
+                Quality loss is minimal down to Q4. Below that it degrades fast.
+              </div>
+              {QUANT_LEVELS.map(l => (
+                <div key={l.q} style={{ display: "flex", alignItems: "center", gap: 10, padding: "7px 0", borderBottom: `1px solid ${C.s3}` }}>
+                  <span style={{ fontFamily: mono, fontSize: 12, fontWeight: 600, width: 64, flexShrink: 0, color: tone[l.tone] }}>{l.q}</span>
+                  <span style={{ fontFamily: mono, fontSize: 10, color: C.dim, width: 64, flexShrink: 0 }}>{l.bpw} bpw</span>
+                  <span style={{ fontSize: 11, color: C.dim }}>{l.note}</span>
+                </div>
+              ))}
+            </Box>
+
+            <Box title="Speed on Apple Silicon" sub="Approximate warm throughput — first token is slower if the model cold-loads.">
+              {SPEED_TIERS.map(s => (
+                <div key={s.tier} style={{ display: "flex", alignItems: "center", gap: 10, padding: "7px 0", borderBottom: `1px solid ${C.s3}` }}>
+                  <span style={{ fontFamily: mono, fontSize: 11, fontWeight: 600, width: 180, flexShrink: 0 }}>{s.tier}</span>
+                  <Pill color={C.accent}>{s.tps}</Pill>
+                  <span style={{ fontSize: 11, color: C.dim }}>{s.note}</span>
+                </div>
+              ))}
+              <div style={{ fontSize: 11, color: C.dim, lineHeight: 1.6, marginTop: 12 }}>
+                The hard ceiling is <strong style={{ color: C.text }}>memory bandwidth</strong> (~100&nbsp;GB/s on an M3).
+                Every token reads the whole model from memory, so token speed scales with model size.
+                Quantization helps by shrinking how much data moves per token — everything else is marginal.
+              </div>
+            </Box>
+
+            <Box title="Keep models warm" sub="Cold-loading a model into GPU memory can take 30s+. Keep it resident between requests.">
+              <div style={{ fontSize: 12, color: C.dim, lineHeight: 1.6, marginBottom: 10 }}>
+                Use the keep-alive selector on the <strong style={{ color: C.text }}>Status</strong> tab to load a model
+                and pin it in memory. To make Ollama keep every model warm by default, set the env var below.
+              </div>
+              <CopyBlock copy={copy} copied={copied} id="opt-env" text={serverEnv} label="Server tuning — paste into terminal" />
+            </Box>
+
+            <Box title="Context window" sub="Ollama defaults num_ctx to 4096. Smaller windows shrink the KV cache and speed up the first token.">
+              <div style={{ fontSize: 12, color: C.dim, lineHeight: 1.6 }}>
+                Every request can pass <code style={{ fontFamily: mono, color: C.accent }}>options.num_ctx</code> to size
+                the context window; set a server-wide default with the
+                <code style={{ fontFamily: mono, color: C.accent }}> OLLAMA_CONTEXT_LENGTH</code> env var.
+                Keep it at 2048–4096 for short prompts; raise it only when you actually feed in long documents,
+                since a larger window means a larger KV cache and a slower first token.
+              </div>
+            </Box>
+
+            <Box title="Free up memory & MoE tradeoffs">
+              <div style={{ fontSize: 12, color: C.dim, lineHeight: 1.6, marginBottom: 10 }}>
+                Every GB you free is a GB Ollama can use. Electron apps (Slack, Discord, VS Code) and browser tabs
+                are the usual culprits — check what's eating memory:
+              </div>
+              <CopyBlock copy={copy} copied={copied} id="opt-top" text="top -o mem" label="See what's using memory" />
+              <div style={{ fontSize: 12, color: C.dim, lineHeight: 1.6, marginTop: 10 }}>
+                <strong style={{ color: C.text }}>MoE models</strong> (e.g. Mixtral 8x7B) activate only a fraction of their
+                weights per token, so they run faster than a dense model of the same total size — but they still need
+                <em> all</em> the weights in memory. They only win when you have memory to spare; otherwise a good dense
+                7–8B model is faster.
+              </div>
+            </Box>
+          </>);
+        })()}
+
         {/* ═══ CONNECT ═══ */}
         {tab === "connect" && (<>
           <Box title="Connect Other Browser Apps" sub="Any web app running locally can call your Ollama models directly via fetch. Copy these snippets into your app code.">
@@ -740,11 +632,24 @@ OLLAMA_ORIGINS="http://localhost:3000,https://myapp.com" ollama serve`;
             </>)}
           </Box>
 
-          <Box title="CORS Setup" sub="If your browser app is on a different origin and gets blocked">
+          <Box title="CORS Setup" sub="Why a hosted page can't reach a freshly-installed Ollama">
             <div style={{ fontSize: 12, color: C.dim, lineHeight: 1.6, marginBottom: 10 }}>
-              By default Ollama allows requests from any origin. If you run into CORS errors, restart Ollama with the <code style={{ fontFamily: mono, color: C.accent }}>OLLAMA_ORIGINS</code> env var:
+              Ollama only answers browser requests whose origin is listed in{" "}
+              <code style={{ fontFamily: mono, color: C.accent }}>OLLAMA_ORIGINS</code> — by default just
+              localhost. A page served from GitHub Pages (or any other host) is blocked until you add it.
+              For the terminal server, pass the variable when you start it:
             </div>
             <CopyBlock copy={copy} copied={copied} id="cors" text={corsNote} />
+            <div style={{ fontSize: 12, color: C.dim, lineHeight: 1.6, marginTop: 12 }}>
+              The <strong style={{ color: C.text }}>official desktop app</strong> ignores shell variables —
+              set them at the OS level instead, then quit and reopen Ollama:
+            </div>
+            {originFixOrder.map(os => (
+              <div key={os} style={{ marginTop: 8 }}>
+                <CopyBlock copy={copy} copied={copied} id={`conn-fix-${os}`} text={originFix[os]}
+                  label={os === hw?.os ? `${os} (your system)` : os} />
+              </div>
+            ))}
           </Box>
 
           <Box title="API Reference">
@@ -759,6 +664,8 @@ OLLAMA_ORIGINS="http://localhost:3000,https://myapp.com" ollama serve`;
           </Box>
         </>)}
       </div>
+      </div>
+      )}
     </div>
   );
 }
