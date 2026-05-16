@@ -1,5 +1,12 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import Chat from "./Chat.jsx";
+import RoutingPanel from "./RoutingPanel.jsx";
+import MatrixGate from "./MatrixGate.jsx";
+import MatrixChat from "./MatrixChat.jsx";
+import { loadLog, runREC } from "./router.js";
+import { loadSession } from "./matrix.js";
+
+const GATE_SKIP_KEY = "llm-manager-gate-skipped";
 
 const MODEL_CATALOG = [
   { id: "gemma2:2b", params: "2B", vram: 1.5, speed: "fast", use: "Light tasks, quick responses" },
@@ -77,6 +84,10 @@ const Box = ({ title, sub, children }) => (
 
 export default function App() {
   const [tab, setTab] = useState("status");
+  const [matrixSession, setMatrixSession] = useState(loadSession);
+  const [gateDone, setGateDone] = useState(
+    () => !!loadSession() || localStorage.getItem(GATE_SKIP_KEY) === "1",
+  );
   const [ollamaUrl, setOllamaUrl] = useState("http://localhost:11434");
   const [ollamaUp, setOllamaUp] = useState(null);
   const [ollamaVer, setOllamaVer] = useState("");
@@ -144,6 +155,15 @@ export default function App() {
   }, [ollamaUrl]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => { probe(); }, [probe]);
+
+  // REC on app load: refresh routing weights once installed models are known
+  // (prunes uninstalled models and log entries older than 30 days).
+  const recRan = useRef(false);
+  useEffect(() => {
+    if (recRan.current || !installed.length) return;
+    recRan.current = true;
+    if (loadLog().length) runREC(installed);
+  }, [installed]);
 
   // ── Model management ──
   const pullModel = async (name) => {
@@ -297,6 +317,15 @@ OLLAMA_ORIGINS="*" ollama serve
 # Or restrict to specific origins:
 OLLAMA_ORIGINS="${pageOrigin || "https://myapp.com"},http://localhost:3000" ollama serve`;
 
+  if (!gateDone) {
+    return (
+      <MatrixGate
+        onLogin={s => { setMatrixSession(s); setGateDone(true); }}
+        onSkip={() => { localStorage.setItem(GATE_SKIP_KEY, "1"); setGateDone(true); }}
+      />
+    );
+  }
+
   return (
     <div style={{ fontFamily: sans, background: C.bg, color: C.text, height: "100vh", display: "flex", flexDirection: "column" }}>
       <div style={{ padding: "16px 20px 12px", borderBottom: `1px solid ${C.border}`, display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 10, flexShrink: 0 }}>
@@ -309,7 +338,7 @@ OLLAMA_ORIGINS="${pageOrigin || "https://myapp.com"},http://localhost:3000" olla
           </div>
         </div>
         <div style={{ display: "flex", gap: 6 }}>
-          {["status", "chat", "models", "optimize", "connect"].map(t => (
+          {["status", "chat", "matrix", "models", "optimize", "connect"].map(t => (
             <button key={t} onClick={() => setTab(t)} style={{
               padding: "7px 16px", fontSize: 12, fontWeight: 600, borderRadius: 8, cursor: "pointer", textTransform: "capitalize",
               border: `1px solid ${tab === t ? C.accent : C.border}`, background: tab === t ? C.accent : "transparent", color: tab === t ? "#fff" : C.dim,
@@ -321,6 +350,18 @@ OLLAMA_ORIGINS="${pageOrigin || "https://myapp.com"},http://localhost:3000" olla
       {tab === "chat" ? (
         <div style={{ flex: 1, minHeight: 0 }}>
           <Chat ollamaUrl={ollamaUrl} installed={installed} ollamaUp={ollamaUp} />
+        </div>
+      ) : tab === "matrix" ? (
+        <div style={{ flex: 1, minHeight: 0, overflowY: "auto" }}>
+          <MatrixChat
+            session={matrixSession}
+            onLogin={setMatrixSession}
+            onLogout={() => setMatrixSession(null)}
+            ollamaUrl={ollamaUrl}
+            ollamaUp={ollamaUp}
+            model={model}
+            models={installed}
+          />
         </div>
       ) : (
       <div style={{ flex: 1, overflowY: "auto" }}>
@@ -494,6 +535,8 @@ launchctl setenv OLLAMA_KV_CACHE_TYPE q8_0
 # Then restart the server for the env vars to take effect
 ollama serve`;
           return (<>
+            <RoutingPanel installed={installed} />
+
             <Box title="Quantization" sub="The biggest speed lever. Fewer bits per weight = less memory to move per token = faster.">
               <div style={{ fontSize: 12, color: C.dim, lineHeight: 1.6, marginBottom: 12 }}>
                 A 7B model is ~14&nbsp;GB at F16 but only ~4.4&nbsp;GB at Q4_K_M — and runs 3–4x faster.

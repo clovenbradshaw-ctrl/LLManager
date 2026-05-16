@@ -39,6 +39,24 @@ If you start Ollama from a terminal instead, pass it inline:
 if the desktop app is running, the terminal server won't bind. The **Status**
 tab detects this case and shows the exact fix.
 
+## Matrix login & remote LLM bridge
+
+The app opens to a **Matrix sign-in gate**. Sign in with any Matrix account
+(homeserver discovery via `.well-known`, defaults to `matrix.org`), or skip it
+to use the local Ollama dashboard only — the choice is remembered.
+
+Once signed in, the **Matrix** tab is a lightweight chat client: it lists your
+joined rooms and lets you read and send messages. The same app works on every
+device — on your phone it is just a Matrix client.
+
+On the device running Ollama, open a room and press **Start LLM bridge**. From
+then on, every message that arrives in that room is routed to your local model
+and the answer is posted back as a Matrix notice. So you can chat from your
+phone (or any Matrix client) and have the device with the LLM answer for you.
+
+Bridge replies are sent as `m.notice`, so the host never answers its own
+output — no feedback loop.
+
 ## Local development
 
 ```bash
