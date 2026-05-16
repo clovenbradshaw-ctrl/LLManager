@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import Markdown from "./Markdown.jsx";
 
 const MODEL_CATALOG = [
@@ -25,6 +25,46 @@ const C = {
   bg: "#0b0b0f", s1: "#131318", s2: "#1b1b22", s3: "#232330",
   border: "#282838", text: "#d4d4e4", dim: "#65657e", accent: "#6e56cf",
   green: "#30a46c", red: "#e5484d", orange: "#f76b15",
+};
+
+const CHAT_STORE_KEY = "llm-manager-chat-threads";
+const MAX_SAVED_THREADS = 30;
+
+const makeThread = (model = "") => {
+  const now = Date.now();
+  return {
+    id: `thread-${now}-${Math.random().toString(36).slice(2, 8)}`,
+    title: "New chat",
+    model,
+    createdAt: now,
+    updatedAt: now,
+    messages: [],
+  };
+};
+
+const shortTitle = (text) => {
+  const cleaned = text.replace(/\s+/g, " ").trim();
+  return cleaned.length > 38 ? `${cleaned.slice(0, 38)}…` : cleaned || "New chat";
+};
+
+const formatTime = (ts) => {
+  if (!ts) return "";
+  return new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" }).format(ts);
+};
+
+const loadStoredThreads = () => {
+  try {
+    const raw = localStorage.getItem(CHAT_STORE_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed
+      .filter(t => t && typeof t.id === "string" && Array.isArray(t.messages))
+      .map(t => ({ ...t, title: t.title || "New chat", messages: t.messages.filter(m => m && m.role && typeof m.content === "string") }))
+      .slice(0, MAX_SAVED_THREADS);
+  } catch {
+    return [];
+  }
 };
 
 const Pill = ({ color, children }) => (
@@ -66,6 +106,52 @@ const Box = ({ title, sub, children }) => (
   </div>
 );
 
+const ChatBubble = ({ message, copy, copied }) => {
+  const isUser = message.role === "user";
+  const isAssistant = message.role === "assistant";
+  return (
+    <div style={{ display: "flex", justifyContent: isUser ? "flex-end" : "flex-start", padding: "8px 0" }}>
+      <div style={{ maxWidth: isUser ? "78%" : "100%", minWidth: 0 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 8, justifyContent: isUser ? "flex-end" : "flex-start", marginBottom: 4 }}>
+          <span style={{ fontSize: 10, fontFamily: mono, color: C.dim, textTransform: "uppercase", letterSpacing: 0.5 }}>{isUser ? "You" : "Assistant"}</span>
+          {message.elapsed && <span style={{ fontSize: 10, fontFamily: mono, color: C.dim }}>{message.elapsed}s</span>}
+        </div>
+        <div style={{
+          background: isUser ? C.accent : "transparent",
+          border: isUser ? "none" : `1px solid ${C.border}`,
+          color: isUser ? "#fff" : C.text,
+          borderRadius: isUser ? "18px 18px 4px 18px" : "18px 18px 18px 4px",
+          padding: isUser ? "10px 14px" : "12px 14px",
+          boxShadow: isUser ? "0 8px 24px #00000020" : "none",
+          wordBreak: "break-word",
+        }}>
+          {message.error ? (
+            <pre style={{ fontFamily: sans, fontSize: 13, lineHeight: 1.6, whiteSpace: "pre-wrap", wordBreak: "break-word", color: C.red, margin: 0 }}>{message.content}</pre>
+          ) : isAssistant ? (
+            <>
+              {message.streaming && <ThinkingBar label={message.content ? "Generating…" : "Thinking…"} />}
+              <Markdown text={message.content} />
+              {message.streaming && (
+                <span style={{ display: "inline-block", width: 8, height: 15, marginLeft: 1, background: C.accent, verticalAlign: "text-bottom", animation: "llm-cursor-blink 1s step-start infinite" }} />
+              )}
+            </>
+          ) : (
+            <div style={{ fontSize: 13, lineHeight: 1.5, whiteSpace: "pre-wrap" }}>{message.content}</div>
+          )}
+        </div>
+        {isAssistant && message.content && !message.streaming && !message.error && (
+          <div style={{ display: "flex", gap: 8, marginTop: 6 }}>
+            <button onClick={() => copy(message.content, `msg-${message.id}`)} style={{
+              padding: "4px 10px", fontSize: 10, fontFamily: mono, borderRadius: 6, border: "none", cursor: "pointer",
+              background: copied === `msg-${message.id}` ? C.green : C.s2, color: copied === `msg-${message.id}` ? "#000" : C.dim,
+            }}>{copied === `msg-${message.id}` ? "✓" : "copy"}</button>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+};
+
 export default function App() {
   const [tab, setTab] = useState("status");
   const [ollamaUrl, setOllamaUrl] = useState("http://localhost:11434");
@@ -78,11 +164,38 @@ export default function App() {
   const [model, setModel] = useState("");
   const [prompt, setPrompt] = useState("");
   const [generating, setGenerating] = useState(false);
-  const [response, setResponse] = useState(null);
-  const [history, setHistory] = useState([]);
+  const [threads, setThreads] = useState(loadStoredThreads);
+  const [activeThreadId, setActiveThreadId] = useState(() => loadStoredThreads()[0]?.id || null);
+  const chatEndRef = useRef(null);
   const [copied, setCopied] = useState(null);
   const [pulling, setPulling] = useState({}); // { [name]: { status, completed, total, error } }
   const [busy, setBusy] = useState({});       // { [name]: "load" | "unload" | "delete" }
+
+  const sortedThreads = useMemo(() => [...threads].sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0)), [threads]);
+  const activeThread = useMemo(() => threads.find(t => t.id === activeThreadId) || null, [threads, activeThreadId]);
+
+  useEffect(() => {
+    localStorage.setItem(CHAT_STORE_KEY, JSON.stringify(sortedThreads.slice(0, MAX_SAVED_THREADS)));
+  }, [sortedThreads]);
+
+  useEffect(() => {
+    if (!activeThreadId && sortedThreads.length) setActiveThreadId(sortedThreads[0].id);
+  }, [activeThreadId, sortedThreads]);
+
+  useEffect(() => {
+    chatEndRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
+  }, [activeThread?.messages, generating]);
+
+  const startNewChat = () => {
+    const thread = makeThread(model);
+    setThreads(prev => [thread, ...prev].slice(0, MAX_SAVED_THREADS));
+    setActiveThreadId(thread.id);
+    setPrompt("");
+  };
+
+  const updateThread = (threadId, updater) => {
+    setThreads(prev => prev.map(t => t.id === threadId ? updater(t) : t));
+  };
 
   // ── Hardware ──
   useEffect(() => {
@@ -130,14 +243,36 @@ export default function App() {
 
   // ── Generate (streaming) ──
   const generate = async () => {
-    if (!prompt.trim() || !model) return;
+    const userText = prompt.trim();
+    if (!userText || !model || generating) return;
+
+    const now = Date.now();
+    const thread = activeThread || makeThread(model);
+    const threadId = thread.id;
+    const userMessage = { id: `user-${now}`, role: "user", content: userText, createdAt: now };
+    const assistantMessage = { id: `assistant-${now}`, role: "assistant", content: "", createdAt: now + 1, streaming: true, model };
+    const priorMessages = thread.messages.filter(m => !m.error && !m.streaming).map(({ role, content }) => ({ role, content }));
+
     setGenerating(true);
-    setResponse({ id: "stream", prompt, model, content: "", streaming: true });
+    setPrompt("");
+    setActiveThreadId(threadId);
+    setThreads(prev => {
+      const exists = prev.some(t => t.id === threadId);
+      const nextThread = {
+        ...thread,
+        title: thread.messages.length ? thread.title : shortTitle(userText),
+        model,
+        updatedAt: now,
+        messages: [...thread.messages, userMessage, assistantMessage],
+      };
+      return (exists ? prev.map(t => t.id === threadId ? nextThread : t) : [nextThread, ...prev]).slice(0, MAX_SAVED_THREADS);
+    });
+
     const t0 = Date.now();
     try {
       const r = await fetch(`${ollamaUrl}/api/chat`, {
         method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ model, messages: [{ role: "user", content: prompt }], stream: true }),
+        body: JSON.stringify({ model, messages: [...priorMessages, { role: "user", content: userText }], stream: true }),
       });
       if (!r.ok || !r.body) throw new Error(`HTTP ${r.status}`);
       const reader = r.body.getReader();
@@ -156,7 +291,11 @@ export default function App() {
           if (j.error) throw new Error(j.error);
           if (j.message?.content) {
             full += j.message.content;
-            setResponse(prev => ({ ...prev, content: full, streaming: true }));
+            updateThread(threadId, t => ({
+              ...t,
+              updatedAt: Date.now(),
+              messages: t.messages.map(m => m.id === assistantMessage.id ? { ...m, content: full, streaming: true } : m),
+            }));
           }
           if (j.done) {
             usage = {
@@ -168,11 +307,17 @@ export default function App() {
         }
       }
       const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
-      const result = { id: Date.now().toString(), prompt, model, elapsed, content: full, usage };
-      setResponse(result);
-      setHistory(prev => [result, ...prev].slice(0, 50));
+      updateThread(threadId, t => ({
+        ...t,
+        updatedAt: Date.now(),
+        messages: t.messages.map(m => m.id === assistantMessage.id ? { ...m, content: full, streaming: false, elapsed, usage } : m),
+      }));
     } catch (e) {
-      setResponse({ id: "err", content: `Error: ${e.message}`, error: true });
+      updateThread(threadId, t => ({
+        ...t,
+        updatedAt: Date.now(),
+        messages: t.messages.map(m => m.id === assistantMessage.id ? { ...m, content: `Error: ${e.message}`, streaming: false, error: true } : m),
+      }));
     }
     setGenerating(false);
   };
@@ -331,7 +476,7 @@ OLLAMA_ORIGINS="http://localhost:3000,https://myapp.com" ollama serve`;
         </div>
       </div>
 
-      <div style={{ padding: "16px 20px", maxWidth: 820, margin: "0 auto" }}>
+      <div style={{ padding: tab === "run" ? 0 : "16px 20px", maxWidth: tab === "run" ? "none" : 820, margin: "0 auto" }}>
 
         {/* ═══ STATUS ═══ */}
         {tab === "status" && (<>
@@ -395,83 +540,96 @@ OLLAMA_ORIGINS="http://localhost:3000,https://myapp.com" ollama serve`;
         </>)}
 
         {/* ═══ RUN ═══ */}
-        {tab === "run" && (<>
-          <Box title="Prompt">
-            {ollamaUp === false ? (
-              <div style={{ fontSize: 12, color: C.red }}>Ollama not running — check the Status tab for setup.</div>
-            ) : (<>
-              <select value={model} onChange={e => setModel(e.target.value)} style={{ width: "100%", padding: "8px 12px", fontSize: 12, fontFamily: mono, background: C.bg, color: C.text, border: `1px solid ${C.border}`, borderRadius: 6, marginBottom: 10 }}>
-                {installed.length === 0 && <option value="">no models installed</option>}
-                {installed.map(m => <option key={m.name} value={m.name}>{m.name} ({fmtB(m.size)})</option>)}
-              </select>
-              <textarea
-                value={prompt} onChange={e => setPrompt(e.target.value)}
-                onKeyDown={e => { if (e.key === "Enter" && e.metaKey) generate(); }}
-                placeholder="Type a prompt… ⌘+Enter to send"
-                rows={4}
-                style={{ width: "100%", padding: "10px 14px", fontSize: 13, background: C.bg, color: C.text, border: `1px solid ${C.border}`, borderRadius: 8, resize: "vertical", boxSizing: "border-box", lineHeight: 1.5, fontFamily: sans }}
-              />
-              <div style={{ display: "flex", justifyContent: "flex-end", marginTop: 8 }}>
-                <button onClick={generate} disabled={generating || !model || !prompt.trim()} style={{
-                  padding: "9px 24px", fontSize: 13, fontWeight: 700, borderRadius: 8, border: "none",
-                  cursor: generating ? "wait" : "pointer", background: generating ? C.s2 : C.accent,
-                  color: generating ? C.dim : "#fff", opacity: (!model || !prompt.trim()) ? 0.4 : 1,
-                }}>{generating ? "Generating…" : "Send"}</button>
+        {tab === "run" && (
+          <div style={{ display: "grid", gridTemplateColumns: "280px minmax(0, 1fr)", height: "calc(100vh - 67px)", minHeight: 520 }}>
+            <aside style={{ borderRight: `1px solid ${C.border}`, background: C.s1, display: "flex", flexDirection: "column", minHeight: 0 }}>
+              <div style={{ padding: 14, borderBottom: `1px solid ${C.border}` }}>
+                <button onClick={startNewChat} style={{ width: "100%", padding: "10px 12px", borderRadius: 9, border: `1px solid ${C.border}`, background: C.s2, color: C.text, cursor: "pointer", fontWeight: 700, fontSize: 12 }}>
+                  + New chat
+                </button>
               </div>
-            </>)}
-          </Box>
+              <div style={{ padding: "10px 10px 6px", fontSize: 10, fontFamily: mono, color: C.dim, textTransform: "uppercase", letterSpacing: 0.7 }}>History</div>
+              <div style={{ overflowY: "auto", padding: "0 8px 12px", flex: 1 }}>
+                {sortedThreads.length === 0 ? (
+                  <div style={{ color: C.dim, fontSize: 12, lineHeight: 1.5, padding: "8px 10px" }}>Start a chat to build a threaded conversation history.</div>
+                ) : sortedThreads.map(t => {
+                  const active = t.id === activeThreadId;
+                  const last = t.messages[t.messages.length - 1];
+                  return (
+                    <button key={t.id} onClick={() => setActiveThreadId(t.id)} style={{
+                      display: "block", width: "100%", textAlign: "left", padding: "10px 11px", marginBottom: 6, borderRadius: 9,
+                      border: `1px solid ${active ? C.accent : "transparent"}`, background: active ? C.accent + "20" : "transparent", color: C.text, cursor: "pointer",
+                    }}>
+                      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, marginBottom: 3 }}>
+                        <span style={{ fontSize: 12, fontWeight: 700, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{t.title}</span>
+                        <span style={{ fontSize: 9, fontFamily: mono, color: C.dim, flexShrink: 0 }}>{t.messages.length}</span>
+                      </div>
+                      <div style={{ fontSize: 10, color: C.dim, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{last?.content || "No messages yet"}</div>
+                      <div style={{ fontSize: 9, color: C.dim, marginTop: 4, fontFamily: mono }}>{formatTime(t.updatedAt)}</div>
+                    </button>
+                  );
+                })}
+              </div>
+            </aside>
 
-          {response && (
-            <Box
-              title={response.error ? "Error" : "Response"}
-              sub={response.error ? null : response.streaming ? "streaming…" : `${response.model} · ${response.elapsed}s · ${response.usage.total_tokens || "?"} tokens`}
-            >
-              {response.error ? (
-                <pre style={{ fontFamily: sans, fontSize: 13, lineHeight: 1.6, whiteSpace: "pre-wrap", wordBreak: "break-word", color: C.red, margin: 0, maxHeight: 400, overflowY: "auto" }}>
-                  {response.content}
-                </pre>
+            <main style={{ display: "flex", flexDirection: "column", minHeight: 0, background: C.bg }}>
+              <div style={{ padding: "12px 18px", borderBottom: `1px solid ${C.border}`, display: "flex", gap: 10, alignItems: "center" }}>
+                <select value={model} onChange={e => setModel(e.target.value)} style={{ flex: 1, maxWidth: 420, padding: "8px 12px", fontSize: 12, fontFamily: mono, background: C.s1, color: C.text, border: `1px solid ${C.border}`, borderRadius: 8 }}>
+                  {installed.length === 0 && <option value="">no models installed</option>}
+                  {installed.map(m => <option key={m.name} value={m.name}>{m.name} ({fmtB(m.size)})</option>)}
+                </select>
+                <div style={{ fontSize: 11, color: C.dim, fontFamily: mono, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                  {activeThread ? activeThread.title : "New chat"}
+                </div>
+              </div>
+
+              {ollamaUp === false ? (
+                <div style={{ margin: 20, fontSize: 12, color: C.red }}>Ollama not running — check the Status tab for setup.</div>
               ) : (
                 <>
-                  {response.streaming && (
-                    <ThinkingBar label={response.content ? "Generating…" : "Thinking…"} />
-                  )}
-                  <div style={{ maxHeight: 400, overflowY: "auto" }}>
-                    <Markdown text={response.content} />
-                    {response.streaming && (
-                      <span style={{ display: "inline-block", width: 8, height: 15, marginLeft: 1, background: C.accent, verticalAlign: "text-bottom", animation: "llm-cursor-blink 1s step-start infinite" }} />
-                    )}
+                  <div style={{ flex: 1, overflowY: "auto", padding: "22px 24px", minHeight: 0 }}>
+                    <div style={{ maxWidth: 820, margin: "0 auto" }}>
+                      {!activeThread || activeThread.messages.length === 0 ? (
+                        <div style={{ minHeight: "45vh", display: "flex", alignItems: "center", justifyContent: "center", textAlign: "center", color: C.dim }}>
+                          <div>
+                            <div style={{ fontSize: 30, marginBottom: 10 }}>◆</div>
+                            <div style={{ fontSize: 20, fontWeight: 700, color: C.text, marginBottom: 6 }}>How can I help?</div>
+                            <div style={{ fontSize: 13 }}>Send a message to start a threaded chat. Older messages stay above as the conversation scrolls.</div>
+                          </div>
+                        </div>
+                      ) : activeThread.messages.map(m => (
+                        <ChatBubble key={m.id} message={m} copy={copy} copied={copied} />
+                      ))}
+                      <div ref={chatEndRef} />
+                    </div>
+                  </div>
+
+                  <div style={{ borderTop: `1px solid ${C.border}`, padding: "14px 24px 18px", background: C.bg }}>
+                    <div style={{ maxWidth: 820, margin: "0 auto" }}>
+                      <div style={{ background: C.s1, border: `1px solid ${C.border}`, borderRadius: 14, padding: 10, boxShadow: "0 -8px 30px #00000022" }}>
+                        <textarea
+                          value={prompt} onChange={e => setPrompt(e.target.value)}
+                          onKeyDown={e => { if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) generate(); }}
+                          placeholder="Message LLM Manager… ⌘/Ctrl+Enter to send"
+                          rows={3}
+                          style={{ width: "100%", padding: "8px 10px", fontSize: 14, background: "transparent", color: C.text, border: "none", outline: "none", resize: "none", boxSizing: "border-box", lineHeight: 1.5, fontFamily: sans }}
+                        />
+                        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10 }}>
+                          <span style={{ fontSize: 10, color: C.dim, fontFamily: mono }}>{activeThread?.messages.length || 0} messages in thread</span>
+                          <button onClick={generate} disabled={generating || !model || !prompt.trim()} style={{
+                            padding: "8px 18px", fontSize: 12, fontWeight: 700, borderRadius: 9, border: "none",
+                            cursor: generating ? "wait" : "pointer", background: generating ? C.s2 : C.accent,
+                            color: generating ? C.dim : "#fff", opacity: (!model || !prompt.trim()) ? 0.4 : 1,
+                          }}>{generating ? "Generating…" : "Send"}</button>
+                        </div>
+                      </div>
+                    </div>
                   </div>
                 </>
               )}
-              {!response.error && !response.streaming && (
-                <div style={{ display: "flex", gap: 8, marginTop: 12 }}>
-                  <button onClick={() => copy(response.content, "resp")} style={{
-                    padding: "6px 14px", fontSize: 11, fontFamily: mono, borderRadius: 6, border: "none", cursor: "pointer",
-                    background: copied === "resp" ? C.green : C.s2, color: copied === "resp" ? "#000" : C.dim,
-                  }}>{copied === "resp" ? "✓" : "copy text"}</button>
-                  <button onClick={() => copy(JSON.stringify({ prompt: response.prompt, model: response.model, response: response.content, usage: response.usage }, null, 2), "json")} style={{
-                    padding: "6px 14px", fontSize: 11, fontFamily: mono, borderRadius: 6, border: "none", cursor: "pointer",
-                    background: copied === "json" ? C.green : C.s2, color: copied === "json" ? "#000" : C.dim,
-                  }}>{copied === "json" ? "✓" : "copy JSON"}</button>
-                </div>
-              )}
-            </Box>
-          )}
-
-          {history.length > 0 && (
-            <Box title={`History (${history.length})`}>
-              {history.map((h, i) => (
-                <div key={h.id} style={{ padding: "8px 0", borderBottom: i < history.length - 1 ? `1px solid ${C.s3}` : "none" }}>
-                  <div style={{ display: "flex", justifyContent: "space-between" }}>
-                    <div style={{ fontSize: 12, fontWeight: 500 }}>{h.prompt.slice(0, 80)}{h.prompt.length > 80 ? "…" : ""}</div>
-                    <span style={{ fontSize: 10, fontFamily: mono, color: C.dim, flexShrink: 0 }}>{h.model} · {h.elapsed}s</span>
-                  </div>
-                  <div style={{ fontSize: 11, color: C.dim, marginTop: 2, lineHeight: 1.4 }}>{h.content.slice(0, 140)}{h.content.length > 140 ? "…" : ""}</div>
-                </div>
-              ))}
-            </Box>
-          )}
-        </>)}
+            </main>
+          </div>
+        )}
 
         {/* ═══ MODELS ═══ */}
         {tab === "models" && (<>
