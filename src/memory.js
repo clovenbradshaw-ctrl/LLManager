@@ -1,11 +1,11 @@
 /* Per-chat memory — a lightweight "Experience Engine".
 
    In Memory mode a chat does not send its growing conversation history to
-   the model. Instead, knowledge-bearing turns are distilled into a small
-   per-chat knowledge graph (entities, connections, definitions) kept in
-   localStorage alongside the conversation. Each turn rebuilds a fixed-size
-   prompt: system + projected dossier + one-turn position marker. The prompt
-   stays the same size at turn 1 and turn 10,000.
+   the model. Instead, every turn is distilled into a small per-chat knowledge
+   graph (entities, connections, definitions) kept in localStorage alongside
+   the conversation. Each turn rebuilds a fixed-size prompt: system + projected
+   dossier + one-turn position marker. The prompt stays the same size at turn 1
+   and turn 10,000.
 
    This is a dependency-free adaptation of the architecture in experience.md:
    NER is mechanical (capitalised-run + date/number matching) rather than
@@ -19,8 +19,6 @@ Use them to stay consistent and personalised across the chat. If the context
 is empty or does not cover something, answer normally from your own knowledge —
 do not claim you have no memory. Keep responses concise unless asked for detail.`;
 
-export const CASUAL_SYSTEM = `You are a helpful assistant. Reply naturally and concisely.`;
-
 export const EXTRACT_SYSTEM = `Extract new, durable facts from this exchange as JSON.
 Return a JSON array of events. Each event is one of:
   { "op": "INS", "entity": "<name>", "kind": "person|place|org|thing|event|topic" }
@@ -30,6 +28,63 @@ Only include facts worth remembering long-term: names, relationships, attributes
 preferences, and decisions. Ignore small talk and transient details.
 Return [] if there is nothing worth remembering.
 Return ONLY the JSON array — no markdown, no commentary.`;
+
+/* Ingest: read a standalone block of text (a pasted note, an article, an
+   uploaded document) into a knowledge graph. Same event vocabulary as the
+   chat Extract step, but framed for a document rather than a conversation. */
+export const INGEST_SYSTEM = `Read the text below and extract its durable facts as JSON.
+Return a JSON array of events. Each event is one of:
+  { "op": "INS", "entity": "<name>", "kind": "person|place|org|thing|event|topic" }
+  { "op": "CON", "from": "<entity>", "to": "<entity>", "type": "<relation>" }
+  { "op": "DEF", "entity": "<name>", "field": "<attribute>", "value": "<value>" }
+Capture the named things, their relationships, their attributes, and any
+definitions or decisions stated in the text. Ignore filler and rhetoric.
+Return [] if there is nothing worth remembering.
+Return ONLY the JSON array — no markdown, no commentary.`;
+
+/* Split a large block of text into model-sized chunks, breaking on paragraph
+   then sentence boundaries so a fact is never cut in half. */
+export function chunkText(text, maxChars = 2800) {
+  const clean = String(text || "").replace(/\r\n/g, "\n").trim();
+  if (!clean) return [];
+  if (clean.length <= maxChars) return [clean];
+  const chunks = [];
+  let buf = "";
+  const flush = () => { if (buf.trim()) { chunks.push(buf.trim()); buf = ""; } };
+  for (const para of clean.split(/\n\s*\n/)) {
+    if (para.length > maxChars) {
+      flush();
+      let sb = "";
+      for (const s of para.match(/[^.!?]+[.!?]+|[^.!?]+$/g) || [para]) {
+        if (sb && (sb + s).length > maxChars) { chunks.push(sb.trim()); sb = ""; }
+        sb += s;
+      }
+      if (sb.trim()) buf = sb.trim();
+      continue;
+    }
+    if (buf && (buf + "\n\n" + para).length > maxChars) flush();
+    buf = buf ? buf + "\n\n" + para : para;
+  }
+  flush();
+  return chunks;
+}
+
+/* Merge several knowledge graphs into one (entities/edges/defs only). Used to
+   project a chat's own memory together with any opted-in library documents
+   into a single graph before building the dossier. */
+export function mergeMemory(...memories) {
+  const out = { entities: {}, edges: {}, defs: {} };
+  for (const m of memories) {
+    if (!m) continue;
+    for (const [id, e] of Object.entries(m.entities || {})) {
+      if (!out.entities[id]) out.entities[id] = { ...e };
+      else out.entities[id].mentions = (out.entities[id].mentions || 0) + (e.mentions || 0);
+    }
+    Object.assign(out.edges, m.edges || {});
+    Object.assign(out.defs, m.defs || {});
+  }
+  return out;
+}
 
 /* ── Empty / clone helpers ── */
 export const emptyMemory = () => ({ entities: {}, edges: {}, defs: {}, lastTurn: null });
@@ -96,18 +151,6 @@ export function extractKeywords(message) {
 
 export function signal(message) {
   return { ner: extractNER(message), keywords: extractKeywords(message) };
-}
-
-/* ── The Gate: is this turn knowledge-bearing? ── */
-export function isKnowledgeBearing(message) {
-  const ner = extractNER(message);
-  const isQuestion = message.includes("?");
-  const words = message.trim().split(/\s+/).filter(Boolean);
-  const isSubstantive = words.length > 4;
-  return ner.names.length > 0
-    || ner.dates.length > 0
-    || isQuestion
-    || (isSubstantive && ner.numbers.length > 0);
 }
 
 /* ── The Reach: search the graph using Signal output ── */
