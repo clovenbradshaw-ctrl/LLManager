@@ -7,6 +7,12 @@ import {
   appendLog, appendSignal, recordAlternateModel, recordFailure,
   processImplicitSignals, runREC, shouldRunREC,
 } from "./router.js";
+import {
+  MEMORY_SYSTEM, CASUAL_SYSTEM, EXTRACT_SYSTEM,
+  emptyMemory, cloneMemory, memoryStats,
+  signal, isKnowledgeBearing, reach, buildDossier, buildPosition,
+  parseEvents, applyEvents,
+} from "./memory.js";
 
 const mono = `'SF Mono','Menlo','Consolas',monospace`;
 const sans = `-apple-system,system-ui,sans-serif`;
@@ -18,6 +24,7 @@ const C = {
 
 const LS_KEY = "llmanager.chats.v1";
 const QUANT_KEY = "llmanager.quantize.v1";
+const MODE_KEY = "llmanager.chatmode.v1";
 
 /* Context quantization: cap the history so Ollama re-processes a smaller
    prompt. Keeps the most recent messages and truncates very long ones. */
@@ -61,6 +68,7 @@ const Icon = ({ name, size = 14 }) => {
     case "branch":  return <svg viewBox="0 0 24 24" {...s}><line x1="6" y1="3" x2="6" y2="15" /><circle cx="18" cy="6" r="3" /><circle cx="6" cy="18" r="3" /><path d="M18 9a9 9 0 0 1-9 9" /></svg>;
     case "chev":    return <svg viewBox="0 0 24 24" {...s}><path d="m6 9 6 6 6-6" /></svg>;
     case "chat":    return <svg viewBox="0 0 24 24" {...s}><path d="M21 12a8 8 0 0 1-11.5 7.2L4 21l1.8-5.5A8 8 0 1 1 21 12Z" /></svg>;
+    case "memory":  return <svg viewBox="0 0 24 24" {...s}><path d="M12 5a3 3 0 0 0-3 3 3 3 0 0 0-2 5 3 3 0 0 0 3 4 3 3 0 0 0 5 0 3 3 0 0 0 3-4 3 3 0 0 0-2-5 3 3 0 0 0-3-3Z" /><path d="M12 5v12" /></svg>;
     default: return null;
   }
 };
@@ -77,6 +85,49 @@ function RoutingPill({ routing }) {
       <span style={{ width: 6, height: 6, borderRadius: 99, boxSizing: "border-box",
         background: high ? intent.color : "transparent", border: `1.5px solid ${intent.color}` }} />
       {intent.icon} {intent.label} → {routing.model}
+    </span>
+  );
+}
+
+/* ── Mode toggle — per-chat Regular / Memory switch ── */
+const MODE_TIPS = {
+  regular: "Regular mode: the full conversation history is sent to the model every turn.",
+  memory: "Memory mode: knowledge-bearing turns are distilled into a per-chat graph and fed back as a fixed-size context block — the prompt never grows with the conversation.",
+};
+function ModeToggle({ mode, onChange, disabled }) {
+  return (
+    <div style={{ display: "flex", background: C.s1, border: `1px solid ${C.border}`, borderRadius: 7, padding: 2, gap: 2, flexShrink: 0 }}>
+      {[["regular", "Regular", "chat"], ["memory", "Memory", "memory"]].map(([val, label, icon]) => {
+        const on = mode === val;
+        return (
+          <button key={val} onClick={() => !disabled && !on && onChange(val)} disabled={disabled} title={MODE_TIPS[val]}
+            style={{
+              display: "flex", alignItems: "center", gap: 5, padding: "4px 9px", fontSize: 10.5, fontFamily: mono,
+              fontWeight: 600, borderRadius: 5, border: "none", cursor: disabled || on ? "default" : "pointer",
+              background: on ? C.accent : "transparent", color: on ? "#fff" : C.dim,
+            }}>
+            <Icon name={icon} size={11} /> {label}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+/* ── Memory pill — shows what a Memory-mode reply drew on ── */
+function MemoryPill({ mem }) {
+  const txt = mem.kb
+    ? `${mem.used} recalled${mem.learned != null ? ` · +${mem.learned} learned` : ""}`
+    : "casual turn — not stored";
+  return (
+    <span title={mem.kb
+      ? "Memory mode: facts recalled from this chat's graph, and new facts extracted from the exchange."
+      : "Memory mode: this turn was not knowledge-bearing, so nothing was recalled or stored."}
+      style={{
+        display: "inline-flex", alignItems: "center", gap: 4, fontSize: 10, fontFamily: mono,
+        padding: "2px 8px", borderRadius: 99, background: C.accent + "22", color: C.accent, fontWeight: 600,
+      }}>
+      <Icon name="memory" size={10} /> {txt}
     </span>
   );
 }
@@ -291,6 +342,7 @@ function MessageBubble({ msg, prevModel, onCopy, copied, onRerun, onFork, busy, 
         <span style={{ width: 7, height: 7, borderRadius: 99, background: msg.error ? C.red : C.accent }} />
         <span style={{ fontFamily: mono, fontSize: 11, fontWeight: 600, color: C.text }}>{msg.model}</span>
         {msg.routing && <RoutingPill routing={msg.routing} />}
+        {msg.mem && <MemoryPill mem={msg.mem} />}
         {msg.elapsed && <span style={{ fontFamily: mono, fontSize: 10.5, color: C.dim }}>· {msg.elapsed}s</span>}
         {msg.tokens ? <span style={{ fontFamily: mono, fontSize: 10.5, color: C.dim }}>· {msg.tokens} tok</span> : null}
       </div>
@@ -352,7 +404,7 @@ function IconBtn({ onClick, active, disabled, title, icon }) {
 }
 
 /* ── Composer ── */
-function Composer({ value, setValue, model, models, setModel, onSend, onStop, busy, isReply, quantize, setQuantize }) {
+function Composer({ value, setValue, model, models, setModel, onSend, onStop, busy, isReply, quantize, setQuantize, mode }) {
   const ref = useRef(null);
   useEffect(() => {
     if (ref.current) {
@@ -375,18 +427,30 @@ function Composer({ value, setValue, model, models, setModel, onSend, onStop, bu
         />
         <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "6px 6px 4px" }}>
           <ModelPicker value={model} models={models} onChange={setModel} />
-          <button
-            onClick={() => setQuantize(q => !q)}
-            title={`Quantize context — send only the last ${HISTORY_MSG_LIMIT} messages, trimmed, so Ollama re-processes a smaller prompt (faster, less memory). Older context is dropped.`}
-            style={{
-              display: "flex", alignItems: "center", gap: 7, padding: "5px 9px",
-              background: quantize ? "rgba(110,86,207,.18)" : C.s2,
-              border: `1px solid ${quantize ? C.accent : C.border}`, borderRadius: 7,
-              cursor: "pointer", fontFamily: mono, fontSize: 11, color: quantize ? C.text : C.dim,
-            }}>
-            <span style={{ width: 6, height: 6, borderRadius: 99, background: quantize ? C.accent : C.dim, flexShrink: 0 }} />
-            Quantize
-          </button>
+          {mode === "memory" ? (
+            <span
+              title="Memory mode is on — each turn sends a fixed-size prompt (system + recalled facts + position marker) instead of the conversation history."
+              style={{
+                display: "flex", alignItems: "center", gap: 7, padding: "5px 9px",
+                background: C.accent + "18", border: `1px solid ${C.accent}44`, borderRadius: 7,
+                fontFamily: mono, fontSize: 11, color: C.accent,
+              }}>
+              <Icon name="memory" size={12} /> Memory
+            </span>
+          ) : (
+            <button
+              onClick={() => setQuantize(q => !q)}
+              title={`Quantize context — send only the last ${HISTORY_MSG_LIMIT} messages, trimmed, so Ollama re-processes a smaller prompt (faster, less memory). Older context is dropped.`}
+              style={{
+                display: "flex", alignItems: "center", gap: 7, padding: "5px 9px",
+                background: quantize ? "rgba(110,86,207,.18)" : C.s2,
+                border: `1px solid ${quantize ? C.accent : C.border}`, borderRadius: 7,
+                cursor: "pointer", fontFamily: mono, fontSize: 11, color: quantize ? C.text : C.dim,
+              }}>
+              <span style={{ width: 6, height: 6, borderRadius: 99, background: quantize ? C.accent : C.dim, flexShrink: 0 }} />
+              Quantize
+            </button>
+          )}
           <div style={{ flex: 1 }} />
           {busy ? (
             <button onClick={onStop} style={{
@@ -423,6 +487,7 @@ export default function Chat({ ollamaUrl, installed, ollamaUp }) {
   const [busy, setBusy] = useState(false);
   const [copied, setCopied] = useState(null);
   const [quantize, setQuantize] = useState(() => localStorage.getItem(QUANT_KEY) === "1");
+  const [mode, setMode] = useState(() => localStorage.getItem(MODE_KEY) === "memory" ? "memory" : "regular");
   const [wrongModelFor, setWrongModelFor] = useState(null);
   const abortRef = useRef(null);
   const scrollRef = useRef(null);
@@ -457,6 +522,21 @@ export default function Chat({ ollamaUrl, installed, ollamaUp }) {
     try { localStorage.setItem(QUANT_KEY, quantize ? "1" : "0"); } catch { /* ignore */ }
   }, [quantize]);
 
+  useEffect(() => {
+    try { localStorage.setItem(MODE_KEY, mode); } catch { /* ignore */ }
+  }, [mode]);
+
+  /* Switch the active chat's mode (or just the default for the next new chat).
+     Memory data is kept even when switching back to Regular. */
+  const changeMode = (m) => {
+    setMode(m);
+    if (activeId) {
+      setConvos(prev => prev.map(c => c.id === activeId
+        ? { ...c, mode: m, memory: m === "memory" ? (c.memory || emptyMemory()) : c.memory }
+        : c));
+    }
+  };
+
   /* Auto-scroll */
   useEffect(() => {
     const el = scrollRef.current;
@@ -485,8 +565,11 @@ export default function Chat({ ollamaUrl, installed, ollamaUp }) {
     setConvos(prev => [{
       id: newId, title: trimmed + " (fork)",
       model: active.model, updatedAt: Date.now(), messages,
+      mode: active.mode || "regular",
+      memory: active.memory ? cloneMemory(active.memory) : undefined,
     }, ...prev]);
     setActiveId(newId);
+    setMode(active.mode || "regular");
     setDraft("");
   };
 
@@ -495,6 +578,7 @@ export default function Chat({ ollamaUrl, installed, ollamaUp }) {
     const c = convos.find(x => x.id === id);
     const lastModel = c?.messages.filter(m => m.role === "assistant").pop()?.model || c?.model;
     if (lastModel && modelNames.includes(lastModel)) setComposerModel(lastModel);
+    setMode(c?.mode === "memory" ? "memory" : "regular");
   };
 
   /* Stream a chat completion from Ollama; calls onToken(answer, reasoning)
@@ -535,6 +619,18 @@ export default function Chat({ ollamaUrl, installed, ollamaUp }) {
     return { content: answer, reasoning, usage };
   };
 
+  /* Non-streaming chat call — used for the background memory Extract step. */
+  const chatOnce = async (model, apiMessages) => {
+    const r = await fetch(`${ollamaUrl}/api/chat`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model, messages: apiMessages, stream: false, options: { temperature: 0 } }),
+    });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const j = await r.json();
+    return j.message?.content || "";
+  };
+
   /* Patch a single message inside a convo (patch may be an object or a fn) */
   const patchMsg = (convoId, msgId, patch) => {
     setConvos(prev => prev.map(c => c.id === convoId
@@ -571,12 +667,12 @@ export default function Chat({ ollamaUrl, installed, ollamaUp }) {
         });
         setConvos(prev => prev.map(c => c.id === convoId ? { ...c, model: useModel, updatedAt: Date.now() } : c));
         abortRef.current = null;
-        return;
+        return content;
       } catch (e) {
         if (e.name === "AbortError") {
           patchMsg(convoId, msgId, { streaming: false });
           abortRef.current = null;
-          return;
+          return null;
         }
         lastErr = e;
         if (routingId) recordFailure(routingId, useModel);
@@ -587,6 +683,34 @@ export default function Chat({ ollamaUrl, installed, ollamaUp }) {
       content: `Could not reach Ollama: ${lastErr?.message}\n\nMake sure Ollama is running and that this page's origin is allowed — see the Status tab.`,
     });
     abortRef.current = null;
+    return null;
+  };
+
+  /* Background memory Extract — distil new facts from a completed turn into
+     the chat's knowledge graph, and refresh the one-turn position marker. */
+  const runMemoryExtract = async (convoId, msgId, userMessage, response, model, memCtx) => {
+    let events = [];
+    try {
+      const out = await chatOnce(model, [
+        { role: "system", content: EXTRACT_SYSTEM },
+        { role: "user", content: `User said: "${userMessage.slice(0, 4000)}"\n\nAssistant said: "${response.slice(0, 4000)}"` },
+      ]);
+      events = parseEvents(out);
+    } catch { /* fail silently — the turn already succeeded */ }
+
+    let learned = 0;
+    setConvos(prev => prev.map(c => {
+      if (c.id !== convoId) return c;
+      const memory = cloneMemory(c.memory);
+      learned = applyEvents(memory, events);
+      memory.lastTurn = {
+        entities: (memCtx.entities || []).map(e => e.canonical),
+        topic: (memCtx.sig?.keywords || []).slice(0, 3).join(" "),
+        userMessage: userMessage.slice(0, 100),
+      };
+      return { ...c, memory };
+    }));
+    patchMsg(convoId, msgId, m => ({ mem: { ...(m.mem || {}), learned } }));
   };
 
   const send = async () => {
@@ -631,13 +755,44 @@ export default function Chat({ ollamaUrl, installed, ollamaUp }) {
       setConvos(prev => [{
         id: convoId, title: text.slice(0, 48) + (text.length > 48 ? "…" : ""),
         model: chosenModel, updatedAt: Date.now(), messages: [],
+        mode, memory: mode === "memory" ? emptyMemory() : undefined,
       }, ...prev]);
       setActiveId(convoId);
     }
 
+    // Build the API messages. Memory mode replaces the growing history with a
+    // fixed-size prompt: system + projected dossier + one-turn position marker.
+    let apiMessages, memCtx = null, memBadge;
+    if (mode === "memory") {
+      const memory = existing?.memory || emptyMemory();
+      const kb = isKnowledgeBearing(text);
+      if (kb) {
+        const sig = signal(text);
+        const entities = reach(sig, memory);
+        const dossier = buildDossier(entities, memory);
+        const position = buildPosition(memory.lastTurn);
+        apiMessages = [
+          { role: "system", content: `${MEMORY_SYSTEM}\n\n${dossier}\n\n${position}`.trim() },
+          { role: "user", content: text },
+        ];
+        memCtx = { kb, sig, entities };
+        memBadge = { kb: true, used: entities.length };
+      } else {
+        apiMessages = [
+          { role: "system", content: CASUAL_SYSTEM },
+          { role: "user", content: text },
+        ];
+        memCtx = { kb: false };
+        memBadge = { kb: false, used: 0 };
+      }
+    } else {
+      const apiHistory = quantize ? quantizeHistory(history) : history;
+      apiMessages = [...apiHistory, { role: "user", content: text }];
+    }
+
     const userMsg = { id: "u" + Date.now(), role: "user", content: text };
     const aId = "a" + Date.now();
-    const placeholder = { id: aId, role: "assistant", model: chosenModel, content: "", streaming: true, routing };
+    const placeholder = { id: aId, role: "assistant", model: chosenModel, content: "", streaming: true, routing, mem: memBadge };
     setConvos(prev => prev.map(c => {
       if (c.id !== convoId) return c;
       const base = evalDoneIds.size
@@ -647,10 +802,14 @@ export default function Chat({ ollamaUrl, installed, ollamaUp }) {
       return { ...c, messages: [...base, userMsg, placeholder], updatedAt: Date.now() };
     }));
 
-    const apiHistory = quantize ? quantizeHistory(history) : history;
-    await runTurn(convoId, aId, chosenModel, [...apiHistory, { role: "user", content: text }], { candidates, routingId: routing?.id });
+    const finalContent = await runTurn(convoId, aId, chosenModel, apiMessages, { candidates, routingId: routing?.id });
     setBusy(false);
     maybeREC();
+
+    // Background: distil new facts from a knowledge-bearing memory-mode turn.
+    if (mode === "memory" && memCtx?.kb && finalContent) {
+      runMemoryExtract(convoId, aId, text, finalContent, chosenModel, memCtx);
+    }
   };
 
   /* Re-run an assistant turn. forcedModel set => "Wrong model" pick;
@@ -694,11 +853,37 @@ export default function Chat({ ollamaUrl, installed, ollamaUp }) {
       ? routing
       : (oldMsg.routing ? { ...oldMsg.routing, evalDone: true, model: useModel } : undefined);
 
+    // Memory mode: rebuild the fixed-size prompt instead of replaying history.
+    // A re-run only regenerates the reply — it does not re-extract memory.
+    let apiMessages, memBadge = oldMsg.mem;
+    if (active.mode === "memory") {
+      const memory = active.memory || emptyMemory();
+      const promptMsg = [...active.messages.slice(0, idx)].reverse().find(m => m.role === "user");
+      const promptText = promptMsg?.content || "";
+      if (isKnowledgeBearing(promptText)) {
+        const sig = signal(promptText);
+        const entities = reach(sig, memory);
+        apiMessages = [
+          { role: "system", content: `${MEMORY_SYSTEM}\n\n${buildDossier(entities, memory)}\n\n${buildPosition(memory.lastTurn)}`.trim() },
+          { role: "user", content: promptText },
+        ];
+        memBadge = { kb: true, used: entities.length };
+      } else {
+        apiMessages = [
+          { role: "system", content: CASUAL_SYSTEM },
+          { role: "user", content: promptText },
+        ];
+        memBadge = { kb: false, used: 0 };
+      }
+    } else {
+      apiMessages = quantize ? quantizeHistory(history) : history;
+    }
+
     patchMsg(active.id, msgId, {
       model: useModel, content: "", reasoning: undefined, streaming: true, error: false,
-      elapsed: undefined, tokens: undefined, routing: newRouting,
+      elapsed: undefined, tokens: undefined, routing: newRouting, mem: memBadge,
     });
-    await runTurn(active.id, msgId, useModel, quantize ? quantizeHistory(history) : history, { candidates, routingId: routing?.id });
+    await runTurn(active.id, msgId, useModel, apiMessages, { candidates, routingId: routing?.id });
     setBusy(false);
     maybeREC();
   };
@@ -733,6 +918,8 @@ export default function Chat({ ollamaUrl, installed, ollamaUp }) {
 
   const offline = ollamaUp === false || ollamaUp === "cors";
 
+  const memStats = mode === "memory" ? memoryStats(active?.memory) : null;
+
   return (
     <div style={{ display: "flex", height: "100%", width: "100%", background: C.bg, fontFamily: sans, color: C.text }}>
       <Sidebar
@@ -746,6 +933,13 @@ export default function Chat({ ollamaUrl, installed, ollamaUp }) {
           </div>
           {active && (
             <span style={{ fontSize: 10.5, fontFamily: mono, color: C.dim, flexShrink: 0 }}>{active.messages.length} messages</span>
+          )}
+          <ModeToggle mode={mode} onChange={changeMode} disabled={busy} />
+          {memStats && (
+            <span title={`This chat's memory graph: ${memStats.entities} entities, ${memStats.edges} connections, ${memStats.defs} facts.`}
+              style={{ display: "flex", alignItems: "center", gap: 5, padding: "5px 10px", background: C.accent + "18", border: `1px solid ${C.accent}44`, borderRadius: 7, fontFamily: mono, fontSize: 11, color: C.accent, flexShrink: 0 }}>
+              <Icon name="memory" size={11} /> {memStats.entities} remembered
+            </span>
           )}
           {headerModel && (
             <span style={{ display: "flex", alignItems: "center", gap: 6, padding: "5px 10px", background: C.s1, border: `1px solid ${C.border}`, borderRadius: 7, fontFamily: mono, fontSize: 11.5, flexShrink: 0 }}>
@@ -774,9 +968,11 @@ export default function Chat({ ollamaUrl, installed, ollamaUp }) {
                   </div>
                   <div style={{ fontSize: 20, fontWeight: 600, marginBottom: 8 }}>Start a new chat</div>
                   <div style={{ fontSize: 13, color: C.dim, lineHeight: 1.6 }}>
-                    {modelNames.length
-                      ? "Pick a model below and ask anything. You can switch models mid-conversation — each reply is labelled with the model that produced it."
-                      : "No models installed yet. Pull one from the Models tab first."}
+                    {!modelNames.length
+                      ? "No models installed yet. Pull one from the Models tab first."
+                      : mode === "memory"
+                        ? "Memory mode is on. Knowledge-bearing turns are distilled into a per-chat graph and replayed as a fixed-size context block, so the prompt never grows with the conversation. Switch back to Regular in the header."
+                        : "Pick a model below and ask anything. You can switch models mid-conversation — each reply is labelled with the model that produced it. Try Memory mode in the header for a chat whose prompt never grows."}
                   </div>
                 </div>
               </div>
@@ -804,6 +1000,7 @@ export default function Chat({ ollamaUrl, installed, ollamaUp }) {
           onSend={send} onStop={stop} busy={busy}
           isReply={messages.length > 0}
           quantize={quantize} setQuantize={setQuantize}
+          mode={mode}
         />
       </main>
     </div>
