@@ -1,5 +1,12 @@
-import { useState, useEffect, useRef, useMemo, useCallback } from "react";
+import { useState, useEffect, useRef, useMemo } from "react";
 import Markdown from "./Markdown.jsx";
+import {
+  AUTO_MODEL, INTENTS,
+  classifyIntent, routeModel, hashPrompt, uuid,
+  loadLog, loadWeights, loadPrefs, savePrefs,
+  appendLog, appendSignal, recordAlternateModel, recordFailure,
+  processImplicitSignals, runREC, shouldRunREC,
+} from "./router.js";
 
 const mono = `'SF Mono','Menlo','Consolas',monospace`;
 const sans = `-apple-system,system-ui,sans-serif`;
@@ -26,6 +33,31 @@ const Icon = ({ name, size = 14 }) => {
     default: return null;
   }
 };
+
+/* ── Routing pill — intent badge on Auto-routed replies ── */
+function RoutingPill({ routing }) {
+  const intent = INTENTS[routing.intent] || INTENTS.general;
+  const high = routing.confidence >= 3;
+  return (
+    <span title={`confidence: ${routing.confidence} ${high ? "(high)" : "(low)"}`} style={{
+      display: "inline-flex", alignItems: "center", gap: 5, fontSize: 10, fontFamily: mono,
+      padding: "2px 8px", borderRadius: 99, background: intent.color + "22", color: intent.color, fontWeight: 600,
+    }}>
+      <span style={{ width: 6, height: 6, borderRadius: 99, boxSizing: "border-box",
+        background: high ? intent.color : "transparent", border: `1.5px solid ${intent.color}` }} />
+      {intent.icon} {intent.label} → {routing.model}
+    </span>
+  );
+}
+
+function FbBtn({ onClick, children }) {
+  return (
+    <button onClick={onClick} style={{
+      fontSize: 11, fontFamily: mono, padding: "3px 9px", borderRadius: 6, border: `1px solid ${C.border}`,
+      cursor: "pointer", background: "transparent", color: C.dim,
+    }}>{children}</button>
+  );
+}
 
 const bucketLabel = (ts) => {
   const now = new Date();
@@ -140,8 +172,11 @@ function ModelPicker({ value, models, onChange }) {
         border: `1px solid ${C.border}`, borderRadius: 7, cursor: disabled ? "default" : "pointer",
         fontFamily: mono, fontSize: 11, color: disabled ? C.dim : C.text, maxWidth: 240,
       }}>
-        <span style={{ width: 6, height: 6, borderRadius: 99, background: disabled ? C.dim : C.accent, flexShrink: 0 }} />
-        <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{value || "no models"}</span>
+        <span style={{ width: 6, height: 6, borderRadius: 99, background: disabled ? C.dim : C.accent, flexShrink: 0,
+          animation: value === AUTO_MODEL ? "llm-pulse 1.4s ease-in-out infinite" : "none" }} />
+        <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+          {value === AUTO_MODEL ? "⚡ Auto" : (value || "no models")}
+        </span>
         {!disabled && <span style={{ color: C.dim, display: "flex" }}><Icon name="chev" size={12} /></span>}
       </button>
       {open && (
@@ -149,15 +184,18 @@ function ModelPicker({ value, models, onChange }) {
           position: "absolute", bottom: "calc(100% + 6px)", left: 0, minWidth: 240, maxHeight: 280, overflowY: "auto", zIndex: 30,
           background: C.s2, border: `1px solid ${C.border}`, borderRadius: 10, boxShadow: "0 12px 32px rgba(0,0,0,.5)", padding: 4,
         }}>
-          <div style={{ padding: "8px 10px 6px", fontSize: 10, fontFamily: mono, color: C.dim, textTransform: "uppercase", letterSpacing: 0.6 }}>Installed models</div>
+          <div style={{ padding: "8px 10px 6px", fontSize: 10, fontFamily: mono, color: C.dim, textTransform: "uppercase", letterSpacing: 0.6 }}>Select model</div>
           {models.map(m => (
             <button key={m} onClick={() => { onChange(m); setOpen(false); }} style={{
               width: "100%", textAlign: "left", display: "flex", alignItems: "center", gap: 10, padding: "8px 10px",
               background: m === value ? "rgba(110,86,207,.18)" : "transparent", border: "none", borderRadius: 6,
               cursor: "pointer", fontFamily: mono, fontSize: 12, color: C.text,
             }}>
-              <span style={{ width: 7, height: 7, borderRadius: 99, background: C.accent, flexShrink: 0 }} />
-              <span style={{ flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{m}</span>
+              <span style={{ width: 7, height: 7, borderRadius: 99, background: C.accent, flexShrink: 0,
+                animation: m === AUTO_MODEL ? "llm-pulse 1.4s ease-in-out infinite" : "none" }} />
+              <span style={{ flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                {m === AUTO_MODEL ? "⚡ Auto — route per message" : m}
+              </span>
             </button>
           ))}
         </div>
@@ -167,7 +205,7 @@ function ModelPicker({ value, models, onChange }) {
 }
 
 /* ── Message bubble ── */
-function MessageBubble({ msg, prevModel, onCopy, copied, onRerun, busy }) {
+function MessageBubble({ msg, prevModel, onCopy, copied, onRerun, busy, installed, onFeedback, onWrongModel, wrongModelFor, setWrongModelFor, userMsgsAfter }) {
   if (msg.role === "user") {
     return (
       <div style={{ display: "flex", justifyContent: "flex-end", padding: "6px 0" }}>
@@ -179,6 +217,9 @@ function MessageBubble({ msg, prevModel, onCopy, copied, onRerun, busy }) {
     );
   }
   const switched = prevModel && prevModel !== msg.model;
+  const showFeedback = msg.routing && !msg.routing.evalDone && !msg.routing.feedback
+    && !msg.streaming && !msg.error && msg.content
+    && installed.length > 1 && userMsgsAfter < 2;
   return (
     <div style={{ padding: "10px 0 14px" }}>
       {switched && (
@@ -188,9 +229,10 @@ function MessageBubble({ msg, prevModel, onCopy, copied, onRerun, busy }) {
           <span style={{ flex: 1, height: 1, background: C.border }} />
         </div>
       )}
-      <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6, flexWrap: "wrap" }}>
         <span style={{ width: 7, height: 7, borderRadius: 99, background: msg.error ? C.red : C.accent }} />
         <span style={{ fontFamily: mono, fontSize: 11, fontWeight: 600, color: C.text }}>{msg.model}</span>
+        {msg.routing && <RoutingPill routing={msg.routing} />}
         {msg.elapsed && <span style={{ fontFamily: mono, fontSize: 10.5, color: C.dim }}>· {msg.elapsed}s</span>}
         {msg.tokens ? <span style={{ fontFamily: mono, fontSize: 10.5, color: C.dim }}>· {msg.tokens} tok</span> : null}
       </div>
@@ -209,7 +251,28 @@ function MessageBubble({ msg, prevModel, onCopy, copied, onRerun, busy }) {
       {!msg.streaming && !msg.error && (
         <div style={{ display: "flex", gap: 4, paddingLeft: 13, marginTop: 8 }}>
           <IconBtn onClick={() => onCopy(msg.content, msg.id)} active={copied === msg.id} title={copied === msg.id ? "Copied" : "Copy"} icon="copy" />
-          <IconBtn onClick={() => onRerun(msg.id)} disabled={busy} title="Re-run with current model" icon="refresh" />
+          <IconBtn onClick={() => onRerun(msg.id)} disabled={busy} title="Re-run" icon="refresh" />
+        </div>
+      )}
+      {showFeedback && (
+        <div style={{ display: "flex", gap: 6, paddingLeft: 13, marginTop: 8, alignItems: "center" }}>
+          <FbBtn onClick={() => onFeedback(msg.id, "up")}>👍</FbBtn>
+          <FbBtn onClick={() => onFeedback(msg.id, "down")}>👎</FbBtn>
+          {wrongModelFor === msg.id ? (
+            <select autoFocus defaultValue="" onChange={e => e.target.value && onWrongModel(msg.id, e.target.value)}
+              onBlur={() => setWrongModelFor(null)}
+              style={{ fontSize: 11, fontFamily: mono, padding: "3px 6px", borderRadius: 6, background: C.s1, color: C.text, border: `1px solid ${C.border}` }}>
+              <option value="">pick correct model…</option>
+              {installed.filter(m => m.name !== msg.routing.model).map(m => <option key={m.name} value={m.name}>{m.name}</option>)}
+            </select>
+          ) : (
+            <FbBtn onClick={() => setWrongModelFor(msg.id)}>🔄 Wrong model</FbBtn>
+          )}
+        </div>
+      )}
+      {msg.routing && msg.routing.feedback && (
+        <div style={{ fontSize: 10, fontFamily: mono, color: C.dim, paddingLeft: 13, marginTop: 8 }}>
+          feedback recorded · {msg.routing.feedback === "up" ? "👍 helpful" : "👎 not helpful"}
         </div>
       )}
     </div>
@@ -284,9 +347,10 @@ export default function Chat({ ollamaUrl, installed, ollamaUp }) {
   const [activeId, setActiveId] = useState(null);
   const [query, setQuery] = useState("");
   const [draft, setDraft] = useState("");
-  const [composerModel, setComposerModel] = useState("");
+  const [composerModel, setComposerModel] = useState(() => (loadPrefs().autoMode ? AUTO_MODEL : ""));
   const [busy, setBusy] = useState(false);
   const [copied, setCopied] = useState(null);
+  const [wrongModelFor, setWrongModelFor] = useState(null);
   const abortRef = useRef(null);
   const scrollRef = useRef(null);
 
@@ -298,6 +362,15 @@ export default function Chat({ ollamaUrl, installed, ollamaUp }) {
   useEffect(() => {
     if (!composerModel && modelNames.length) setComposerModel(modelNames[0]);
   }, [modelNames, composerModel]);
+
+  /* Persist Auto-mode on/off */
+  useEffect(() => {
+    const prefs = loadPrefs();
+    const autoMode = composerModel === AUTO_MODEL;
+    if (composerModel && prefs.autoMode !== autoMode) savePrefs({ ...prefs, autoMode });
+  }, [composerModel]);
+
+  const maybeREC = () => { if (shouldRunREC(loadWeights(), loadLog())) runREC(installed); };
 
   /* Persist (debounced so token streaming doesn't thrash localStorage) */
   useEffect(() => {
@@ -359,86 +432,193 @@ export default function Chat({ ollamaUrl, installed, ollamaUp }) {
     return { content: full, usage };
   };
 
-  /* Patch a single message inside a convo */
+  /* Patch a single message inside a convo (patch may be an object or a fn) */
   const patchMsg = (convoId, msgId, patch) => {
     setConvos(prev => prev.map(c => c.id === convoId
-      ? { ...c, messages: c.messages.map(m => m.id === msgId ? { ...m, ...patch } : m) }
+      ? { ...c, messages: c.messages.map(m => m.id === msgId
+          ? { ...m, ...(typeof patch === "function" ? patch(m) : patch) } : m) }
       : c));
   };
 
-  /* Run a model turn into an existing placeholder assistant message */
-  const runTurn = async (convoId, msgId, model, apiMessages) => {
+  /* Run a model turn into an existing placeholder assistant message.
+     opts.candidates enables Auto-mode fallback: if a model errors, the next
+     candidate is tried once. opts.routingId logs failures to the routing log. */
+  const runTurn = async (convoId, msgId, model, apiMessages, opts = {}) => {
+    const { candidates, routingId } = opts;
+    const attempts = candidates && candidates.length ? candidates.slice(0, 2) : [model];
     const ctrl = new AbortController();
     abortRef.current = ctrl;
     const t0 = Date.now();
-    try {
-      const { content, usage } = await streamChat(model, apiMessages, (full) => {
-        patchMsg(convoId, msgId, { content: full });
-      }, ctrl.signal);
-      patchMsg(convoId, msgId, {
-        content, streaming: false, error: false,
-        elapsed: ((Date.now() - t0) / 1000).toFixed(1), tokens: usage.tokens,
-      });
-      setConvos(prev => prev.map(c => c.id === convoId ? { ...c, model, updatedAt: Date.now() } : c));
-    } catch (e) {
-      if (e.name === "AbortError") {
-        // Keep whatever streamed so far; just stop.
-        patchMsg(convoId, msgId, { streaming: false });
-      } else {
-        patchMsg(convoId, msgId, {
-          streaming: false, error: true,
-          content: `Could not reach Ollama: ${e.message}\n\nMake sure Ollama is running and that this page's origin is allowed — see the Status tab.`,
-        });
+    let lastErr = null;
+    for (let i = 0; i < attempts.length; i++) {
+      const useModel = attempts[i];
+      if (i > 0) {
+        patchMsg(convoId, msgId, m => ({
+          model: useModel, content: "",
+          routing: m.routing ? { ...m.routing, model: useModel } : m.routing,
+        }));
       }
-    } finally {
-      abortRef.current = null;
+      try {
+        const { content, usage } = await streamChat(useModel, apiMessages, (full) => {
+          patchMsg(convoId, msgId, { content: full });
+        }, ctrl.signal);
+        patchMsg(convoId, msgId, {
+          content, streaming: false, error: false, model: useModel,
+          elapsed: ((Date.now() - t0) / 1000).toFixed(1), tokens: usage.tokens,
+        });
+        setConvos(prev => prev.map(c => c.id === convoId ? { ...c, model: useModel, updatedAt: Date.now() } : c));
+        abortRef.current = null;
+        return;
+      } catch (e) {
+        if (e.name === "AbortError") {
+          patchMsg(convoId, msgId, { streaming: false });
+          abortRef.current = null;
+          return;
+        }
+        lastErr = e;
+        if (routingId) recordFailure(routingId, useModel);
+      }
     }
+    patchMsg(convoId, msgId, {
+      streaming: false, error: true,
+      content: `Could not reach Ollama: ${lastErr?.message}\n\nMake sure Ollama is running and that this page's origin is allowed — see the Status tab.`,
+    });
+    abortRef.current = null;
   };
 
   const send = async () => {
     const text = draft.trim();
     if (!text || !composerModel || busy) return;
+    const autoMode = composerModel === AUTO_MODEL;
+    if (autoMode && !modelNames.length) return;
     setBusy(true);
     setDraft("");
 
     let convoId = activeId;
     let history = [];
+    const existing = convoId ? convos.find(c => c.id === convoId) : null;
+
+    // EVA: implicit signals about prior Auto-routed replies in this convo.
+    let evalDoneIds = new Set();
+    if (existing) {
+      const results = processImplicitSignals({ messages: existing.messages }, text, autoMode);
+      evalDoneIds = new Set(results.map(r => r.routingId));
+      history = existing.messages.filter(m => !m.error).map(m => ({ role: m.role, content: m.content }));
+    }
+
+    // DEF: classify the prompt and commit to a model when in Auto mode.
+    let routing = null, candidates = null, chosenModel = composerModel;
+    if (autoMode) {
+      const weights = loadWeights();
+      const cls = classifyIntent(text, installed, weights);
+      const r = routeModel(cls.intent, installed, weights);
+      candidates = r.candidates;
+      chosenModel = r.model;
+      routing = { id: uuid(), intent: cls.intent, confidence: cls.confidence, model: chosenModel, candidates };
+      appendLog({
+        id: routing.id, timestamp: new Date().toISOString(), convoId: convoId || null,
+        promptHash: await hashPrompt(text), promptLength: text.length,
+        intent: cls.intent, confidence: cls.confidence, modelChosen: chosenModel,
+        candidates, evaluated: false, signals: [], alternateModel: null,
+      });
+    }
+
     if (!convoId) {
       convoId = "c" + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
       setConvos(prev => [{
         id: convoId, title: text.slice(0, 48) + (text.length > 48 ? "…" : ""),
-        model: composerModel, updatedAt: Date.now(), messages: [],
+        model: chosenModel, updatedAt: Date.now(), messages: [],
       }, ...prev]);
       setActiveId(convoId);
-    } else {
-      history = (convos.find(c => c.id === convoId)?.messages || [])
-        .filter(m => !m.error)
-        .map(m => ({ role: m.role, content: m.content }));
     }
 
     const userMsg = { id: "u" + Date.now(), role: "user", content: text };
     const aId = "a" + Date.now();
-    const placeholder = { id: aId, role: "assistant", model: composerModel, content: "", streaming: true };
-    setConvos(prev => prev.map(c => c.id === convoId
-      ? { ...c, messages: [...c.messages, userMsg, placeholder], updatedAt: Date.now() }
-      : c));
+    const placeholder = { id: aId, role: "assistant", model: chosenModel, content: "", streaming: true, routing };
+    setConvos(prev => prev.map(c => {
+      if (c.id !== convoId) return c;
+      const base = evalDoneIds.size
+        ? c.messages.map(m => (m.routing && evalDoneIds.has(m.routing.id))
+            ? { ...m, routing: { ...m.routing, evalDone: true } } : m)
+        : c.messages;
+      return { ...c, messages: [...base, userMsg, placeholder], updatedAt: Date.now() };
+    }));
 
-    await runTurn(convoId, aId, composerModel, [...history, { role: "user", content: text }]);
+    await runTurn(convoId, aId, chosenModel, [...history, { role: "user", content: text }], { candidates, routingId: routing?.id });
     setBusy(false);
+    maybeREC();
   };
 
-  /* Re-run an assistant turn with the current composer model */
-  const rerun = async (msgId) => {
+  /* Re-run an assistant turn. forcedModel set => "Wrong model" pick;
+     otherwise a plain regenerate (a weak negative EVA signal in Auto mode). */
+  const rerun = async (msgId, forcedModel) => {
     if (!active || busy) return;
     const idx = active.messages.findIndex(m => m.id === msgId);
-    if (idx === -1) return;
+    if (idx < 1) return;
+    const oldMsg = active.messages[idx];
     setBusy(true);
+
     const history = active.messages.slice(0, idx)
       .filter(m => !m.error)
       .map(m => ({ role: m.role, content: m.content }));
-    patchMsg(active.id, msgId, { model: composerModel, content: "", streaming: true, error: false, elapsed: undefined, tokens: undefined });
-    await runTurn(active.id, msgId, composerModel, history);
+    const autoMode = !forcedModel && composerModel === AUTO_MODEL;
+
+    if (!forcedModel && oldMsg.routing && !oldMsg.routing.evalDone) {
+      appendSignal(oldMsg.routing.id, { type: "implicit", value: -0.3, action: "regenerate", model: oldMsg.routing.model });
+    }
+
+    let routing = null, candidates = null, useModel = forcedModel || composerModel;
+    if (autoMode) {
+      const userMsg = [...active.messages.slice(0, idx)].reverse().find(m => m.role === "user");
+      const promptText = userMsg?.content || "";
+      const weights = loadWeights();
+      const cls = classifyIntent(promptText, installed, weights);
+      const r = routeModel(cls.intent, installed, weights);
+      candidates = r.candidates;
+      useModel = r.model;
+      routing = { id: uuid(), intent: cls.intent, confidence: cls.confidence, model: useModel, candidates };
+      appendLog({
+        id: routing.id, timestamp: new Date().toISOString(), convoId: active.id,
+        promptHash: await hashPrompt(promptText), promptLength: promptText.length,
+        intent: cls.intent, confidence: cls.confidence, modelChosen: useModel,
+        candidates, evaluated: false, signals: [], alternateModel: null,
+      });
+    }
+
+    // Fresh routing for an Auto re-run; otherwise keep the old pill but settle it.
+    const newRouting = autoMode
+      ? routing
+      : (oldMsg.routing ? { ...oldMsg.routing, evalDone: true, model: useModel } : undefined);
+
+    patchMsg(active.id, msgId, {
+      model: useModel, content: "", streaming: true, error: false,
+      elapsed: undefined, tokens: undefined, routing: newRouting,
+    });
+    await runTurn(active.id, msgId, useModel, history, { candidates, routingId: routing?.id });
     setBusy(false);
+    maybeREC();
+  };
+
+  /* EVA: explicit feedback on an Auto-routed reply */
+  const handleFeedback = (msgId, action) => {
+    if (!active) return;
+    const r = active.messages.find(m => m.id === msgId)?.routing;
+    if (!r || r.evalDone) return;
+    if (action === "up") appendSignal(r.id, { type: "explicit", value: 1.0, action: "thumbs-up", model: r.model });
+    else if (action === "down") appendSignal(r.id, { type: "explicit", value: -0.5, action: "thumbs-down", model: r.model });
+    patchMsg(active.id, msgId, m => ({ routing: { ...m.routing, evalDone: true, feedback: action } }));
+    maybeREC();
+  };
+
+  const handleWrongModel = (msgId, altModel) => {
+    setWrongModelFor(null);
+    if (!active || !altModel) return;
+    const r = active.messages.find(m => m.id === msgId)?.routing;
+    if (!r || r.evalDone) return;
+    appendSignal(r.id, { type: "explicit", value: -1.0, action: "wrong-model", model: r.model });
+    appendSignal(r.id, { type: "explicit", value: 0.5, action: "wrong-model-alt", model: altModel });
+    recordAlternateModel(r.id, altModel);
+    rerun(msgId, altModel);
   };
 
   const stop = () => abortRef.current?.abort();
@@ -465,8 +645,9 @@ export default function Chat({ ollamaUrl, installed, ollamaUp }) {
           )}
           {headerModel && (
             <span style={{ display: "flex", alignItems: "center", gap: 6, padding: "5px 10px", background: C.s1, border: `1px solid ${C.border}`, borderRadius: 7, fontFamily: mono, fontSize: 11.5, flexShrink: 0 }}>
-              <span style={{ width: 6, height: 6, borderRadius: 99, background: C.accent }} />
-              {headerModel}
+              <span style={{ width: 6, height: 6, borderRadius: 99, background: C.accent,
+                animation: headerModel === AUTO_MODEL ? "llm-pulse 1.4s ease-in-out infinite" : "none" }} />
+              {headerModel === AUTO_MODEL ? "⚡ Auto" : headerModel}
             </span>
           )}
         </header>
@@ -498,10 +679,14 @@ export default function Chat({ ollamaUrl, installed, ollamaUp }) {
             ) : (
               messages.map((m, i) => {
                 const prevAi = [...messages.slice(0, i)].reverse().find(x => x.role === "assistant");
+                const userMsgsAfter = messages.slice(i + 1).filter(x => x.role === "user").length;
                 return (
                   <MessageBubble
                     key={m.id || i} msg={m} prevModel={prevAi?.model}
                     onCopy={copy} copied={copied} onRerun={rerun} busy={busy}
+                    installed={installed} userMsgsAfter={userMsgsAfter}
+                    onFeedback={handleFeedback} onWrongModel={handleWrongModel}
+                    wrongModelFor={wrongModelFor} setWrongModelFor={setWrongModelFor}
                   />
                 );
               })
@@ -511,7 +696,7 @@ export default function Chat({ ollamaUrl, installed, ollamaUp }) {
 
         <Composer
           value={draft} setValue={setDraft}
-          model={composerModel} models={modelNames} setModel={setComposerModel}
+          model={composerModel} models={modelNames.length ? [AUTO_MODEL, ...modelNames] : []} setModel={setComposerModel}
           onSend={send} onStop={stop} busy={busy}
           isReply={messages.length > 0}
         />
