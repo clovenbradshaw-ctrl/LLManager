@@ -60,7 +60,10 @@ export default function MatrixGate({ onLogin, onSkip, embedded }) {
           <label style={lbl}>Homeserver</label>
           <input value={homeserver} onChange={e => setHomeserver(e.target.value)}
             placeholder="matrix.org" style={field} />
-          <div style={{ fontSize: 10, color: C.dim, marginTop: 4 }}>
+          <div style={{ fontSize: 10, color: C.dim, marginTop: 4, lineHeight: 1.5 }}>
+            A domain or a full base URL. If sign-in can't connect, the API may
+            live elsewhere — open <code style={{ fontFamily: mono }}>https://&lt;domain&gt;/.well-known/matrix/client</code> and
+            paste its <code style={{ fontFamily: mono }}>base_url</code> here.
             Ignored when the username already includes a server (@you:server).
           </div>
         </div>
