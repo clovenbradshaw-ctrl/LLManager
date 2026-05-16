@@ -58,6 +58,7 @@ const Icon = ({ name, size = 14 }) => {
     case "copy":    return <svg viewBox="0 0 24 24" {...s}><rect x="9" y="9" width="11" height="11" rx="2" /><path d="M5 15V6a2 2 0 0 1 2-2h9" /></svg>;
     case "refresh": return <svg viewBox="0 0 24 24" {...s}><path d="M3 12a9 9 0 0 1 15.5-6.3L21 8M21 3v5h-5M21 12a9 9 0 0 1-15.5 6.3L3 16M3 21v-5h5" /></svg>;
     case "trash":   return <svg viewBox="0 0 24 24" {...s}><path d="M4 7h16M9 7V4h6v3M6 7l1 13a2 2 0 0 0 2 2h6a2 2 0 0 0 2-2l1-13" /></svg>;
+    case "branch":  return <svg viewBox="0 0 24 24" {...s}><line x1="6" y1="3" x2="6" y2="15" /><circle cx="18" cy="6" r="3" /><circle cx="6" cy="18" r="3" /><path d="M18 9a9 9 0 0 1-9 9" /></svg>;
     case "chev":    return <svg viewBox="0 0 24 24" {...s}><path d="m6 9 6 6 6-6" /></svg>;
     case "chat":    return <svg viewBox="0 0 24 24" {...s}><path d="M21 12a8 8 0 0 1-11.5 7.2L4 21l1.8-5.5A8 8 0 1 1 21 12Z" /></svg>;
     default: return null;
@@ -259,14 +260,17 @@ function Reasoning({ text, streaming }) {
 }
 
 /* ── Message bubble ── */
-function MessageBubble({ msg, prevModel, onCopy, copied, onRerun, busy, installed, onFeedback, onWrongModel, wrongModelFor, setWrongModelFor, userMsgsAfter }) {
+function MessageBubble({ msg, prevModel, onCopy, copied, onRerun, onFork, busy, installed, onFeedback, onWrongModel, wrongModelFor, setWrongModelFor, userMsgsAfter }) {
   if (msg.role === "user") {
     return (
-      <div style={{ display: "flex", justifyContent: "flex-end", padding: "6px 0" }}>
+      <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", padding: "6px 0" }}>
         <div style={{
           maxWidth: "78%", padding: "10px 14px", borderRadius: 14, borderTopRightRadius: 4,
           background: C.s2, border: `1px solid ${C.border}`, fontSize: 14, lineHeight: 1.55, whiteSpace: "pre-wrap", wordBreak: "break-word",
         }}>{msg.content}</div>
+        <div style={{ display: "flex", gap: 4, marginTop: 6 }}>
+          <IconBtn onClick={() => onFork(msg.id)} disabled={busy} title="Fork a new chat from here" icon="branch" />
+        </div>
       </div>
     );
   }
@@ -307,6 +311,7 @@ function MessageBubble({ msg, prevModel, onCopy, copied, onRerun, busy, installe
         <div style={{ display: "flex", gap: 4, paddingLeft: 13, marginTop: 8 }}>
           <IconBtn onClick={() => onCopy(msg.content, msg.id)} active={copied === msg.id} title={copied === msg.id ? "Copied" : "Copy"} icon="copy" />
           <IconBtn onClick={() => onRerun(msg.id)} disabled={busy} title="Re-run" icon="refresh" />
+          <IconBtn onClick={() => onFork(msg.id)} disabled={busy} title="Fork a new chat from here" icon="branch" />
         </div>
       )}
       {showFeedback && (
@@ -465,6 +470,24 @@ export default function Chat({ ollamaUrl, installed, ollamaUp }) {
   const deleteConvo = (id) => {
     setConvos(prev => prev.filter(c => c.id !== id));
     if (id === activeId) setActiveId(null);
+  };
+
+  /* Fork: branch a new conversation off the message at msgId, carrying
+     every message up to and including it. The original is left untouched. */
+  const forkConvo = (msgId) => {
+    if (!active || busy) return;
+    const idx = active.messages.findIndex(m => m.id === msgId);
+    if (idx < 0) return;
+    const messages = active.messages.slice(0, idx + 1).map(m => ({ ...m, streaming: false }));
+    const baseTitle = active.title.replace(/ \(fork\)$/, "");
+    const trimmed = baseTitle.length > 40 ? baseTitle.slice(0, 40) + "…" : baseTitle;
+    const newId = "c" + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+    setConvos(prev => [{
+      id: newId, title: trimmed + " (fork)",
+      model: active.model, updatedAt: Date.now(), messages,
+    }, ...prev]);
+    setActiveId(newId);
+    setDraft("");
   };
 
   const selectConvo = (id) => {
@@ -764,7 +787,7 @@ export default function Chat({ ollamaUrl, installed, ollamaUp }) {
                 return (
                   <MessageBubble
                     key={m.id || i} msg={m} prevModel={prevAi?.model}
-                    onCopy={copy} copied={copied} onRerun={rerun} busy={busy}
+                    onCopy={copy} copied={copied} onRerun={rerun} onFork={forkConvo} busy={busy}
                     installed={installed} userMsgsAfter={userMsgsAfter}
                     onFeedback={handleFeedback} onWrongModel={handleWrongModel}
                     wrongModelFor={wrongModelFor} setWrongModelFor={setWrongModelFor}
