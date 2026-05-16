@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from "react";
-import Markdown from "./Markdown.jsx";
+import Chat from "./Chat.jsx";
 
 const MODEL_CATALOG = [
   { id: "gemma2:2b", params: "2B", vram: 1.5, speed: "fast", use: "Light tasks, quick responses" },
@@ -67,15 +67,6 @@ const ActBtn = ({ onClick, disabled, color, children }) => (
   }}>{children}</button>
 );
 
-const ThinkingBar = ({ label }) => (
-  <div style={{ marginBottom: 12 }}>
-    <div style={{ fontSize: 11, fontFamily: mono, color: C.accent, marginBottom: 5 }}>{label}</div>
-    <div style={{ position: "relative", height: 5, background: C.s3, borderRadius: 3, overflow: "hidden" }}>
-      <div style={{ position: "absolute", top: 0, height: "100%", width: "45%", borderRadius: 3, background: C.accent, animation: "llm-indeterminate 1.1s ease-in-out infinite" }} />
-    </div>
-  </div>
-);
-
 const Box = ({ title, sub, children }) => (
   <div style={{ background: C.s1, border: `1px solid ${C.border}`, borderRadius: 10, padding: "14px 18px", marginBottom: 10 }}>
     <div style={{ fontSize: 13, fontWeight: 700, color: C.text, marginBottom: sub ? 2 : 10 }}>{title}</div>
@@ -94,12 +85,7 @@ export default function App() {
   const [hw, setHw] = useState(null);
 
   const [model, setModel] = useState("");
-  const [prompt, setPrompt] = useState("");
-  const [numCtx, setNumCtx] = useState(4096);
   const [keepAlivePref, setKeepAlivePref] = useState("10m");
-  const [generating, setGenerating] = useState(false);
-  const [response, setResponse] = useState(null);
-  const [history, setHistory] = useState([]);
   const [copied, setCopied] = useState(null);
   const [pulling, setPulling] = useState({}); // { [name]: { status, completed, total, error } }
   const [busy, setBusy] = useState({});       // { [name]: "load" | "unload" | "delete" }
@@ -143,63 +129,21 @@ export default function App() {
       }
       const pR = await fetch(`${ollamaUrl}/api/ps`, { signal: AbortSignal.timeout(3000) });
       if (pR.ok) setRunning((await pR.json()).models || []);
-    } catch { setOllamaUp(false); }
-  }, [ollamaUrl]);
+    } catch {
+      // A normal fetch fails both when the server is down AND when it's up
+      // but rejecting this page's origin (CORS). A no-cors request still
+      // resolves (as an opaque response) if something is actually listening,
+      // so it tells the two cases apart.
+      try {
+        await fetch(`${ollamaUrl}/api/version`, { mode: "no-cors", signal: AbortSignal.timeout(3000) });
+        setOllamaUp("cors");
+      } catch {
+        setOllamaUp(false);
+      }
+    }
+  }, [ollamaUrl]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => { probe(); }, [probe]);
-
-  // ── Generate (streaming) ──
-  const generate = async () => {
-    if (!prompt.trim() || !model) return;
-    setGenerating(true);
-    setResponse({ id: "stream", prompt, model, content: "", streaming: true });
-    const t0 = Date.now();
-    try {
-      const r = await fetch(`${ollamaUrl}/api/chat`, {
-        method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ model, messages: [{ role: "user", content: prompt }], stream: true, options: { num_ctx: numCtx } }),
-      });
-      if (!r.ok || !r.body) throw new Error(`HTTP ${r.status}`);
-      const reader = r.body.getReader();
-      const decoder = new TextDecoder();
-      let buf = "", full = "", usage = {};
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buf += decoder.decode(value, { stream: true });
-        const lines = buf.split("\n");
-        buf = lines.pop();
-        for (const line of lines) {
-          if (!line.trim()) continue;
-          let j;
-          try { j = JSON.parse(line); } catch { continue; }
-          if (j.error) throw new Error(j.error);
-          if (j.message?.content) {
-            full += j.message.content;
-            setResponse(prev => ({ ...prev, content: full, streaming: true }));
-          }
-          if (j.done) {
-            usage = {
-              prompt_tokens: j.prompt_eval_count,
-              completion_tokens: j.eval_count,
-              total_tokens: (j.prompt_eval_count || 0) + (j.eval_count || 0),
-              tok_per_sec: j.eval_count && j.eval_duration
-                ? (j.eval_count / (j.eval_duration / 1e9)).toFixed(1)
-                : null,
-              load_ms: j.load_duration ? Math.round(j.load_duration / 1e6) : null,
-            };
-          }
-        }
-      }
-      const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
-      const result = { id: Date.now().toString(), prompt, model, elapsed, content: full, usage };
-      setResponse(result);
-      setHistory(prev => [result, ...prev].slice(0, 50));
-    } catch (e) {
-      setResponse({ id: "err", content: `Error: ${e.message}`, error: true });
-    }
-    setGenerating(false);
-  };
 
   // ── Model management ──
   const pullModel = async (name) => {
@@ -330,23 +274,42 @@ async function askLLMStream(prompt, onToken) {
 //   document.getElementById("output").textContent = soFar;
 // });`;
 
-  const corsNote = `# If other browser apps get CORS errors, restart Ollama with:
+  const pageOrigin = typeof window !== "undefined" ? window.location.origin : "";
+
+  // OLLAMA_ORIGINS setup for the official desktop app, which ignores your
+  // shell environment — the variable has to be set at the OS level.
+  const originFix = {
+    macOS: `launchctl setenv OLLAMA_ORIGINS "*"
+# then fully quit Ollama (menu-bar icon → Quit) and reopen it`,
+    Windows: `setx OLLAMA_ORIGINS "*"
+:: then quit Ollama from the system tray and reopen it`,
+    Linux: `systemctl edit ollama.service
+# add under [Service]:   Environment="OLLAMA_ORIGINS=*"
+sudo systemctl daemon-reload && sudo systemctl restart ollama`,
+  };
+  // Detected OS first, then the rest.
+  const originFixOrder = ["macOS", "Windows", "Linux"]
+    .sort((a, b) => (a === hw?.os ? -1 : b === hw?.os ? 1 : 0));
+
+  const corsNote = `# Terminal users: start Ollama with the origins allowed
 OLLAMA_ORIGINS="*" ollama serve
 
 # Or restrict to specific origins:
-OLLAMA_ORIGINS="http://localhost:3000,https://myapp.com" ollama serve`;
+OLLAMA_ORIGINS="${pageOrigin || "https://myapp.com"},http://localhost:3000" ollama serve`;
 
   return (
-    <div style={{ fontFamily: sans, background: C.bg, color: C.text, minHeight: "100vh" }}>
-      <div style={{ padding: "16px 20px 12px", borderBottom: `1px solid ${C.border}`, display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 10 }}>
+    <div style={{ fontFamily: sans, background: C.bg, color: C.text, height: "100vh", display: "flex", flexDirection: "column" }}>
+      <div style={{ padding: "16px 20px 12px", borderBottom: `1px solid ${C.border}`, display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 10, flexShrink: 0 }}>
         <div>
           <div style={{ fontSize: 18, fontWeight: 700 }}><span style={{ color: C.accent }}>◆</span> LLM Manager</div>
           <div style={{ fontSize: 11, fontFamily: mono, color: C.dim, marginTop: 2 }}>
-            {ollamaUp === true ? "🟢" : ollamaUp === false ? "🔴" : "⏳"} Ollama {ollamaUp ? `v${ollamaVer}` : "offline"} · {installed.length} models
+            {ollamaUp === true ? "🟢" : ollamaUp === "cors" ? "🟠" : ollamaUp === false ? "🔴" : "⏳"}
+            {" Ollama "}
+            {ollamaUp === true ? `v${ollamaVer}` : ollamaUp === "cors" ? "blocked" : "offline"} · {installed.length} models
           </div>
         </div>
         <div style={{ display: "flex", gap: 6 }}>
-          {["status", "run", "models", "optimize", "connect"].map(t => (
+          {["status", "chat", "models", "optimize", "connect"].map(t => (
             <button key={t} onClick={() => setTab(t)} style={{
               padding: "7px 16px", fontSize: 12, fontWeight: 600, borderRadius: 8, cursor: "pointer", textTransform: "capitalize",
               border: `1px solid ${tab === t ? C.accent : C.border}`, background: tab === t ? C.accent : "transparent", color: tab === t ? "#fff" : C.dim,
@@ -355,6 +318,12 @@ OLLAMA_ORIGINS="http://localhost:3000,https://myapp.com" ollama serve`;
         </div>
       </div>
 
+      {tab === "chat" ? (
+        <div style={{ flex: 1, minHeight: 0 }}>
+          <Chat ollamaUrl={ollamaUrl} installed={installed} ollamaUp={ollamaUp} />
+        </div>
+      ) : (
+      <div style={{ flex: 1, overflowY: "auto" }}>
       <div style={{ padding: "16px 20px", maxWidth: 820, margin: "0 auto" }}>
 
         {/* ═══ STATUS ═══ */}
@@ -380,9 +349,45 @@ OLLAMA_ORIGINS="http://localhost:3000,https://myapp.com" ollama serve`;
             {ollamaUp === false && (
               <div style={{ background: C.red + "12", border: `1px solid ${C.red}30`, borderRadius: 8, padding: "12px 16px" }}>
                 <div style={{ fontSize: 12, fontWeight: 600, color: C.red, marginBottom: 8 }}>Not reachable</div>
-                <CopyBlock copy={copy} copied={copied} text="brew install ollama" id="inst" label="1. Install" />
-                <CopyBlock copy={copy} copied={copied} text="ollama serve" id="srv" label="2. Start server" />
-                <CopyBlock copy={copy} copied={copied} text="ollama pull gemma2:2b" id="fp" label="3. Pull a model" />
+                <div style={{ fontSize: 12, color: C.dim, lineHeight: 1.6, marginBottom: 10 }}>
+                  Install the <strong style={{ color: C.text }}>official Ollama app</strong> from{" "}
+                  <a href="https://ollama.com/download" target="_blank" rel="noopener noreferrer" style={{ color: C.accent }}>ollama.com/download</a>.
+                  It runs the server as a background service automatically — a menu-bar icon on
+                  macOS, a system-tray icon on Windows — so you don't need to keep a terminal open.
+                </div>
+                <CopyBlock copy={copy} copied={copied} text="ollama pull gemma2:2b" id="fp" label="Then pull your first model" />
+                <div style={{ fontSize: 11, color: C.dim, marginTop: 8, lineHeight: 1.6 }}>
+                  Prefer the terminal? Run <code style={{ fontFamily: mono, color: C.accent }}>OLLAMA_ORIGINS="*" ollama serve</code> —
+                  the origins flag lets this page reach it.
+                </div>
+              </div>
+            )}
+            {ollamaUp === "cors" && (
+              <div style={{ background: C.orange + "12", border: `1px solid ${C.orange}40`, borderRadius: 8, padding: "12px 16px" }}>
+                <div style={{ fontSize: 12, fontWeight: 600, color: C.orange, marginBottom: 8 }}>Running — but blocking this page</div>
+                <div style={{ fontSize: 12, color: C.dim, lineHeight: 1.6, marginBottom: 12 }}>
+                  Ollama is up at <code style={{ fontFamily: mono, color: C.text }}>{ollamaUrl}</code>, but it's
+                  refusing requests from this page's origin
+                  (<code style={{ fontFamily: mono, color: C.text }}>{pageOrigin}</code>).
+                  The official desktop app ignores your shell environment, so set{" "}
+                  <code style={{ fontFamily: mono, color: C.accent }}>OLLAMA_ORIGINS</code> at the OS level,
+                  then fully quit and reopen Ollama.
+                </div>
+                {originFixOrder.map(os => (
+                  <CopyBlock key={os} copy={copy} copied={copied} id={`fix-${os}`} text={originFix[os]}
+                    label={os === hw?.os ? `${os} (your system)` : os} />
+                ))}
+                <div style={{ fontSize: 11, color: C.dim, marginTop: 8, lineHeight: 1.6 }}>
+                  Running both the Ollama app and <code style={{ fontFamily: mono, color: C.accent }}>ollama serve</code> at
+                  once? Only one process can own port 11434 — the app takes it, and the terminal
+                  server (with your origins flag) never sees the request. Either configure the app
+                  above, or quit the app and use the terminal server.
+                </div>
+                <div style={{ marginTop: 10 }}>
+                  <button onClick={probe} style={{ padding: "6px 14px", fontSize: 11, fontWeight: 600, background: C.s2, color: C.text, border: `1px solid ${C.border}`, borderRadius: 6, cursor: "pointer" }}>
+                    Re-check connection
+                  </button>
+                </div>
               </div>
             )}
             {ollamaUp === true && (<>
@@ -427,101 +432,6 @@ OLLAMA_ORIGINS="http://localhost:3000,https://myapp.com" ollama serve`;
               })}
             </>)}
           </Box>
-        </>)}
-
-        {/* ═══ RUN ═══ */}
-        {tab === "run" && (<>
-          <Box title="Prompt">
-            {ollamaUp === false ? (
-              <div style={{ fontSize: 12, color: C.red }}>Ollama not running — check the Status tab for setup.</div>
-            ) : (<>
-              <select value={model} onChange={e => setModel(e.target.value)} style={{ width: "100%", padding: "8px 12px", fontSize: 12, fontFamily: mono, background: C.bg, color: C.text, border: `1px solid ${C.border}`, borderRadius: 6, marginBottom: 10 }}>
-                {installed.length === 0 && <option value="">no models installed</option>}
-                {installed.map(m => <option key={m.name} value={m.name}>{m.name} ({fmtB(m.size)})</option>)}
-              </select>
-              <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10 }}>
-                <span style={{ fontSize: 11, color: C.dim, fontFamily: mono }}>Context window</span>
-                <select value={numCtx} onChange={e => setNumCtx(Number(e.target.value))} style={{ padding: "6px 10px", fontSize: 11, fontFamily: mono, background: C.bg, color: C.text, border: `1px solid ${C.border}`, borderRadius: 6 }}>
-                  <option value={2048}>2048 — fastest first token</option>
-                  <option value={4096}>4096 — Ollama default</option>
-                  <option value={8192}>8192 — long prompts</option>
-                  <option value={16384}>16384 — large docs (more KV memory)</option>
-                </select>
-                <span style={{ fontSize: 10, color: C.dim }}>smaller = smaller KV cache = faster</span>
-              </div>
-              <textarea
-                value={prompt} onChange={e => setPrompt(e.target.value)}
-                onKeyDown={e => { if (e.key === "Enter" && e.metaKey) generate(); }}
-                placeholder="Type a prompt… ⌘+Enter to send"
-                rows={4}
-                style={{ width: "100%", padding: "10px 14px", fontSize: 13, background: C.bg, color: C.text, border: `1px solid ${C.border}`, borderRadius: 8, resize: "vertical", boxSizing: "border-box", lineHeight: 1.5, fontFamily: sans }}
-              />
-              <div style={{ display: "flex", justifyContent: "flex-end", marginTop: 8 }}>
-                <button onClick={generate} disabled={generating || !model || !prompt.trim()} style={{
-                  padding: "9px 24px", fontSize: 13, fontWeight: 700, borderRadius: 8, border: "none",
-                  cursor: generating ? "wait" : "pointer", background: generating ? C.s2 : C.accent,
-                  color: generating ? C.dim : "#fff", opacity: (!model || !prompt.trim()) ? 0.4 : 1,
-                }}>{generating ? "Generating…" : "Send"}</button>
-              </div>
-            </>)}
-          </Box>
-
-          {response && (
-            <Box
-              title={response.error ? "Error" : "Response"}
-              sub={response.error ? null : response.streaming ? "streaming…" : [
-                response.model,
-                `${response.elapsed}s`,
-                `${response.usage.total_tokens || "?"} tokens`,
-                response.usage.tok_per_sec ? `${response.usage.tok_per_sec} tok/s` : null,
-                response.usage.load_ms ? `load ${response.usage.load_ms}ms` : null,
-              ].filter(Boolean).join(" · ")}
-            >
-              {response.error ? (
-                <pre style={{ fontFamily: sans, fontSize: 13, lineHeight: 1.6, whiteSpace: "pre-wrap", wordBreak: "break-word", color: C.red, margin: 0, maxHeight: 400, overflowY: "auto" }}>
-                  {response.content}
-                </pre>
-              ) : (
-                <>
-                  {response.streaming && (
-                    <ThinkingBar label={response.content ? "Generating…" : "Thinking…"} />
-                  )}
-                  <div style={{ maxHeight: 400, overflowY: "auto" }}>
-                    <Markdown text={response.content} />
-                    {response.streaming && (
-                      <span style={{ display: "inline-block", width: 8, height: 15, marginLeft: 1, background: C.accent, verticalAlign: "text-bottom", animation: "llm-cursor-blink 1s step-start infinite" }} />
-                    )}
-                  </div>
-                </>
-              )}
-              {!response.error && !response.streaming && (
-                <div style={{ display: "flex", gap: 8, marginTop: 12 }}>
-                  <button onClick={() => copy(response.content, "resp")} style={{
-                    padding: "6px 14px", fontSize: 11, fontFamily: mono, borderRadius: 6, border: "none", cursor: "pointer",
-                    background: copied === "resp" ? C.green : C.s2, color: copied === "resp" ? "#000" : C.dim,
-                  }}>{copied === "resp" ? "✓" : "copy text"}</button>
-                  <button onClick={() => copy(JSON.stringify({ prompt: response.prompt, model: response.model, response: response.content, usage: response.usage }, null, 2), "json")} style={{
-                    padding: "6px 14px", fontSize: 11, fontFamily: mono, borderRadius: 6, border: "none", cursor: "pointer",
-                    background: copied === "json" ? C.green : C.s2, color: copied === "json" ? "#000" : C.dim,
-                  }}>{copied === "json" ? "✓" : "copy JSON"}</button>
-                </div>
-              )}
-            </Box>
-          )}
-
-          {history.length > 0 && (
-            <Box title={`History (${history.length})`}>
-              {history.map((h, i) => (
-                <div key={h.id} style={{ padding: "8px 0", borderBottom: i < history.length - 1 ? `1px solid ${C.s3}` : "none" }}>
-                  <div style={{ display: "flex", justifyContent: "space-between" }}>
-                    <div style={{ fontSize: 12, fontWeight: 500 }}>{h.prompt.slice(0, 80)}{h.prompt.length > 80 ? "…" : ""}</div>
-                    <span style={{ fontSize: 10, fontFamily: mono, color: C.dim, flexShrink: 0 }}>{h.model} · {h.elapsed}s</span>
-                  </div>
-                  <div style={{ fontSize: 11, color: C.dim, marginTop: 2, lineHeight: 1.4 }}>{h.content.slice(0, 140)}{h.content.length > 140 ? "…" : ""}</div>
-                </div>
-              ))}
-            </Box>
-          )}
         </>)}
 
         {/* ═══ MODELS ═══ */}
@@ -623,9 +533,11 @@ ollama serve`;
 
             <Box title="Context window" sub="Ollama defaults num_ctx to 4096. Smaller windows shrink the KV cache and speed up the first token.">
               <div style={{ fontSize: 12, color: C.dim, lineHeight: 1.6 }}>
-                Set the context size on the <strong style={{ color: C.text }}>Run</strong> tab — it's passed as
-                <code style={{ fontFamily: mono, color: C.accent }}> options.num_ctx</code> on every request.
-                Drop it to 2048 for short prompts; raise it only when you actually feed in long documents.
+                Every request can pass <code style={{ fontFamily: mono, color: C.accent }}>options.num_ctx</code> to size
+                the context window; set a server-wide default with the
+                <code style={{ fontFamily: mono, color: C.accent }}> OLLAMA_CONTEXT_LENGTH</code> env var.
+                Keep it at 2048–4096 for short prompts; raise it only when you actually feed in long documents,
+                since a larger window means a larger KV cache and a slower first token.
               </div>
             </Box>
 
@@ -677,11 +589,24 @@ ollama serve`;
             </>)}
           </Box>
 
-          <Box title="CORS Setup" sub="If your browser app is on a different origin and gets blocked">
+          <Box title="CORS Setup" sub="Why a hosted page can't reach a freshly-installed Ollama">
             <div style={{ fontSize: 12, color: C.dim, lineHeight: 1.6, marginBottom: 10 }}>
-              By default Ollama allows requests from any origin. If you run into CORS errors, restart Ollama with the <code style={{ fontFamily: mono, color: C.accent }}>OLLAMA_ORIGINS</code> env var:
+              Ollama only answers browser requests whose origin is listed in{" "}
+              <code style={{ fontFamily: mono, color: C.accent }}>OLLAMA_ORIGINS</code> — by default just
+              localhost. A page served from GitHub Pages (or any other host) is blocked until you add it.
+              For the terminal server, pass the variable when you start it:
             </div>
             <CopyBlock copy={copy} copied={copied} id="cors" text={corsNote} />
+            <div style={{ fontSize: 12, color: C.dim, lineHeight: 1.6, marginTop: 12 }}>
+              The <strong style={{ color: C.text }}>official desktop app</strong> ignores shell variables —
+              set them at the OS level instead, then quit and reopen Ollama:
+            </div>
+            {originFixOrder.map(os => (
+              <div key={os} style={{ marginTop: 8 }}>
+                <CopyBlock copy={copy} copied={copied} id={`conn-fix-${os}`} text={originFix[os]}
+                  label={os === hw?.os ? `${os} (your system)` : os} />
+              </div>
+            ))}
           </Box>
 
           <Box title="API Reference">
@@ -696,6 +621,8 @@ ollama serve`;
           </Box>
         </>)}
       </div>
+      </div>
+      )}
     </div>
   );
 }
