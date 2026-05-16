@@ -237,17 +237,17 @@ const REJECTION_RE = /\b(no|nope|that'?s wrong|that is wrong|try again|not what 
 
 // Inspect prior auto-routed messages in a thread when a new prompt is sent.
 // Logs implicit signals and returns [{ routingId, action }] for messages
-// that just became evaluated.
+// that just became evaluated. Message order is taken from array position.
 export const processImplicitSignals = (thread, newUserText, autoMode) => {
   const results = [];
   if (!thread || !Array.isArray(thread.messages)) return results;
+  const msgs = thread.messages;
   const shortFollowUp = newUserText.trim().length < 60;
 
-  for (const m of thread.messages) {
+  for (let i = 0; i < msgs.length; i++) {
+    const m = msgs[i];
     if (m.role !== "assistant" || !m.routing || m.routing.evalDone) continue;
-    const userMsgsAfter = thread.messages.filter(
-      (x) => x.role === "user" && x.createdAt > m.createdAt
-    ).length;
+    const userMsgsAfter = msgs.slice(i + 1).filter((x) => x.role === "user").length;
 
     let signal = null;
     if (userMsgsAfter === 0) {
