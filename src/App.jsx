@@ -106,7 +106,7 @@ const Box = ({ title, sub, children }) => (
   </div>
 );
 
-const ChatBubble = ({ message, copy, copied }) => {
+const ChatBubble = ({ message, copy, copied, fork }) => {
   const isUser = message.role === "user";
   const isAssistant = message.role === "assistant";
   return (
@@ -139,12 +139,21 @@ const ChatBubble = ({ message, copy, copied }) => {
             <div style={{ fontSize: 13, lineHeight: 1.5, whiteSpace: "pre-wrap" }}>{message.content}</div>
           )}
         </div>
-        {isAssistant && message.content && !message.streaming && !message.error && (
-          <div style={{ display: "flex", gap: 8, marginTop: 6 }}>
-            <button onClick={() => copy(message.content, `msg-${message.id}`)} style={{
-              padding: "4px 10px", fontSize: 10, fontFamily: mono, borderRadius: 6, border: "none", cursor: "pointer",
-              background: copied === `msg-${message.id}` ? C.green : C.s2, color: copied === `msg-${message.id}` ? "#000" : C.dim,
-            }}>{copied === `msg-${message.id}` ? "✓" : "copy"}</button>
+        {!message.streaming && (
+          <div style={{ display: "flex", gap: 8, marginTop: 6, justifyContent: isUser ? "flex-end" : "flex-start" }}>
+            {isAssistant && message.content && !message.error && (
+              <button onClick={() => copy(message.content, `msg-${message.id}`)} style={{
+                padding: "4px 10px", fontSize: 10, fontFamily: mono, borderRadius: 6, border: "none", cursor: "pointer",
+                background: copied === `msg-${message.id}` ? C.green : C.s2, color: copied === `msg-${message.id}` ? "#000" : C.dim,
+              }}>{copied === `msg-${message.id}` ? "✓" : "copy"}</button>
+            )}
+            {fork && (
+              <button onClick={() => fork(message.id)} title="Branch a new chat from this point"
+                style={{
+                  padding: "4px 10px", fontSize: 10, fontFamily: mono, borderRadius: 6, border: "none", cursor: "pointer",
+                  background: C.s2, color: C.dim,
+                }}>⑂ fork</button>
+            )}
           </div>
         )}
       </div>
@@ -195,6 +204,29 @@ export default function App() {
 
   const updateThread = (threadId, updater) => {
     setThreads(prev => prev.map(t => t.id === threadId ? updater(t) : t));
+  };
+
+  const forkThread = (messageId) => {
+    if (!activeThread) return;
+    const idx = activeThread.messages.findIndex(m => m.id === messageId);
+    if (idx < 0) return;
+    const now = Date.now();
+    const messages = activeThread.messages
+      .slice(0, idx + 1)
+      .map(m => ({ ...m, streaming: false }));
+    const baseTitle = activeThread.title.replace(/\s*\(fork\)$/, "");
+    const trimmedBase = baseTitle.length > 30 ? `${baseTitle.slice(0, 30)}…` : baseTitle;
+    const fork = {
+      id: `thread-${now}-${Math.random().toString(36).slice(2, 8)}`,
+      title: `${trimmedBase} (fork)`,
+      model: activeThread.model,
+      createdAt: now,
+      updatedAt: now,
+      messages,
+    };
+    setThreads(prev => [fork, ...prev].slice(0, MAX_SAVED_THREADS));
+    setActiveThreadId(fork.id);
+    setPrompt("");
   };
 
   // ── Hardware ──
@@ -598,7 +630,7 @@ OLLAMA_ORIGINS="http://localhost:3000,https://myapp.com" ollama serve`;
                           </div>
                         </div>
                       ) : activeThread.messages.map(m => (
-                        <ChatBubble key={m.id} message={m} copy={copy} copied={copied} />
+                        <ChatBubble key={m.id} message={m} copy={copy} copied={copied} fork={generating ? null : forkThread} />
                       ))}
                       <div ref={chatEndRef} />
                     </div>
