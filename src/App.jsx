@@ -2,21 +2,42 @@ import { useState, useEffect, useCallback } from "react";
 import Markdown from "./Markdown.jsx";
 
 const MODEL_CATALOG = [
-  { id: "gemma2:2b", params: "2B", vram: 1.5, speed: "fast", use: "Light tasks, quick responses" },
-  { id: "llama3.2:3b", params: "3B", vram: 2.2, speed: "fast", use: "General chat, summarization" },
-  { id: "phi3:mini", params: "3.8B", vram: 2.5, speed: "fast", use: "Reasoning, code, math" },
-  { id: "mistral", params: "7B", vram: 4.4, speed: "medium", use: "General purpose, tool use" },
-  { id: "llama3.1:8b", params: "8B", vram: 5.0, speed: "medium", use: "Strong all-rounder" },
-  { id: "gemma2:9b", params: "9B", vram: 5.5, speed: "medium", use: "Quality reasoning" },
-  { id: "qwen2.5:7b", params: "7B", vram: 4.7, speed: "medium", use: "Code, math, multilingual" },
-  { id: "deepseek-r1:8b", params: "8B", vram: 5.0, speed: "medium", use: "Chain-of-thought reasoning" },
-  { id: "qwen2.5:14b", params: "14B", vram: 9.0, speed: "slow", use: "High quality code & writing" },
-  { id: "phi3:medium", params: "14B", vram: 8.5, speed: "slow", use: "Strong reasoning & analysis" },
-  { id: "codellama:13b", params: "13B", vram: 7.9, speed: "slow", use: "Code generation" },
-  { id: "mixtral:8x7b", params: "47B MoE", vram: 15, speed: "slow", use: "MoE — fast for its quality" },
-  { id: "nomic-embed-text", params: "137M", vram: 0.3, speed: "instant", use: "Embeddings for RAG" },
-  { id: "llava", params: "7B", vram: 5.0, speed: "medium", use: "Image + text understanding" },
-  { id: "starcoder2:7b", params: "7B", vram: 4.5, speed: "medium", use: "Code completion" },
+  { id: "gemma2:2b", params: "2B", vram: 1.5, speed: "fastest", tok: "100+ tok/s warm", use: "Light tasks, quick responses" },
+  { id: "llama3.2:3b", params: "3B", vram: 2.2, speed: "fast", tok: "60-80 tok/s", use: "General chat, summarization" },
+  { id: "phi3:mini", params: "3.8B", vram: 2.5, speed: "fast", tok: "60-80 tok/s", use: "Reasoning, code, math" },
+  { id: "mistral", params: "7B", vram: 4.4, speed: "medium", tok: "30-40 tok/s", use: "General purpose, tool use" },
+  { id: "llama3.1:8b", params: "8B", vram: 5.0, speed: "medium", tok: "30-40 tok/s", use: "Strong all-rounder" },
+  { id: "gemma2:9b", params: "9B", vram: 5.5, speed: "medium", tok: "25-35 tok/s", use: "Quality reasoning" },
+  { id: "qwen2.5:7b", params: "7B", vram: 4.7, speed: "medium", tok: "30-40 tok/s", use: "Code, math, multilingual" },
+  { id: "deepseek-r1:8b", params: "8B", vram: 5.0, speed: "medium", tok: "30-40 tok/s", use: "Chain-of-thought reasoning" },
+  { id: "qwen2.5:14b", params: "14B", vram: 9.0, speed: "slow", tok: "15-20 tok/s", use: "Best quality that fits comfortably" },
+  { id: "phi3:medium", params: "14B", vram: 8.5, speed: "slow", tok: "15-20 tok/s", use: "Strong reasoning & analysis" },
+  { id: "codellama:13b", params: "13B", vram: 7.9, speed: "slow", tok: "15-25 tok/s", use: "Code generation" },
+  { id: "mixtral:8x7b", params: "47B MoE", vram: 15, speed: "tight", tok: "memory-bound", use: "MoE; only worth it with memory to spare" },
+  { id: "nomic-embed-text", params: "137M", vram: 0.3, speed: "instant", tok: "instant", use: "Embeddings for RAG" },
+  { id: "llava", params: "7B", vram: 5.0, speed: "medium", tok: "30-40 tok/s", use: "Image + text understanding" },
+  { id: "starcoder2:7b", params: "7B", vram: 4.5, speed: "medium", tok: "30-40 tok/s", use: "Code completion" },
+];
+
+const CONTEXT_OPTIONS = [
+  { value: 2048, label: "2048 — faster/simple prompts" },
+  { value: 4096, label: "4096 — Ollama default" },
+  { value: 8192, label: "8192 — long documents" },
+  { value: 16384, label: "16384 — max context, slower" },
+];
+
+const KEEP_ALIVE_OPTIONS = [
+  { value: "5m", label: "5m — default-ish" },
+  { value: "30m", label: "30m — short session" },
+  { value: "24h", label: "24h — keep hot all day" },
+  { value: "0", label: "0 — unload after response" },
+];
+
+const OPTIMIZATION_TIPS = [
+  { title: "Quantization", text: "Q4_K_M or Q5_K_M is the sweet spot. Q4 cuts a 7B model from ~14 GB F16 to ~4.4 GB and is often 3-4x faster with minimal quality loss." },
+  { title: "Context", text: "Use num_ctx 2048 for simple tasks. Smaller KV cache improves first-token latency; raise it only for long prompts or documents." },
+  { title: "Keep-alive", text: "Cold loads are slow. keep_alive 24h keeps the model resident between requests so warm prompts stay fast." },
+  { title: "MoE", text: "Mixtral 8x7B activates ~13B parameters per token but still needs the full ~47B loaded. On a 24 GB laptop it is usually slower than a strong 7-14B dense model." },
 ];
 
 const mono = `'SF Mono','Menlo','Consolas',monospace`;
@@ -77,6 +98,9 @@ export default function App() {
 
   const [model, setModel] = useState("");
   const [prompt, setPrompt] = useState("");
+  const [numCtx, setNumCtx] = useState(2048);
+  const [keepAlive, setKeepAliveOption] = useState("24h");
+  const [temperature, setTemperature] = useState(0.7);
   const [generating, setGenerating] = useState(false);
   const [response, setResponse] = useState(null);
   const [history, setHistory] = useState([]);
@@ -124,7 +148,7 @@ export default function App() {
       const pR = await fetch(`${ollamaUrl}/api/ps`, { signal: AbortSignal.timeout(3000) });
       if (pR.ok) setRunning((await pR.json()).models || []);
     } catch { setOllamaUp(false); }
-  }, [ollamaUrl]);
+  }, [ollamaUrl, model]);
 
   useEffect(() => { probe(); }, [probe]);
 
@@ -137,7 +161,13 @@ export default function App() {
     try {
       const r = await fetch(`${ollamaUrl}/api/chat`, {
         method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ model, messages: [{ role: "user", content: prompt }], stream: true }),
+        body: JSON.stringify({
+          model,
+          messages: [{ role: "user", content: prompt }],
+          stream: true,
+          keep_alive: keepAlive === "0" ? 0 : keepAlive,
+          options: { num_ctx: Number(numCtx), temperature: Number(temperature) },
+        }),
       });
       if (!r.ok || !r.body) throw new Error(`HTTP ${r.status}`);
       const reader = r.body.getReader();
@@ -168,7 +198,10 @@ export default function App() {
         }
       }
       const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
-      const result = { id: Date.now().toString(), prompt, model, elapsed, content: full, usage };
+      const result = {
+        id: Date.now().toString(), prompt, model, elapsed, content: full, usage,
+        options: { num_ctx: Number(numCtx), keep_alive: keepAlive, temperature: Number(temperature) },
+      };
       setResponse(result);
       setHistory(prev => [result, ...prev].slice(0, 50));
     } catch (e) {
@@ -224,6 +257,7 @@ export default function App() {
     probe();
   };
   const loadModel = (name) => setKeepAlive(name, "10m", "load");
+  const keepModelHot = (name) => setKeepAlive(name, "24h", "load");
   const unloadModel = (name) => setKeepAlive(name, 0, "unload");
 
   const deleteModel = async (name) => {
@@ -282,7 +316,13 @@ async function askLLMStream(prompt, onToken) {
   const res = await fetch("${ollamaUrl}/api/generate", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ model: "${m}", prompt, stream: true }),
+    body: JSON.stringify({
+      model: "${m}",
+      prompt,
+      stream: true,
+      keep_alive: "24h",
+      options: { num_ctx: 2048 },
+    }),
   });
   const reader = res.body.getReader();
   const decoder = new TextDecoder();
@@ -305,6 +345,13 @@ async function askLLMStream(prompt, onToken) {
 // await askLLMStream("explain monads", (token, soFar) => {
 //   document.getElementById("output").textContent = soFar;
 // });`;
+
+  const speedCurl = `curl ${ollamaUrl}/api/generate -d '{
+  "model": "${model || "gemma2:2b"}",
+  "prompt": "hello",
+  "keep_alive": "24h",
+  "options": { "num_ctx": 2048 }
+}'`;
 
   const corsNote = `# If other browser apps get CORS errors, restart Ollama with:
 OLLAMA_ORIGINS="*" ollama serve
@@ -385,6 +432,7 @@ OLLAMA_ORIGINS="http://localhost:3000,https://myapp.com" ollama serve`;
                       {loaded
                         ? <ActBtn onClick={() => unloadModel(m.name)} disabled={!!act}>{act === "unload" ? "unloading…" : "unload"}</ActBtn>
                         : <ActBtn onClick={() => loadModel(m.name)} disabled={!!act}>{act === "load" ? "loading…" : "load"}</ActBtn>}
+                      <ActBtn onClick={() => keepModelHot(m.name)} disabled={!!act}>{act === "load" ? "loading…" : "keep 24h"}</ActBtn>
                       <ActBtn onClick={() => deleteModel(m.name)} disabled={!!act} color={C.red}>{act === "delete" ? "deleting…" : "delete"}</ActBtn>
                     </div>
                   </div>
@@ -411,6 +459,27 @@ OLLAMA_ORIGINS="http://localhost:3000,https://myapp.com" ollama serve`;
                 rows={4}
                 style={{ width: "100%", padding: "10px 14px", fontSize: 13, background: C.bg, color: C.text, border: `1px solid ${C.border}`, borderRadius: 8, resize: "vertical", boxSizing: "border-box", lineHeight: 1.5, fontFamily: sans }}
               />
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(170px, 1fr))", gap: 8, marginTop: 10 }}>
+                <label style={{ fontSize: 10, color: C.dim, fontFamily: mono }}>
+                  num_ctx
+                  <select value={numCtx} onChange={e => setNumCtx(Number(e.target.value))} style={{ width: "100%", marginTop: 4, padding: "7px 9px", fontSize: 11, fontFamily: mono, background: C.bg, color: C.text, border: `1px solid ${C.border}`, borderRadius: 6 }}>
+                    {CONTEXT_OPTIONS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+                  </select>
+                </label>
+                <label style={{ fontSize: 10, color: C.dim, fontFamily: mono }}>
+                  keep_alive
+                  <select value={keepAlive} onChange={e => setKeepAliveOption(e.target.value)} style={{ width: "100%", marginTop: 4, padding: "7px 9px", fontSize: 11, fontFamily: mono, background: C.bg, color: C.text, border: `1px solid ${C.border}`, borderRadius: 6 }}>
+                    {KEEP_ALIVE_OPTIONS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+                  </select>
+                </label>
+                <label style={{ fontSize: 10, color: C.dim, fontFamily: mono }}>
+                  temperature
+                  <input type="number" min="0" max="2" step="0.1" value={temperature} onChange={e => setTemperature(e.target.value)} style={{ width: "100%", boxSizing: "border-box", marginTop: 4, padding: "7px 9px", fontSize: 11, fontFamily: mono, background: C.bg, color: C.text, border: `1px solid ${C.border}`, borderRadius: 6 }} />
+                </label>
+              </div>
+              <div style={{ fontSize: 11, color: C.dim, lineHeight: 1.5, marginTop: 8 }}>
+                Tip: 2048 context plus 24h keep-alive is the fast warm-laptop preset; raise context only when the prompt needs it.
+              </div>
               <div style={{ display: "flex", justifyContent: "flex-end", marginTop: 8 }}>
                 <button onClick={generate} disabled={generating || !model || !prompt.trim()} style={{
                   padding: "9px 24px", fontSize: 13, fontWeight: 700, borderRadius: 8, border: "none",
@@ -449,7 +518,7 @@ OLLAMA_ORIGINS="http://localhost:3000,https://myapp.com" ollama serve`;
                     padding: "6px 14px", fontSize: 11, fontFamily: mono, borderRadius: 6, border: "none", cursor: "pointer",
                     background: copied === "resp" ? C.green : C.s2, color: copied === "resp" ? "#000" : C.dim,
                   }}>{copied === "resp" ? "✓" : "copy text"}</button>
-                  <button onClick={() => copy(JSON.stringify({ prompt: response.prompt, model: response.model, response: response.content, usage: response.usage }, null, 2), "json")} style={{
+                  <button onClick={() => copy(JSON.stringify({ prompt: response.prompt, model: response.model, options: response.options, response: response.content, usage: response.usage }, null, 2), "json")} style={{
                     padding: "6px 14px", fontSize: 11, fontFamily: mono, borderRadius: 6, border: "none", cursor: "pointer",
                     background: copied === "json" ? C.green : C.s2, color: copied === "json" ? "#000" : C.dim,
                   }}>{copied === "json" ? "✓" : "copy JSON"}</button>
@@ -475,6 +544,19 @@ OLLAMA_ORIGINS="http://localhost:3000,https://myapp.com" ollama serve`;
 
         {/* ═══ MODELS ═══ */}
         {tab === "models" && (<>
+          <Box title="M3 Speed Preset" sub="The biggest wins are quantization, smaller context, and keeping the model loaded.">
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))", gap: 10, marginBottom: 12 }}>
+              {OPTIMIZATION_TIPS.map(t => (
+                <div key={t.title} style={{ background: C.bg, border: `1px solid ${C.border}`, borderRadius: 8, padding: "10px 12px" }}>
+                  <div style={{ fontSize: 11, fontWeight: 700, color: C.text, marginBottom: 4 }}>{t.title}</div>
+                  <div style={{ fontSize: 11, color: C.dim, lineHeight: 1.45 }}>{t.text}</div>
+                </div>
+              ))}
+            </div>
+            <CopyBlock copy={copy} copied={copied} id="speed-curl" label="Fast warm request preset" text={speedCurl} />
+            <CopyBlock copy={copy} copied={copied} id="mem-top" label="Find memory hogs before running larger models" text="top -o mem" />
+          </Box>
+
           <Box title="Model Catalog" sub={ramGB ? `~${ramGB} GB detected → ~${(ramGB * .75).toFixed(0)} GB usable for models` : "RAM not exposed by browser — check terminal"}>
             {!ramGB && <div style={{ marginBottom: 12 }}><CopyBlock copy={copy} copied={copied} id="ram" text='sysctl -n hw.memsize | awk "{print $1/1073741824\" GB\"}"' label="Check actual RAM" /></div>}
             {MODEL_CATALOG.map(m => {
@@ -488,7 +570,7 @@ OLLAMA_ORIGINS="http://localhost:3000,https://myapp.com" ollama serve`;
                       {inst && <Pill color={C.green}>INSTALLED</Pill>}
                       {rec && <Pill color={rec.c}>{rec.t}</Pill>}
                     </div>
-                    <div style={{ fontSize: 11, color: C.dim, marginTop: 2 }}>{m.params} · ~{m.vram} GB · {m.speed} · {m.use}</div>
+                    <div style={{ fontSize: 11, color: C.dim, marginTop: 2 }}>{m.params} · ~{m.vram} GB Q4-ish · {m.speed} · {m.tok} · {m.use}</div>
                   </div>
                   {(() => {
                     const pp = pulling[m.id];
