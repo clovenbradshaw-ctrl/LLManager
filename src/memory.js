@@ -31,6 +31,63 @@ preferences, and decisions. Ignore small talk and transient details.
 Return [] if there is nothing worth remembering.
 Return ONLY the JSON array — no markdown, no commentary.`;
 
+/* Ingest: read a standalone block of text (a pasted note, an article, an
+   uploaded document) into a knowledge graph. Same event vocabulary as the
+   chat Extract step, but framed for a document rather than a conversation. */
+export const INGEST_SYSTEM = `Read the text below and extract its durable facts as JSON.
+Return a JSON array of events. Each event is one of:
+  { "op": "INS", "entity": "<name>", "kind": "person|place|org|thing|event|topic" }
+  { "op": "CON", "from": "<entity>", "to": "<entity>", "type": "<relation>" }
+  { "op": "DEF", "entity": "<name>", "field": "<attribute>", "value": "<value>" }
+Capture the named things, their relationships, their attributes, and any
+definitions or decisions stated in the text. Ignore filler and rhetoric.
+Return [] if there is nothing worth remembering.
+Return ONLY the JSON array — no markdown, no commentary.`;
+
+/* Split a large block of text into model-sized chunks, breaking on paragraph
+   then sentence boundaries so a fact is never cut in half. */
+export function chunkText(text, maxChars = 2800) {
+  const clean = String(text || "").replace(/\r\n/g, "\n").trim();
+  if (!clean) return [];
+  if (clean.length <= maxChars) return [clean];
+  const chunks = [];
+  let buf = "";
+  const flush = () => { if (buf.trim()) { chunks.push(buf.trim()); buf = ""; } };
+  for (const para of clean.split(/\n\s*\n/)) {
+    if (para.length > maxChars) {
+      flush();
+      let sb = "";
+      for (const s of para.match(/[^.!?]+[.!?]+|[^.!?]+$/g) || [para]) {
+        if (sb && (sb + s).length > maxChars) { chunks.push(sb.trim()); sb = ""; }
+        sb += s;
+      }
+      if (sb.trim()) buf = sb.trim();
+      continue;
+    }
+    if (buf && (buf + "\n\n" + para).length > maxChars) flush();
+    buf = buf ? buf + "\n\n" + para : para;
+  }
+  flush();
+  return chunks;
+}
+
+/* Merge several knowledge graphs into one (entities/edges/defs only). Used to
+   project a chat's own memory together with any opted-in library documents
+   into a single graph before building the dossier. */
+export function mergeMemory(...memories) {
+  const out = { entities: {}, edges: {}, defs: {} };
+  for (const m of memories) {
+    if (!m) continue;
+    for (const [id, e] of Object.entries(m.entities || {})) {
+      if (!out.entities[id]) out.entities[id] = { ...e };
+      else out.entities[id].mentions = (out.entities[id].mentions || 0) + (e.mentions || 0);
+    }
+    Object.assign(out.edges, m.edges || {});
+    Object.assign(out.defs, m.defs || {});
+  }
+  return out;
+}
+
 /* ── Empty / clone helpers ── */
 export const emptyMemory = () => ({ entities: {}, edges: {}, defs: {}, lastTurn: null });
 

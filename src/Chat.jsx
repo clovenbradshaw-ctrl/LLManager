@@ -8,11 +8,12 @@ import {
   processImplicitSignals, runREC, shouldRunREC,
 } from "./router.js";
 import {
-  MEMORY_SYSTEM, CASUAL_SYSTEM, EXTRACT_SYSTEM,
-  emptyMemory, cloneMemory, memoryStats,
+  MEMORY_SYSTEM, CASUAL_SYSTEM, EXTRACT_SYSTEM, INGEST_SYSTEM,
+  emptyMemory, cloneMemory, memoryStats, mergeMemory, chunkText,
   signal, isKnowledgeBearing, reach, buildDossier, buildPosition,
   parseEvents, applyEvents,
 } from "./memory.js";
+import { loadLibrary, saveLibrary, docStats } from "./library.js";
 
 const mono = `'SF Mono','Menlo','Consolas',monospace`;
 const sans = `-apple-system,system-ui,sans-serif`;
@@ -69,6 +70,11 @@ const Icon = ({ name, size = 14 }) => {
     case "chev":    return <svg viewBox="0 0 24 24" {...s}><path d="m6 9 6 6 6-6" /></svg>;
     case "chat":    return <svg viewBox="0 0 24 24" {...s}><path d="M21 12a8 8 0 0 1-11.5 7.2L4 21l1.8-5.5A8 8 0 1 1 21 12Z" /></svg>;
     case "memory":  return <svg viewBox="0 0 24 24" {...s}><path d="M12 5a3 3 0 0 0-3 3 3 3 0 0 0-2 5 3 3 0 0 0 3 4 3 3 0 0 0 5 0 3 3 0 0 0 3-4 3 3 0 0 0-2-5 3 3 0 0 0-3-3Z" /><path d="M12 5v12" /></svg>;
+    case "book":    return <svg viewBox="0 0 24 24" {...s}><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20" /><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2Z" /></svg>;
+    case "download":return <svg viewBox="0 0 24 24" {...s}><path d="M12 3v12M7 10l5 5 5-5M5 21h14" /></svg>;
+    case "doc":     return <svg viewBox="0 0 24 24" {...s}><path d="M14 3v5h5M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8Z" /></svg>;
+    case "x":       return <svg viewBox="0 0 24 24" {...s}><path d="M18 6 6 18M6 6l12 12" /></svg>;
+    case "eye":     return <svg viewBox="0 0 24 24" {...s}><path d="M2 12s4-7 10-7 10 7 10 7-4 7-10 7-10-7-10-7Z" /><circle cx="12" cy="12" r="3" /></svg>;
     default: return null;
   }
 };
@@ -310,6 +316,41 @@ function Reasoning({ text, streaming }) {
   );
 }
 
+/* ── Prompt audit panel — the exact messages this reply was given ── */
+function PromptView({ prompt }) {
+  const [open, setOpen] = useState(false);
+  if (!prompt || !prompt.length) return null;
+  const chars = prompt.reduce((n, m) => n + (m.content || "").length, 0);
+  return (
+    <div style={{ marginTop: 8 }}>
+      <button onClick={() => setOpen(o => !o)} style={{
+        display: "flex", alignItems: "center", gap: 6, padding: "4px 9px",
+        background: C.s1, border: `1px solid ${C.border}`, borderRadius: 6,
+        cursor: "pointer", fontFamily: mono, fontSize: 10.5, color: C.dim,
+      }}>
+        <Icon name="eye" size={11} />
+        {open ? "Hide prompt" : "View prompt sent"}
+        <span style={{ color: C.dim }}>· {prompt.length} msg · {chars} chars</span>
+      </button>
+      {open && (
+        <div style={{
+          marginTop: 6, padding: "8px 12px", background: C.s1, border: `1px solid ${C.border}`,
+          borderRadius: 8,
+        }}>
+          {prompt.map((m, i) => (
+            <div key={i} style={{ marginBottom: i < prompt.length - 1 ? 10 : 0 }}>
+              <div style={{ fontFamily: mono, fontSize: 9.5, fontWeight: 700, letterSpacing: 0.5,
+                textTransform: "uppercase", color: C.accent, marginBottom: 3 }}>{m.role}</div>
+              <div style={{ fontFamily: mono, fontSize: 11.5, lineHeight: 1.6, color: C.dim,
+                whiteSpace: "pre-wrap", wordBreak: "break-word" }}>{m.content}</div>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 /* ── Message bubble ── */
 function MessageBubble({ msg, prevModel, onCopy, copied, onRerun, onFork, busy, installed, onFeedback, onWrongModel, wrongModelFor, setWrongModelFor, userMsgsAfter }) {
   if (msg.role === "user") {
@@ -386,6 +427,9 @@ function MessageBubble({ msg, prevModel, onCopy, copied, onRerun, onFork, busy, 
         <div style={{ fontSize: 10, fontFamily: mono, color: C.dim, paddingLeft: 13, marginTop: 8 }}>
           feedback recorded · {msg.routing.feedback === "up" ? "👍 helpful" : "👎 not helpful"}
         </div>
+      )}
+      {!msg.streaming && msg.prompt && (
+        <div style={{ paddingLeft: 13 }}><PromptView prompt={msg.prompt} /></div>
       )}
     </div>
   );
@@ -477,6 +521,238 @@ function Composer({ value, setValue, model, models, setModel, onSend, onStop, bu
   );
 }
 
+/* ── Header action button ── */
+function HeaderBtn({ icon, label, onClick, disabled, badge }) {
+  return (
+    <button onClick={onClick} disabled={disabled} title={label} style={{
+      display: "flex", alignItems: "center", gap: 6, padding: "5px 10px", flexShrink: 0,
+      background: C.s1, border: `1px solid ${C.border}`, borderRadius: 7,
+      fontFamily: mono, fontSize: 11, color: disabled ? C.dim : C.text,
+      cursor: disabled ? "default" : "pointer", opacity: disabled ? 0.5 : 1,
+    }}>
+      <Icon name={icon} size={12} /> {label}
+      {badge != null && (
+        <span style={{ background: C.accent, color: "#fff", borderRadius: 99, padding: "0 5px",
+          fontSize: 9.5, fontWeight: 700 }}>{badge}</span>
+      )}
+    </button>
+  );
+}
+
+/* ── Per-chunk read trace — one row of the reading process ── */
+function ChunkTrace({ chunk }) {
+  const [open, setOpen] = useState(false);
+  const stColor = chunk.status === "done" ? C.green
+    : chunk.status === "error" ? C.red
+    : chunk.status === "reading" ? C.orange : C.dim;
+  const ner = chunk.signal?.ner || { names: [], dates: [], numbers: [] };
+  const kws = chunk.signal?.keywords || [];
+  const label = chunk.status === "done" ? `+${chunk.applied} facts`
+    : chunk.status === "reading" ? "reading…"
+    : chunk.status === "error" ? "error" : "queued";
+  return (
+    <div style={{ border: `1px solid ${C.border}`, borderRadius: 8, marginBottom: 6, background: C.bg }}>
+      <button onClick={() => setOpen(o => !o)} style={{
+        display: "flex", alignItems: "center", gap: 8, width: "100%", padding: "8px 10px",
+        background: "transparent", border: "none", cursor: "pointer", color: C.text,
+        fontFamily: mono, fontSize: 11,
+      }}>
+        <span style={{ display: "flex", transform: open ? "none" : "rotate(-90deg)" }}>
+          <Icon name="chev" size={11} />
+        </span>
+        <span style={{ width: 7, height: 7, borderRadius: 99, background: stColor, flexShrink: 0 }} />
+        <span>Chunk {chunk.index + 1} · {chunk.chars} chars</span>
+        <span style={{ flex: 1 }} />
+        <span style={{ color: stColor }}>{label}</span>
+      </button>
+      {open && (
+        <div style={{ padding: "0 10px 10px", fontFamily: mono, fontSize: 10.5, color: C.dim, lineHeight: 1.7 }}>
+          <div><span style={{ color: C.text }}>Scanned names:</span> {ner.names.join(", ") || "—"}</div>
+          <div><span style={{ color: C.text }}>Scanned dates:</span> {ner.dates.join(", ") || "—"}</div>
+          <div><span style={{ color: C.text }}>Keywords:</span> {kws.slice(0, 14).join(", ") || "—"}</div>
+          {chunk.events?.length > 0 && (
+            <div style={{ marginTop: 6 }}>
+              <span style={{ color: C.text }}>Extracted into the graph:</span>
+              {chunk.events.map((e, i) => (
+                <div key={i} style={{ paddingLeft: 10, color: C.accent }}>
+                  {e.op === "INS" && `+ ${e.entity} (${e.kind || "thing"})`}
+                  {e.op === "CON" && `+ ${e.from} —${e.type || "related to"}→ ${e.to}`}
+                  {e.op === "DEF" && `+ ${e.entity}.${e.field} = ${e.value}`}
+                </div>
+              ))}
+            </div>
+          )}
+          {chunk.status === "error" && chunk.rawOutput && (
+            <div style={{ marginTop: 6, color: C.red }}>{chunk.rawOutput}</div>
+          )}
+          {chunk.text && (
+            <details style={{ marginTop: 6 }}>
+              <summary style={{ cursor: "pointer", color: C.text }}>Source text</summary>
+              <div style={{ whiteSpace: "pre-wrap", marginTop: 4, wordBreak: "break-word" }}>{chunk.text}</div>
+            </details>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ── Library & reading modal ── */
+function LibraryModal({ open, onClose, library, activeConvo, canIngest,
+                        ingestRunning, ingestTrace, onIngest, onToggleDoc, onRemoveDoc }) {
+  const [text, setText] = useState("");
+  const [title, setTitle] = useState("");
+  const [source, setSource] = useState("");
+  const fileRef = useRef(null);
+  if (!open) return null;
+
+  const loadFile = (e) => {
+    const f = e.target.files?.[0];
+    if (!f) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      setText(String(reader.result || ""));
+      setSource(f.name);
+      if (!title) setTitle(f.name.replace(/\.[^.]+$/, ""));
+    };
+    reader.readAsText(f);
+    e.target.value = "";
+  };
+
+  const ingest = () => {
+    if (!text.trim() || ingestRunning || !canIngest) return;
+    onIngest(text, title.trim(), source);
+  };
+
+  const done = ingestTrace.filter(t => t.status === "done" || t.status === "error").length;
+  const learned = ingestTrace.reduce((n, t) => n + (t.applied || 0), 0);
+  const attached = new Set(activeConvo?.docs || []);
+  const btn = (active) => ({
+    fontSize: 11, fontFamily: mono, fontWeight: 600, padding: "5px 12px", borderRadius: 6,
+    border: "none", cursor: "pointer", background: active ? C.accent : C.s2,
+    color: active ? "#fff" : C.dim,
+  });
+
+  return (
+    <div onClick={() => !ingestRunning && onClose()} style={{
+      position: "fixed", inset: 0, background: "rgba(0,0,0,.62)", zIndex: 50,
+      display: "flex", alignItems: "center", justifyContent: "center", padding: 24,
+    }}>
+      <div onClick={e => e.stopPropagation()} style={{
+        width: "min(720px, 100%)", maxHeight: "88vh", display: "flex", flexDirection: "column",
+        background: C.s1, border: `1px solid ${C.border}`, borderRadius: 14,
+        boxShadow: "0 20px 56px rgba(0,0,0,.55)",
+      }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "14px 18px",
+          borderBottom: `1px solid ${C.border}` }}>
+          <Icon name="book" size={15} />
+          <div style={{ fontSize: 13.5, fontWeight: 700, flex: 1 }}>Library &amp; Reading</div>
+          <button onClick={onClose} disabled={ingestRunning} style={{ background: "transparent",
+            border: "none", color: C.dim, cursor: ingestRunning ? "default" : "pointer", display: "flex" }}>
+            <Icon name="x" size={16} />
+          </button>
+        </div>
+
+        <div style={{ padding: "14px 18px", overflowY: "auto" }}>
+          {/* ── Read new content ── */}
+          <div style={{ fontSize: 12, fontWeight: 700, marginBottom: 6 }}>Read new content</div>
+          <div style={{ fontSize: 11.5, color: C.dim, lineHeight: 1.6, marginBottom: 10 }}>
+            Paste or upload any text. It is split into chunks, each chunk is mechanically
+            scanned for entities and then read by the model into a knowledge graph. The
+            document is added to the library and opted in to the current chat — every step
+            is shown below.
+          </div>
+          <input value={title} onChange={e => setTitle(e.target.value)} placeholder="Document title (optional)"
+            disabled={ingestRunning}
+            style={{ width: "100%", padding: "8px 11px", marginBottom: 8, background: C.bg, color: C.text,
+              border: `1px solid ${C.border}`, borderRadius: 7, fontSize: 12, fontFamily: mono,
+              boxSizing: "border-box", outline: "none" }} />
+          <textarea value={text} onChange={e => setText(e.target.value)} placeholder="Paste text to read…"
+            disabled={ingestRunning}
+            style={{ width: "100%", minHeight: 110, maxHeight: 220, resize: "vertical", padding: "10px 12px",
+              background: C.bg, color: C.text, border: `1px solid ${C.border}`, borderRadius: 8,
+              fontSize: 12, fontFamily: mono, boxSizing: "border-box", outline: "none" }} />
+          <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 8 }}>
+            <input ref={fileRef} type="file" accept=".txt,.md,.markdown,.csv,.json,text/*"
+              onChange={loadFile} style={{ display: "none" }} />
+            <button onClick={() => fileRef.current?.click()} disabled={ingestRunning} style={btn(false)}>
+              Upload file
+            </button>
+            <span style={{ fontSize: 10.5, fontFamily: mono, color: C.dim }}>
+              {text.length} chars{source ? ` · ${source}` : ""}
+            </span>
+            <div style={{ flex: 1 }} />
+            <button onClick={ingest} disabled={ingestRunning || !text.trim() || !canIngest}
+              style={{ ...btn(true), opacity: (ingestRunning || !text.trim() || !canIngest) ? 0.5 : 1 }}>
+              {ingestRunning ? "Reading…" : "Read into memory"}
+            </button>
+          </div>
+          {!canIngest && (
+            <div style={{ fontSize: 10.5, color: C.orange, marginTop: 6 }}>
+              No model available — pull one from the Models tab first.
+            </div>
+          )}
+
+          {ingestTrace.length > 0 && (
+            <div style={{ marginTop: 14 }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6,
+                fontFamily: mono, fontSize: 11, color: C.dim }}>
+                <span>{done}/{ingestTrace.length} chunks read</span>
+                <span>·</span>
+                <span style={{ color: C.accent }}>+{learned} facts learned</span>
+              </div>
+              <div style={{ height: 5, background: C.s3, borderRadius: 3, overflow: "hidden", marginBottom: 10 }}>
+                <div style={{ height: "100%", background: C.accent, transition: "width .2s",
+                  width: `${ingestTrace.length ? (done / ingestTrace.length) * 100 : 0}%` }} />
+              </div>
+              {ingestTrace.map(t => <ChunkTrace key={t.index} chunk={t} />)}
+            </div>
+          )}
+
+          {/* ── Library list ── */}
+          <div style={{ fontSize: 12, fontWeight: 700, margin: "20px 0 6px" }}>
+            Library · {library.length} document{library.length === 1 ? "" : "s"}
+          </div>
+          <div style={{ fontSize: 11.5, color: C.dim, lineHeight: 1.6, marginBottom: 10 }}>
+            {activeConvo
+              ? "Toggle a document to opt this chat in or out. Opted-in documents are merged into the chat's memory and projected into every prompt."
+              : "Open or start a chat to opt documents in to it."}
+          </div>
+          {library.length === 0 ? (
+            <div style={{ fontSize: 11.5, color: C.dim, padding: "14px 0", textAlign: "center" }}>
+              Nothing read yet. Read some content above to build your first document.
+            </div>
+          ) : library.map(doc => {
+            const st = docStats(doc);
+            const on = attached.has(doc.id);
+            return (
+              <div key={doc.id} style={{ display: "flex", alignItems: "center", gap: 10,
+                padding: "9px 11px", marginBottom: 6, background: C.bg,
+                border: `1px solid ${on ? C.accent + "66" : C.border}`, borderRadius: 8 }}>
+                <Icon name="doc" size={14} />
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{ fontSize: 12, fontWeight: 600, whiteSpace: "nowrap", overflow: "hidden",
+                    textOverflow: "ellipsis" }}>{doc.title}</div>
+                  <div style={{ fontSize: 10, fontFamily: mono, color: C.dim }}>
+                    {st.entities} entities · {st.edges} links · {st.defs} facts · {doc.chunks} chunks
+                  </div>
+                </div>
+                <button onClick={() => onToggleDoc(doc.id)} disabled={!activeConvo} style={btn(on)}>
+                  {on ? "✓ in chat" : "opt in"}
+                </button>
+                <button onClick={() => onRemoveDoc(doc.id)} title="Remove from library" style={{
+                  background: "transparent", border: "none", color: C.dim, cursor: "pointer", display: "flex" }}>
+                  <Icon name="trash" size={13} />
+                </button>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 /* ── Main chat ── */
 export default function Chat({ ollamaUrl, installed, ollamaUp }) {
   const [convos, setConvos] = useState(loadConvos);
@@ -489,6 +765,10 @@ export default function Chat({ ollamaUrl, installed, ollamaUp }) {
   const [quantize, setQuantize] = useState(() => localStorage.getItem(QUANT_KEY) === "1");
   const [mode, setMode] = useState(() => localStorage.getItem(MODE_KEY) === "memory" ? "memory" : "regular");
   const [wrongModelFor, setWrongModelFor] = useState(null);
+  const [library, setLibrary] = useState(loadLibrary);
+  const [libOpen, setLibOpen] = useState(false);
+  const [ingestRunning, setIngestRunning] = useState(false);
+  const [ingestTrace, setIngestTrace] = useState([]);
   const abortRef = useRef(null);
   const scrollRef = useRef(null);
 
@@ -525,6 +805,22 @@ export default function Chat({ ollamaUrl, installed, ollamaUp }) {
   useEffect(() => {
     try { localStorage.setItem(MODE_KEY, mode); } catch { /* ignore */ }
   }, [mode]);
+
+  /* Persist the document library (debounced, same policy as chats). */
+  useEffect(() => {
+    const id = setTimeout(() => saveLibrary(library), 400);
+    return () => clearTimeout(id);
+  }, [library]);
+
+  /* Project a chat's own memory together with every opted-in library
+     document into a single graph (entities/edges/defs only). */
+  const combinedMemory = (convo) => {
+    const docMems = (convo?.docs || [])
+      .map(id => library.find(d => d.id === id))
+      .filter(Boolean)
+      .map(d => d.memory);
+    return mergeMemory(convo?.memory, ...docMems);
+  };
 
   /* Switch the active chat's mode (or just the default for the next new chat).
      Memory data is kept even when switching back to Regular. */
@@ -713,6 +1009,138 @@ export default function Chat({ ollamaUrl, installed, ollamaUp }) {
     patchMsg(convoId, msgId, m => ({ mem: { ...(m.mem || {}), learned } }));
   };
 
+  /* Read a block of text into a library document: chunk it, mechanically
+     scan each chunk, then have the model distil it into a knowledge graph.
+     The finished document is added to the library and opted in to the
+     current chat. The per-chunk trace is shown live in the Library modal. */
+  const runIngest = async (rawText, title, source) => {
+    const text = (rawText || "").trim();
+    if (!text || ingestRunning) return;
+    const model = composerModel === AUTO_MODEL ? modelNames[0] : composerModel;
+    if (!model) return;
+
+    // A document needs a Memory-mode chat to belong to — make or adopt one.
+    let convoId = activeId;
+    const cur = activeId ? convos.find(c => c.id === activeId) : null;
+    if (!cur) {
+      convoId = "c" + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+      setConvos(prev => [{
+        id: convoId, title: title || ("Library · " + text.slice(0, 32)),
+        model, updatedAt: Date.now(), messages: [], mode: "memory",
+        memory: emptyMemory(), docs: [],
+      }, ...prev]);
+      setActiveId(convoId);
+      setMode("memory");
+    } else if (cur.mode !== "memory") {
+      setConvos(prev => prev.map(c => c.id === convoId
+        ? { ...c, mode: "memory", memory: c.memory || emptyMemory() } : c));
+      setMode("memory");
+    }
+
+    const docId = "d" + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+    const chunks = chunkText(text);
+    const trace = chunks.map((c, i) => ({
+      index: i, chars: c.length, text: c, signal: signal(c),
+      status: "pending", rawOutput: "", events: [], applied: 0,
+    }));
+    const sync = () => setIngestTrace(trace.map(t => ({ ...t })));
+    setIngestRunning(true);
+    sync();
+
+    const docMem = { entities: {}, edges: {}, defs: {} };
+    for (let i = 0; i < chunks.length; i++) {
+      trace[i].status = "reading"; sync();
+      try {
+        const out = await chatOnce(model, [
+          { role: "system", content: INGEST_SYSTEM },
+          { role: "user", content: chunks[i] },
+        ]);
+        const events = parseEvents(out);
+        trace[i].applied = applyEvents(docMem, events);
+        trace[i].rawOutput = out;
+        trace[i].events = events;
+        trace[i].status = "done";
+      } catch (e) {
+        trace[i].status = "error";
+        trace[i].rawOutput = String(e?.message || e);
+      }
+      sync();
+    }
+
+    const learned = trace.reduce((n, t) => n + (t.applied || 0), 0);
+    const doc = {
+      id: docId,
+      title: title || source || (text.slice(0, 40) + (text.length > 40 ? "…" : "")),
+      source: source || "pasted text",
+      addedAt: new Date().toISOString(),
+      chars: text.length, chunks: chunks.length, learned,
+      memory: docMem,
+      trace: trace.map(t => ({
+        index: t.index, chars: t.chars, status: t.status, applied: t.applied,
+        signal: { names: t.signal.ner.names, dates: t.signal.ner.dates, keywords: t.signal.keywords },
+        events: t.events, rawOutput: t.rawOutput,
+      })),
+    };
+    setLibrary(prev => [doc, ...prev]);
+    setConvos(prev => prev.map(c => c.id === convoId
+      ? { ...c, docs: [...(c.docs || []), docId], updatedAt: Date.now() } : c));
+    setIngestRunning(false);
+  };
+
+  /* Opt the active chat in or out of a library document. */
+  const toggleDoc = (docId) => {
+    if (!activeId) return;
+    setConvos(prev => prev.map(c => {
+      if (c.id !== activeId) return c;
+      const has = (c.docs || []).includes(docId);
+      return {
+        ...c, mode: "memory", memory: c.memory || emptyMemory(), updatedAt: Date.now(),
+        docs: has ? c.docs.filter(d => d !== docId) : [...(c.docs || []), docId],
+      };
+    }));
+    if (mode !== "memory") setMode("memory");
+  };
+
+  /* Drop a document from the library and from every chat that used it. */
+  const removeDoc = (docId) => {
+    setLibrary(prev => prev.filter(d => d.id !== docId));
+    setConvos(prev => prev.map(c => (c.docs || []).includes(docId)
+      ? { ...c, docs: c.docs.filter(d => d !== docId) } : c));
+  };
+
+  /* Export a chat as an auditable JSON file: every message with the exact
+     prompt it was given, the chat's memory graph, and the full read trace
+     of each opted-in library document. */
+  const exportConvo = (c) => {
+    if (!c) return;
+    const attached = (c.docs || []).map(id => library.find(d => d.id === id)).filter(Boolean);
+    const data = {
+      app: "LLManager", schema: "chat-audit-1", exportedAt: new Date().toISOString(),
+      chat: { id: c.id, title: c.title, mode: c.mode || "regular", model: c.model, updatedAt: c.updatedAt },
+      messages: c.messages.map(m => ({
+        id: m.id, role: m.role, model: m.model, content: m.content,
+        reasoning: m.reasoning || undefined, elapsed: m.elapsed, tokens: m.tokens,
+        routing: m.routing || undefined, memory: m.mem || undefined,
+        promptSent: m.prompt || undefined,
+      })),
+      memory: c.memory || undefined,
+      library: attached.map(d => ({
+        id: d.id, title: d.title, source: d.source, addedAt: d.addedAt,
+        chars: d.chars, chunks: d.chunks, learned: d.learned,
+        memory: d.memory, readTrace: d.trace,
+      })),
+    };
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `llmanager-${(c.title || "chat").replace(/[^a-z0-9]+/gi, "-").slice(0, 40)}.json`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  };
+
   const send = async () => {
     const text = draft.trim();
     if (!text || !composerModel || busy) return;
@@ -768,8 +1196,9 @@ export default function Chat({ ollamaUrl, installed, ollamaUp }) {
       const kb = isKnowledgeBearing(text);
       if (kb) {
         const sig = signal(text);
-        const entities = reach(sig, memory);
-        const dossier = buildDossier(entities, memory);
+        const projected = combinedMemory(existing);
+        const entities = reach(sig, projected);
+        const dossier = buildDossier(entities, projected);
         const position = buildPosition(memory.lastTurn);
         apiMessages = [
           { role: "system", content: `${MEMORY_SYSTEM}\n\n${dossier}\n\n${position}`.trim() },
@@ -792,7 +1221,7 @@ export default function Chat({ ollamaUrl, installed, ollamaUp }) {
 
     const userMsg = { id: "u" + Date.now(), role: "user", content: text };
     const aId = "a" + Date.now();
-    const placeholder = { id: aId, role: "assistant", model: chosenModel, content: "", streaming: true, routing, mem: memBadge };
+    const placeholder = { id: aId, role: "assistant", model: chosenModel, content: "", streaming: true, routing, mem: memBadge, prompt: apiMessages };
     setConvos(prev => prev.map(c => {
       if (c.id !== convoId) return c;
       const base = evalDoneIds.size
@@ -862,9 +1291,10 @@ export default function Chat({ ollamaUrl, installed, ollamaUp }) {
       const promptText = promptMsg?.content || "";
       if (isKnowledgeBearing(promptText)) {
         const sig = signal(promptText);
-        const entities = reach(sig, memory);
+        const projected = combinedMemory(active);
+        const entities = reach(sig, projected);
         apiMessages = [
-          { role: "system", content: `${MEMORY_SYSTEM}\n\n${buildDossier(entities, memory)}\n\n${buildPosition(memory.lastTurn)}`.trim() },
+          { role: "system", content: `${MEMORY_SYSTEM}\n\n${buildDossier(entities, projected)}\n\n${buildPosition(memory.lastTurn)}`.trim() },
           { role: "user", content: promptText },
         ];
         memBadge = { kb: true, used: entities.length };
@@ -881,7 +1311,7 @@ export default function Chat({ ollamaUrl, installed, ollamaUp }) {
 
     patchMsg(active.id, msgId, {
       model: useModel, content: "", reasoning: undefined, streaming: true, error: false,
-      elapsed: undefined, tokens: undefined, routing: newRouting, mem: memBadge,
+      elapsed: undefined, tokens: undefined, routing: newRouting, mem: memBadge, prompt: apiMessages,
     });
     await runTurn(active.id, msgId, useModel, apiMessages, { candidates, routingId: routing?.id });
     setBusy(false);
@@ -918,7 +1348,8 @@ export default function Chat({ ollamaUrl, installed, ollamaUp }) {
 
   const offline = ollamaUp === false || ollamaUp === "cors";
 
-  const memStats = mode === "memory" ? memoryStats(active?.memory) : null;
+  const memStats = mode === "memory" ? memoryStats(combinedMemory(active)) : null;
+  const docCount = active?.docs?.length || 0;
 
   return (
     <div style={{ display: "flex", height: "100%", width: "100%", background: C.bg, fontFamily: sans, color: C.text }}>
@@ -936,11 +1367,15 @@ export default function Chat({ ollamaUrl, installed, ollamaUp }) {
           )}
           <ModeToggle mode={mode} onChange={changeMode} disabled={busy} />
           {memStats && (
-            <span title={`This chat's memory graph: ${memStats.entities} entities, ${memStats.edges} connections, ${memStats.defs} facts.`}
+            <span title={`Projected memory: ${memStats.entities} entities, ${memStats.edges} connections, ${memStats.defs} facts`
+              + (docCount ? ` — including ${docCount} library document${docCount === 1 ? "" : "s"}.` : ".")}
               style={{ display: "flex", alignItems: "center", gap: 5, padding: "5px 10px", background: C.accent + "18", border: `1px solid ${C.accent}44`, borderRadius: 7, fontFamily: mono, fontSize: 11, color: C.accent, flexShrink: 0 }}>
-              <Icon name="memory" size={11} /> {memStats.entities} remembered
+              <Icon name="memory" size={11} /> {memStats.entities} remembered{docCount ? ` · ${docCount} doc${docCount === 1 ? "" : "s"}` : ""}
             </span>
           )}
+          <HeaderBtn icon="book" label="Library" onClick={() => setLibOpen(true)}
+            badge={library.length || undefined} />
+          {active && <HeaderBtn icon="download" label="Export" onClick={() => exportConvo(active)} />}
           {headerModel && (
             <span style={{ display: "flex", alignItems: "center", gap: 6, padding: "5px 10px", background: C.s1, border: `1px solid ${C.border}`, borderRadius: 7, fontFamily: mono, fontSize: 11.5, flexShrink: 0 }}>
               <span style={{ width: 6, height: 6, borderRadius: 99, background: C.accent,
@@ -1003,6 +1438,12 @@ export default function Chat({ ollamaUrl, installed, ollamaUp }) {
           mode={mode}
         />
       </main>
+      <LibraryModal
+        open={libOpen} onClose={() => setLibOpen(false)}
+        library={library} activeConvo={active} canIngest={modelNames.length > 0}
+        ingestRunning={ingestRunning} ingestTrace={ingestTrace}
+        onIngest={runIngest} onToggleDoc={toggleDoc} onRemoveDoc={removeDoc}
+      />
     </div>
   );
 }
