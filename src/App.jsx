@@ -26,6 +26,28 @@ const C = {
   green: "#30a46c", red: "#e5484d", orange: "#f76b15",
 };
 
+const Pill = ({ color, children }) => (
+  <span style={{ fontSize: 10, fontFamily: mono, padding: "2px 8px", borderRadius: 99, background: color + "22", color, fontWeight: 600 }}>{children}</span>
+);
+
+const CopyBlock = ({ text, id, label, copy, copied }) => (
+  <div style={{ marginBottom: 8 }}>
+    {label && <div style={{ fontSize: 10, color: C.dim, marginBottom: 3 }}>{label}</div>}
+    <div style={{ display: "flex", gap: 6 }}>
+      <code style={{ flex: 1, fontSize: 11, fontFamily: mono, background: C.bg, padding: "8px 12px", borderRadius: 6, color: C.green, border: `1px solid ${C.border}`, wordBreak: "break-all", whiteSpace: "pre-wrap" }}>{text}</code>
+      <button onClick={() => copy(text, id)} style={{ padding: "6px 12px", fontSize: 10, fontFamily: mono, fontWeight: 600, borderRadius: 6, border: "none", cursor: "pointer", background: copied === id ? C.green : C.accent, color: copied === id ? "#000" : "#fff", whiteSpace: "nowrap" }}>{copied === id ? "✓" : "copy"}</button>
+    </div>
+  </div>
+);
+
+const Box = ({ title, sub, children }) => (
+  <div style={{ background: C.s1, border: `1px solid ${C.border}`, borderRadius: 10, padding: "14px 18px", marginBottom: 10 }}>
+    <div style={{ fontSize: 13, fontWeight: 700, color: C.text, marginBottom: sub ? 2 : 10 }}>{title}</div>
+    {sub && <div style={{ fontSize: 11, color: C.dim, marginBottom: 10 }}>{sub}</div>}
+    {children}
+  </div>
+);
+
 export default function App() {
   const [tab, setTab] = useState("status");
   const [ollamaUrl, setOllamaUrl] = useState("http://localhost:11434");
@@ -124,28 +146,6 @@ export default function App() {
     return { t: "too big", c: C.red };
   };
 
-  const Pill = ({ color, children }) => (
-    <span style={{ fontSize: 10, fontFamily: mono, padding: "2px 8px", borderRadius: 99, background: color + "22", color, fontWeight: 600 }}>{children}</span>
-  );
-
-  const CopyBlock = ({ text, id, label }) => (
-    <div style={{ marginBottom: 8 }}>
-      {label && <div style={{ fontSize: 10, color: C.dim, marginBottom: 3 }}>{label}</div>}
-      <div style={{ display: "flex", gap: 6 }}>
-        <code style={{ flex: 1, fontSize: 11, fontFamily: mono, background: C.bg, padding: "8px 12px", borderRadius: 6, color: C.green, border: `1px solid ${C.border}`, wordBreak: "break-all", whiteSpace: "pre-wrap" }}>{text}</code>
-        <button onClick={() => copy(text, id)} style={{ padding: "6px 12px", fontSize: 10, fontFamily: mono, fontWeight: 600, borderRadius: 6, border: "none", cursor: "pointer", background: copied === id ? C.green : C.accent, color: copied === id ? "#000" : "#fff", whiteSpace: "nowrap" }}>{copied === id ? "✓" : "copy"}</button>
-      </div>
-    </div>
-  );
-
-  const Box = ({ title, sub, children }) => (
-    <div style={{ background: C.s1, border: `1px solid ${C.border}`, borderRadius: 10, padding: "14px 18px", marginBottom: 10 }}>
-      <div style={{ fontSize: 13, fontWeight: 700, color: C.text, marginBottom: sub ? 2 : 10 }}>{title}</div>
-      {sub && <div style={{ fontSize: 11, color: C.dim, marginBottom: 10 }}>{sub}</div>}
-      {children}
-    </div>
-  );
-
   // ── Snippet generator for other apps ──
   const snippet = (m) => `// Drop this into any browser app to call ${m}
 async function askLLM(prompt, options = {}) {
@@ -238,7 +238,7 @@ OLLAMA_ORIGINS="http://localhost:3000,https://myapp.com" ollama serve`;
               </div>
             )}
             <div style={{ marginTop: 10 }}>
-              <CopyBlock id="hw" text='system_profiler SPHardwareDataType | grep -E "Chip|Memory|Cores|Model"' label="Get exact specs in terminal" />
+              <CopyBlock copy={copy} copied={copied} id="hw" text='system_profiler SPHardwareDataType | grep -E "Chip|Memory|Cores|Model"' label="Get exact specs in terminal" />
             </div>
           </Box>
 
@@ -250,9 +250,9 @@ OLLAMA_ORIGINS="http://localhost:3000,https://myapp.com" ollama serve`;
             {ollamaUp === false && (
               <div style={{ background: C.red + "12", border: `1px solid ${C.red}30`, borderRadius: 8, padding: "12px 16px" }}>
                 <div style={{ fontSize: 12, fontWeight: 600, color: C.red, marginBottom: 8 }}>Not reachable</div>
-                <CopyBlock text="brew install ollama" id="inst" label="1. Install" />
-                <CopyBlock text="ollama serve" id="srv" label="2. Start server" />
-                <CopyBlock text="ollama pull gemma2:2b" id="fp" label="3. Pull a model" />
+                <CopyBlock copy={copy} copied={copied} text="brew install ollama" id="inst" label="1. Install" />
+                <CopyBlock copy={copy} copied={copied} text="ollama serve" id="srv" label="2. Start server" />
+                <CopyBlock copy={copy} copied={copied} text="ollama pull gemma2:2b" id="fp" label="3. Pull a model" />
               </div>
             )}
             {ollamaUp === true && (<>
@@ -343,7 +343,7 @@ OLLAMA_ORIGINS="http://localhost:3000,https://myapp.com" ollama serve`;
         {/* ═══ MODELS ═══ */}
         {tab === "models" && (<>
           <Box title="Model Catalog" sub={ramGB ? `~${ramGB} GB detected → ~${(ramGB * .75).toFixed(0)} GB usable for models` : "RAM not exposed by browser — check terminal"}>
-            {!ramGB && <div style={{ marginBottom: 12 }}><CopyBlock id="ram" text='sysctl -n hw.memsize | awk "{print $1/1073741824\" GB\"}"' label="Check actual RAM" /></div>}
+            {!ramGB && <div style={{ marginBottom: 12 }}><CopyBlock copy={copy} copied={copied} id="ram" text='sysctl -n hw.memsize | awk "{print $1/1073741824\" GB\"}"' label="Check actual RAM" /></div>}
             {MODEL_CATALOG.map(m => {
               const rec = getRec(m);
               const inst = installed.some(i => i.name.startsWith(m.id.split(":")[0]));
@@ -391,10 +391,10 @@ OLLAMA_ORIGINS="http://localhost:3000,https://myapp.com" ollama serve`;
 
             {model && (<>
               <div style={{ marginTop: 16 }}>
-                <CopyBlock id="snip-simple" label="Simple — one-shot request, returns the text response" text={snippet(model)} />
+                <CopyBlock copy={copy} copied={copied} id="snip-simple" label="Simple — one-shot request, returns the text response" text={snippet(model)} />
               </div>
               <div style={{ marginTop: 8 }}>
-                <CopyBlock id="snip-stream" label="Streaming — tokens arrive as they're generated" text={streamSnippet(model)} />
+                <CopyBlock copy={copy} copied={copied} id="snip-stream" label="Streaming — tokens arrive as they're generated" text={streamSnippet(model)} />
               </div>
             </>)}
           </Box>
@@ -403,7 +403,7 @@ OLLAMA_ORIGINS="http://localhost:3000,https://myapp.com" ollama serve`;
             <div style={{ fontSize: 12, color: C.dim, lineHeight: 1.6, marginBottom: 10 }}>
               By default Ollama allows requests from any origin. If you run into CORS errors, restart Ollama with the <code style={{ fontFamily: mono, color: C.accent }}>OLLAMA_ORIGINS</code> env var:
             </div>
-            <CopyBlock id="cors" text={corsNote} />
+            <CopyBlock copy={copy} copied={copied} id="cors" text={corsNote} />
           </Box>
 
           <Box title="API Reference">
