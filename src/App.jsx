@@ -1,5 +1,7 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import Chat from "./Chat.jsx";
+import RoutingPanel from "./RoutingPanel.jsx";
+import { loadLog, runREC } from "./router.js";
 
 const MODEL_CATALOG = [
   { id: "gemma2:2b", params: "2B", vram: 1.5, speed: "fast", use: "Light tasks, quick responses" },
@@ -144,6 +146,15 @@ export default function App() {
   }, [ollamaUrl]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => { probe(); }, [probe]);
+
+  // REC on app load: refresh routing weights once installed models are known
+  // (prunes uninstalled models and log entries older than 30 days).
+  const recRan = useRef(false);
+  useEffect(() => {
+    if (recRan.current || !installed.length) return;
+    recRan.current = true;
+    if (loadLog().length) runREC(installed);
+  }, [installed]);
 
   // ── Model management ──
   const pullModel = async (name) => {
@@ -494,6 +505,8 @@ launchctl setenv OLLAMA_KV_CACHE_TYPE q8_0
 # Then restart the server for the env vars to take effect
 ollama serve`;
           return (<>
+            <RoutingPanel installed={installed} />
+
             <Box title="Quantization" sub="The biggest speed lever. Fewer bits per weight = less memory to move per token = faster.">
               <div style={{ fontSize: 12, color: C.dim, lineHeight: 1.6, marginBottom: 12 }}>
                 A 7B model is ~14&nbsp;GB at F16 but only ~4.4&nbsp;GB at Q4_K_M — and runs 3–4x faster.
