@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 
 const MODEL_CATALOG = [
   { id: "gemma2:2b", params: "2B", vram: 1.5, speed: "fast", use: "Light tasks, quick responses" },
@@ -38,9 +38,15 @@ export default function App() {
   const [model, setModel] = useState("");
   const [prompt, setPrompt] = useState("");
   const [generating, setGenerating] = useState(false);
-  const [response, setResponse] = useState(null);
-  const [history, setHistory] = useState([]);
+  const [messages, setMessages] = useState([]);
+  const [chatMode, setChatMode] = useState("thread");
   const [copied, setCopied] = useState(null);
+  const chatEndRef = useRef(null);
+
+  // Keep the latest message in view as the conversation grows.
+  useEffect(() => {
+    chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [messages, generating]);
 
   // ── Hardware ──
   useEffect(() => {
@@ -86,27 +92,39 @@ export default function App() {
 
   useEffect(() => { probe(); }, [probe]);
 
-  // ── Generate ──
-  const generate = async () => {
-    if (!prompt.trim() || !model) return;
-    setGenerating(true); setResponse(null);
+  // ── Send a chat message ──
+  const send = async () => {
+    const text = prompt.trim();
+    if (!text || !model || generating) return;
+
+    // In thread mode the prior turns are sent as context; in one-shot mode
+    // each prompt is answered on its own with no history.
+    const context = chatMode === "thread" ? messages : [];
+    const userMsg = { id: `${Date.now()}-u`, role: "user", content: text };
+
+    setMessages(prev => [...prev, userMsg]);
+    setPrompt("");
+    setGenerating(true);
     const t0 = Date.now();
     try {
+      const apiMessages = [...context, userMsg]
+        .filter(m => !m.error)
+        .map(m => ({ role: m.role, content: m.content }));
       const r = await fetch(`${ollamaUrl}/v1/chat/completions`, {
         method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ model, messages: [{ role: "user", content: prompt }], stream: false }),
+        body: JSON.stringify({ model, messages: apiMessages, stream: false }),
       });
       const data = await r.json();
       const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
-      const result = {
-        id: Date.now().toString(), prompt, model, elapsed,
+      setMessages(prev => [...prev, {
+        id: `${Date.now()}-a`, role: "assistant", model, elapsed,
         content: data.choices?.[0]?.message?.content || JSON.stringify(data),
         usage: data.usage || {},
-      };
-      setResponse(result);
-      setHistory(prev => [result, ...prev].slice(0, 50));
+      }]);
     } catch (e) {
-      setResponse({ id: "err", content: `Error: ${e.message}`, error: true });
+      setMessages(prev => [...prev, {
+        id: `${Date.now()}-a`, role: "assistant", content: `Error: ${e.message}`, error: true,
+      }]);
     }
     setGenerating(false);
   };
@@ -279,66 +297,93 @@ OLLAMA_ORIGINS="http://localhost:3000,https://myapp.com" ollama serve`;
         </>)}
 
         {/* ═══ RUN ═══ */}
-        {tab === "run" && (<>
-          <Box title="Prompt">
-            {ollamaUp === false ? (
+        {tab === "run" && (
+          ollamaUp === false ? (
+            <Box title="Chat">
               <div style={{ fontSize: 12, color: C.red }}>Ollama not running — check the Status tab for setup.</div>
-            ) : (<>
-              <select value={model} onChange={e => setModel(e.target.value)} style={{ width: "100%", padding: "8px 12px", fontSize: 12, fontFamily: mono, background: C.bg, color: C.text, border: `1px solid ${C.border}`, borderRadius: 6, marginBottom: 10 }}>
-                {installed.length === 0 && <option value="">no models installed</option>}
-                {installed.map(m => <option key={m.name} value={m.name}>{m.name} ({fmtB(m.size)})</option>)}
-              </select>
-              <textarea
-                value={prompt} onChange={e => setPrompt(e.target.value)}
-                onKeyDown={e => { if (e.key === "Enter" && e.metaKey) generate(); }}
-                placeholder="Type a prompt… ⌘+Enter to send"
-                rows={4}
-                style={{ width: "100%", padding: "10px 14px", fontSize: 13, background: C.bg, color: C.text, border: `1px solid ${C.border}`, borderRadius: 8, resize: "vertical", boxSizing: "border-box", lineHeight: 1.5, fontFamily: sans }}
-              />
-              <div style={{ display: "flex", justifyContent: "flex-end", marginTop: 8 }}>
-                <button onClick={generate} disabled={generating || !model || !prompt.trim()} style={{
-                  padding: "9px 24px", fontSize: 13, fontWeight: 700, borderRadius: 8, border: "none",
+            </Box>
+          ) : (
+            <div style={{ display: "flex", flexDirection: "column", height: "calc(100vh - 130px)" }}>
+              {/* ── Controls ── */}
+              <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap", marginBottom: 10 }}>
+                <select value={model} onChange={e => setModel(e.target.value)} style={{ flex: 1, minWidth: 160, padding: "8px 12px", fontSize: 12, fontFamily: mono, background: C.s1, color: C.text, border: `1px solid ${C.border}`, borderRadius: 8 }}>
+                  {installed.length === 0 && <option value="">no models installed</option>}
+                  {installed.map(m => <option key={m.name} value={m.name}>{m.name} ({fmtB(m.size)})</option>)}
+                </select>
+                <div style={{ display: "flex", background: C.s1, border: `1px solid ${C.border}`, borderRadius: 8, padding: 2 }}>
+                  {[["thread", "Thread"], ["oneshot", "One-shot"]].map(([v, label]) => (
+                    <button key={v} onClick={() => setChatMode(v)} title={v === "thread" ? "Each reply sees the whole conversation" : "Each prompt is answered on its own, no memory"} style={{
+                      padding: "6px 14px", fontSize: 11, fontWeight: 600, borderRadius: 6, border: "none", cursor: "pointer",
+                      background: chatMode === v ? C.accent : "transparent", color: chatMode === v ? "#fff" : C.dim,
+                    }}>{label}</button>
+                  ))}
+                </div>
+                {messages.length > 0 && (
+                  <button onClick={() => setMessages([])} style={{ padding: "7px 14px", fontSize: 11, fontWeight: 600, background: C.s2, color: C.dim, border: `1px solid ${C.border}`, borderRadius: 8, cursor: "pointer" }}>New chat</button>
+                )}
+              </div>
+
+              {/* ── Messages ── */}
+              <div style={{ flex: 1, overflowY: "auto", background: C.s1, border: `1px solid ${C.border}`, borderRadius: 10, padding: "16px 18px" }}>
+                {messages.length === 0 && !generating && (
+                  <div style={{ height: "100%", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", color: C.dim, fontSize: 13, textAlign: "center" }}>
+                    <div style={{ fontSize: 28, marginBottom: 8 }}>◆</div>
+                    <div>Start a conversation.</div>
+                    <div style={{ fontSize: 11, marginTop: 4 }}>
+                      {chatMode === "thread" ? "Thread mode — replies remember the whole conversation." : "One-shot mode — each prompt is answered independently."}
+                    </div>
+                  </div>
+                )}
+                {messages.map(m => (
+                  <div key={m.id} style={{ display: "flex", justifyContent: m.role === "user" ? "flex-end" : "flex-start", marginBottom: 14 }}>
+                    <div style={{ maxWidth: "85%" }}>
+                      <div style={{
+                        fontSize: 13, lineHeight: 1.6, whiteSpace: "pre-wrap", wordBreak: "break-word",
+                        padding: "10px 14px", borderRadius: 12,
+                        background: m.role === "user" ? C.accent : C.s2,
+                        color: m.error ? C.red : m.role === "user" ? "#fff" : C.text,
+                        border: m.role === "user" ? "none" : `1px solid ${C.border}`,
+                      }}>{m.content}</div>
+                      {m.role === "assistant" && !m.error && (
+                        <div style={{ display: "flex", alignItems: "center", gap: 10, marginTop: 4, fontSize: 10, fontFamily: mono, color: C.dim }}>
+                          <span>{m.model} · {m.elapsed}s · {m.usage?.total_tokens || "?"} tokens</span>
+                          <button onClick={() => copy(m.content, m.id)} style={{
+                            padding: "2px 8px", fontSize: 10, fontFamily: mono, borderRadius: 5, border: "none", cursor: "pointer",
+                            background: copied === m.id ? C.green : "transparent", color: copied === m.id ? "#000" : C.dim,
+                          }}>{copied === m.id ? "✓" : "copy"}</button>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                ))}
+                {generating && (
+                  <div style={{ display: "flex", justifyContent: "flex-start", marginBottom: 14 }}>
+                    <div style={{ padding: "10px 14px", borderRadius: 12, background: C.s2, border: `1px solid ${C.border}`, fontSize: 13, color: C.dim }}>
+                      Generating…
+                    </div>
+                  </div>
+                )}
+                <div ref={chatEndRef} />
+              </div>
+
+              {/* ── Input ── */}
+              <div style={{ display: "flex", gap: 8, alignItems: "flex-end", marginTop: 10 }}>
+                <textarea
+                  value={prompt} onChange={e => setPrompt(e.target.value)}
+                  onKeyDown={e => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } }}
+                  placeholder="Type a message… Enter to send, Shift+Enter for newline"
+                  rows={2}
+                  style={{ flex: 1, padding: "10px 14px", fontSize: 13, background: C.s1, color: C.text, border: `1px solid ${C.border}`, borderRadius: 8, resize: "none", boxSizing: "border-box", lineHeight: 1.5, fontFamily: sans }}
+                />
+                <button onClick={send} disabled={generating || !model || !prompt.trim()} style={{
+                  padding: "11px 24px", fontSize: 13, fontWeight: 700, borderRadius: 8, border: "none",
                   cursor: generating ? "wait" : "pointer", background: generating ? C.s2 : C.accent,
                   color: generating ? C.dim : "#fff", opacity: (!model || !prompt.trim()) ? 0.4 : 1,
-                }}>{generating ? "Generating…" : "Send"}</button>
+                }}>{generating ? "…" : "Send"}</button>
               </div>
-            </>)}
-          </Box>
-
-          {response && (
-            <Box title={response.error ? "Error" : "Response"} sub={response.error ? null : `${response.model} · ${response.elapsed}s · ${response.usage.total_tokens || "?"} tokens`}>
-              <pre style={{ fontFamily: sans, fontSize: 13, lineHeight: 1.6, whiteSpace: "pre-wrap", wordBreak: "break-word", color: response.error ? C.red : C.text, margin: 0, maxHeight: 400, overflowY: "auto" }}>
-                {response.content}
-              </pre>
-              {!response.error && (
-                <div style={{ display: "flex", gap: 8, marginTop: 12 }}>
-                  <button onClick={() => copy(response.content, "resp")} style={{
-                    padding: "6px 14px", fontSize: 11, fontFamily: mono, borderRadius: 6, border: "none", cursor: "pointer",
-                    background: copied === "resp" ? C.green : C.s2, color: copied === "resp" ? "#000" : C.dim,
-                  }}>{copied === "resp" ? "✓" : "copy text"}</button>
-                  <button onClick={() => copy(JSON.stringify({ prompt: response.prompt, model: response.model, response: response.content, usage: response.usage }, null, 2), "json")} style={{
-                    padding: "6px 14px", fontSize: 11, fontFamily: mono, borderRadius: 6, border: "none", cursor: "pointer",
-                    background: copied === "json" ? C.green : C.s2, color: copied === "json" ? "#000" : C.dim,
-                  }}>{copied === "json" ? "✓" : "copy JSON"}</button>
-                </div>
-              )}
-            </Box>
-          )}
-
-          {history.length > 0 && (
-            <Box title={`History (${history.length})`}>
-              {history.map((h, i) => (
-                <div key={h.id} style={{ padding: "8px 0", borderBottom: i < history.length - 1 ? `1px solid ${C.s3}` : "none" }}>
-                  <div style={{ display: "flex", justifyContent: "space-between" }}>
-                    <div style={{ fontSize: 12, fontWeight: 500 }}>{h.prompt.slice(0, 80)}{h.prompt.length > 80 ? "…" : ""}</div>
-                    <span style={{ fontSize: 10, fontFamily: mono, color: C.dim, flexShrink: 0 }}>{h.model} · {h.elapsed}s</span>
-                  </div>
-                  <div style={{ fontSize: 11, color: C.dim, marginTop: 2, lineHeight: 1.4 }}>{h.content.slice(0, 140)}{h.content.length > 140 ? "…" : ""}</div>
-                </div>
-              ))}
-            </Box>
-          )}
-        </>)}
+            </div>
+          )
+        )}
 
         {/* ═══ MODELS ═══ */}
         {tab === "models" && (<>
