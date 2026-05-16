@@ -1,5 +1,9 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import Markdown from "./Markdown.jsx";
+import MatrixGate from "./MatrixGate.jsx";
+import MatrixChat from "./MatrixChat.jsx";
+import { loadSession } from "./matrix.js";
+import { C, mono, sans } from "./theme.js";
 
 const MODEL_CATALOG = [
   { id: "gemma2:2b", params: "2B", vram: 1.5, speed: "fast", use: "Light tasks, quick responses" },
@@ -19,15 +23,8 @@ const MODEL_CATALOG = [
   { id: "starcoder2:7b", params: "7B", vram: 4.5, speed: "medium", use: "Code completion" },
 ];
 
-const mono = `'SF Mono','Menlo','Consolas',monospace`;
-const sans = `-apple-system,system-ui,sans-serif`;
-const C = {
-  bg: "#0b0b0f", s1: "#131318", s2: "#1b1b22", s3: "#232330",
-  border: "#282838", text: "#d4d4e4", dim: "#65657e", accent: "#6e56cf",
-  green: "#30a46c", red: "#e5484d", orange: "#f76b15",
-};
-
 const CHAT_STORE_KEY = "llm-manager-chat-threads";
+const GATE_SKIP_KEY = "llm-manager-gate-skipped";
 const MAX_SAVED_THREADS = 30;
 
 const makeThread = (model = "") => {
@@ -154,6 +151,10 @@ const ChatBubble = ({ message, copy, copied }) => {
 
 export default function App() {
   const [tab, setTab] = useState("status");
+  const [matrixSession, setMatrixSession] = useState(loadSession);
+  const [gateDone, setGateDone] = useState(
+    () => !!loadSession() || localStorage.getItem(GATE_SKIP_KEY) === "1",
+  );
   const [ollamaUrl, setOllamaUrl] = useState("http://localhost:11434");
   const [ollamaUp, setOllamaUp] = useState(null);
   const [ollamaVer, setOllamaVer] = useState("");
@@ -457,6 +458,15 @@ OLLAMA_ORIGINS="*" ollama serve
 # Or restrict to specific origins:
 OLLAMA_ORIGINS="http://localhost:3000,https://myapp.com" ollama serve`;
 
+  if (!gateDone) {
+    return (
+      <MatrixGate
+        onLogin={s => { setMatrixSession(s); setGateDone(true); }}
+        onSkip={() => { localStorage.setItem(GATE_SKIP_KEY, "1"); setGateDone(true); }}
+      />
+    );
+  }
+
   return (
     <div style={{ fontFamily: sans, background: C.bg, color: C.text, minHeight: "100vh" }}>
       <div style={{ padding: "16px 20px 12px", borderBottom: `1px solid ${C.border}`, display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 10 }}>
@@ -467,7 +477,7 @@ OLLAMA_ORIGINS="http://localhost:3000,https://myapp.com" ollama serve`;
           </div>
         </div>
         <div style={{ display: "flex", gap: 6 }}>
-          {["status", "run", "models", "connect"].map(t => (
+          {["status", "run", "matrix", "models", "connect"].map(t => (
             <button key={t} onClick={() => setTab(t)} style={{
               padding: "7px 16px", fontSize: 12, fontWeight: 600, borderRadius: 8, cursor: "pointer", textTransform: "capitalize",
               border: `1px solid ${tab === t ? C.accent : C.border}`, background: tab === t ? C.accent : "transparent", color: tab === t ? "#fff" : C.dim,
@@ -476,7 +486,19 @@ OLLAMA_ORIGINS="http://localhost:3000,https://myapp.com" ollama serve`;
         </div>
       </div>
 
-      <div style={{ padding: tab === "run" ? 0 : "16px 20px", maxWidth: tab === "run" ? "none" : 820, margin: "0 auto" }}>
+      {tab === "matrix" && (
+        <MatrixChat
+          session={matrixSession}
+          onLogin={setMatrixSession}
+          onLogout={() => setMatrixSession(null)}
+          ollamaUrl={ollamaUrl}
+          ollamaUp={ollamaUp}
+          model={model}
+          models={installed}
+        />
+      )}
+
+      <div style={{ padding: tab === "run" || tab === "matrix" ? 0 : "16px 20px", maxWidth: tab === "run" || tab === "matrix" ? "none" : 820, margin: "0 auto" }}>
 
         {/* ═══ STATUS ═══ */}
         {tab === "status" && (<>
