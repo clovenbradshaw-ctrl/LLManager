@@ -220,7 +220,7 @@ function MatrixChatInner({ session, onLogout, ollamaUrl, ollamaUp, model, models
   return (
     <div style={{
       display: "grid", gridTemplateColumns: "280px minmax(0, 1fr)",
-      height: "calc(100vh - 67px)", minHeight: 520,
+      height: "100%", minHeight: 520,
     }}>
       {/* ── Rooms sidebar ── */}
       <aside style={{
