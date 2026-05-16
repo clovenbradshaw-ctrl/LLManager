@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback } from "react";
+import Markdown from "./Markdown.jsx";
 
 const MODEL_CATALOG = [
   { id: "gemma2:2b", params: "2B", vram: 1.5, speed: "fast", use: "Light tasks, quick responses" },
@@ -307,9 +308,15 @@ OLLAMA_ORIGINS="http://localhost:3000,https://myapp.com" ollama serve`;
 
           {response && (
             <Box title={response.error ? "Error" : "Response"} sub={response.error ? null : `${response.model} · ${response.elapsed}s · ${response.usage.total_tokens || "?"} tokens`}>
-              <pre style={{ fontFamily: sans, fontSize: 13, lineHeight: 1.6, whiteSpace: "pre-wrap", wordBreak: "break-word", color: response.error ? C.red : C.text, margin: 0, maxHeight: 400, overflowY: "auto" }}>
-                {response.content}
-              </pre>
+              {response.error ? (
+                <pre style={{ fontFamily: sans, fontSize: 13, lineHeight: 1.6, whiteSpace: "pre-wrap", wordBreak: "break-word", color: C.red, margin: 0, maxHeight: 400, overflowY: "auto" }}>
+                  {response.content}
+                </pre>
+              ) : (
+                <div style={{ maxHeight: 400, overflowY: "auto" }}>
+                  <Markdown text={response.content} />
+                </div>
+              )}
               {!response.error && (
                 <div style={{ display: "flex", gap: 8, marginTop: 12 }}>
                   <button onClick={() => copy(response.content, "resp")} style={{
