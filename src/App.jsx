@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback } from "react";
+import Markdown from "./Markdown.jsx";
 
 const MODEL_CATALOG = [
   { id: "gemma2:2b", params: "2B", vram: 1.5, speed: "fast", use: "Light tasks, quick responses" },
@@ -26,6 +27,36 @@ const C = {
   green: "#30a46c", red: "#e5484d", orange: "#f76b15",
 };
 
+const Pill = ({ color, children }) => (
+  <span style={{ fontSize: 10, fontFamily: mono, padding: "2px 8px", borderRadius: 99, background: color + "22", color, fontWeight: 600 }}>{children}</span>
+);
+
+const CopyBlock = ({ text, id, label, copy, copied }) => (
+  <div style={{ marginBottom: 8 }}>
+    {label && <div style={{ fontSize: 10, color: C.dim, marginBottom: 3 }}>{label}</div>}
+    <div style={{ display: "flex", gap: 6 }}>
+      <code style={{ flex: 1, fontSize: 11, fontFamily: mono, background: C.bg, padding: "8px 12px", borderRadius: 6, color: C.green, border: `1px solid ${C.border}`, wordBreak: "break-all", whiteSpace: "pre-wrap" }}>{text}</code>
+      <button onClick={() => copy(text, id)} style={{ padding: "6px 12px", fontSize: 10, fontFamily: mono, fontWeight: 600, borderRadius: 6, border: "none", cursor: "pointer", background: copied === id ? C.green : C.accent, color: copied === id ? "#000" : "#fff", whiteSpace: "nowrap" }}>{copied === id ? "✓" : "copy"}</button>
+    </div>
+  </div>
+);
+
+const ActBtn = ({ onClick, disabled, color, children }) => (
+  <button onClick={onClick} disabled={disabled} style={{
+    fontSize: 10, fontFamily: mono, fontWeight: 600, padding: "4px 10px", borderRadius: 5,
+    border: "none", cursor: disabled ? "default" : "pointer", whiteSpace: "nowrap",
+    background: color || C.s2, color: color ? "#fff" : C.dim, opacity: disabled ? 0.5 : 1,
+  }}>{children}</button>
+);
+
+const Box = ({ title, sub, children }) => (
+  <div style={{ background: C.s1, border: `1px solid ${C.border}`, borderRadius: 10, padding: "14px 18px", marginBottom: 10 }}>
+    <div style={{ fontSize: 13, fontWeight: 700, color: C.text, marginBottom: sub ? 2 : 10 }}>{title}</div>
+    {sub && <div style={{ fontSize: 11, color: C.dim, marginBottom: 10 }}>{sub}</div>}
+    {children}
+  </div>
+);
+
 export default function App() {
   const [tab, setTab] = useState("status");
   const [ollamaUrl, setOllamaUrl] = useState("http://localhost:11434");
@@ -41,6 +72,8 @@ export default function App() {
   const [response, setResponse] = useState(null);
   const [history, setHistory] = useState([]);
   const [copied, setCopied] = useState(null);
+  const [pulling, setPulling] = useState({}); // { [name]: { status, completed, total, error } }
+  const [busy, setBusy] = useState({});       // { [name]: "load" | "unload" | "delete" }
 
   // ── Hardware ──
   useEffect(() => {
@@ -111,6 +144,68 @@ export default function App() {
     setGenerating(false);
   };
 
+  // ── Model management ──
+  const pullModel = async (name) => {
+    if (pulling[name] && !pulling[name].error) return;
+    setPulling(p => ({ ...p, [name]: { status: "starting…" } }));
+    try {
+      const res = await fetch(`${ollamaUrl}/api/pull`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name }),
+      });
+      if (!res.ok || !res.body) throw new Error(`HTTP ${res.status}`);
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = "";
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        const lines = buf.split("\n");
+        buf = lines.pop();
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          let j;
+          try { j = JSON.parse(line); } catch { continue; }
+          if (j.error) throw new Error(j.error);
+          setPulling(p => ({ ...p, [name]: { status: j.status, completed: j.completed, total: j.total } }));
+        }
+      }
+      setPulling(p => { const n = { ...p }; delete n[name]; return n; });
+      probe();
+    } catch (e) {
+      setPulling(p => ({ ...p, [name]: { status: `error: ${e.message}`, error: true } }));
+      setTimeout(() => setPulling(p => { const n = { ...p }; delete n[name]; return n; }), 5000);
+    }
+  };
+
+  const setKeepAlive = async (name, keep_alive, action) => {
+    setBusy(b => ({ ...b, [name]: action }));
+    try {
+      await fetch(`${ollamaUrl}/api/generate`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ model: name, keep_alive }),
+      });
+    } catch { /* probe below reflects real state */ }
+    setBusy(b => { const n = { ...b }; delete n[name]; return n; });
+    probe();
+  };
+  const loadModel = (name) => setKeepAlive(name, "10m", "load");
+  const unloadModel = (name) => setKeepAlive(name, 0, "unload");
+
+  const deleteModel = async (name) => {
+    if (!window.confirm(`Delete ${name}? This removes the model files from disk.`)) return;
+    setBusy(b => ({ ...b, [name]: "delete" }));
+    try {
+      await fetch(`${ollamaUrl}/api/delete`, {
+        method: "DELETE", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name }),
+      });
+    } catch { /* probe below reflects real state */ }
+    setBusy(b => { const n = { ...b }; delete n[name]; return n; });
+    probe();
+  };
+
   // ── Helpers ──
   const copy = (t, id) => { navigator.clipboard.writeText(t); setCopied(id); setTimeout(() => setCopied(null), 1500); };
   const fmtB = b => !b ? "—" : (b / (1024 ** 3)) >= 1 ? `${(b / (1024 ** 3)).toFixed(1)} GB` : `${(b / (1024 ** 2)).toFixed(0)} MB`;
@@ -123,28 +218,6 @@ export default function App() {
     if (m.vram <= ramGB) return { t: "tight", c: C.orange };
     return { t: "too big", c: C.red };
   };
-
-  const Pill = ({ color, children }) => (
-    <span style={{ fontSize: 10, fontFamily: mono, padding: "2px 8px", borderRadius: 99, background: color + "22", color, fontWeight: 600 }}>{children}</span>
-  );
-
-  const CopyBlock = ({ text, id, label }) => (
-    <div style={{ marginBottom: 8 }}>
-      {label && <div style={{ fontSize: 10, color: C.dim, marginBottom: 3 }}>{label}</div>}
-      <div style={{ display: "flex", gap: 6 }}>
-        <code style={{ flex: 1, fontSize: 11, fontFamily: mono, background: C.bg, padding: "8px 12px", borderRadius: 6, color: C.green, border: `1px solid ${C.border}`, wordBreak: "break-all", whiteSpace: "pre-wrap" }}>{text}</code>
-        <button onClick={() => copy(text, id)} style={{ padding: "6px 12px", fontSize: 10, fontFamily: mono, fontWeight: 600, borderRadius: 6, border: "none", cursor: "pointer", background: copied === id ? C.green : C.accent, color: copied === id ? "#000" : "#fff", whiteSpace: "nowrap" }}>{copied === id ? "✓" : "copy"}</button>
-      </div>
-    </div>
-  );
-
-  const Box = ({ title, sub, children }) => (
-    <div style={{ background: C.s1, border: `1px solid ${C.border}`, borderRadius: 10, padding: "14px 18px", marginBottom: 10 }}>
-      <div style={{ fontSize: 13, fontWeight: 700, color: C.text, marginBottom: sub ? 2 : 10 }}>{title}</div>
-      {sub && <div style={{ fontSize: 11, color: C.dim, marginBottom: 10 }}>{sub}</div>}
-      {children}
-    </div>
-  );
 
   // ── Snippet generator for other apps ──
   const snippet = (m) => `// Drop this into any browser app to call ${m}
@@ -238,7 +311,7 @@ OLLAMA_ORIGINS="http://localhost:3000,https://myapp.com" ollama serve`;
               </div>
             )}
             <div style={{ marginTop: 10 }}>
-              <CopyBlock id="hw" text='system_profiler SPHardwareDataType | grep -E "Chip|Memory|Cores|Model"' label="Get exact specs in terminal" />
+              <CopyBlock copy={copy} copied={copied} id="hw" text='system_profiler SPHardwareDataType | grep -E "Chip|Memory|Cores|Model"' label="Get exact specs in terminal" />
             </div>
           </Box>
 
@@ -250,9 +323,9 @@ OLLAMA_ORIGINS="http://localhost:3000,https://myapp.com" ollama serve`;
             {ollamaUp === false && (
               <div style={{ background: C.red + "12", border: `1px solid ${C.red}30`, borderRadius: 8, padding: "12px 16px" }}>
                 <div style={{ fontSize: 12, fontWeight: 600, color: C.red, marginBottom: 8 }}>Not reachable</div>
-                <CopyBlock text="brew install ollama" id="inst" label="1. Install" />
-                <CopyBlock text="ollama serve" id="srv" label="2. Start server" />
-                <CopyBlock text="ollama pull gemma2:2b" id="fp" label="3. Pull a model" />
+                <CopyBlock copy={copy} copied={copied} text="brew install ollama" id="inst" label="1. Install" />
+                <CopyBlock copy={copy} copied={copied} text="ollama serve" id="srv" label="2. Start server" />
+                <CopyBlock copy={copy} copied={copied} text="ollama pull gemma2:2b" id="fp" label="3. Pull a model" />
               </div>
             )}
             {ollamaUp === true && (<>
@@ -268,12 +341,22 @@ OLLAMA_ORIGINS="http://localhost:3000,https://myapp.com" ollama serve`;
                 </div>
               )}
               <div style={{ fontSize: 11, color: C.dim, marginBottom: 4 }}>Installed ({installed.length}):</div>
-              {installed.map(m => (
-                <div key={m.name} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "5px 0", fontSize: 12, borderBottom: `1px solid ${C.s3}` }}>
-                  <span style={{ fontFamily: mono }}>{m.name} <span style={{ color: C.dim, fontSize: 10 }}>· {fmtB(m.size)} · {m.details?.quantization_level || ""}</span></span>
-                  {running.some(r => r.name === m.name) && <Pill color={C.green}>LOADED</Pill>}
-                </div>
-              ))}
+              {installed.map(m => {
+                const loaded = running.some(r => r.name === m.name);
+                const act = busy[m.name];
+                return (
+                  <div key={m.name} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, padding: "6px 0", fontSize: 12, borderBottom: `1px solid ${C.s3}` }}>
+                    <span style={{ fontFamily: mono, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{m.name} <span style={{ color: C.dim, fontSize: 10 }}>· {fmtB(m.size)} · {m.details?.quantization_level || ""}</span></span>
+                    <div style={{ display: "flex", gap: 6, alignItems: "center", flexShrink: 0 }}>
+                      {loaded && <Pill color={C.green}>LOADED</Pill>}
+                      {loaded
+                        ? <ActBtn onClick={() => unloadModel(m.name)} disabled={!!act}>{act === "unload" ? "unloading…" : "unload"}</ActBtn>
+                        : <ActBtn onClick={() => loadModel(m.name)} disabled={!!act}>{act === "load" ? "loading…" : "load"}</ActBtn>}
+                      <ActBtn onClick={() => deleteModel(m.name)} disabled={!!act} color={C.red}>{act === "delete" ? "deleting…" : "delete"}</ActBtn>
+                    </div>
+                  </div>
+                );
+              })}
             </>)}
           </Box>
         </>)}
@@ -307,9 +390,15 @@ OLLAMA_ORIGINS="http://localhost:3000,https://myapp.com" ollama serve`;
 
           {response && (
             <Box title={response.error ? "Error" : "Response"} sub={response.error ? null : `${response.model} · ${response.elapsed}s · ${response.usage.total_tokens || "?"} tokens`}>
-              <pre style={{ fontFamily: sans, fontSize: 13, lineHeight: 1.6, whiteSpace: "pre-wrap", wordBreak: "break-word", color: response.error ? C.red : C.text, margin: 0, maxHeight: 400, overflowY: "auto" }}>
-                {response.content}
-              </pre>
+              {response.error ? (
+                <pre style={{ fontFamily: sans, fontSize: 13, lineHeight: 1.6, whiteSpace: "pre-wrap", wordBreak: "break-word", color: C.red, margin: 0, maxHeight: 400, overflowY: "auto" }}>
+                  {response.content}
+                </pre>
+              ) : (
+                <div style={{ maxHeight: 400, overflowY: "auto" }}>
+                  <Markdown text={response.content} />
+                </div>
+              )}
               {!response.error && (
                 <div style={{ display: "flex", gap: 8, marginTop: 12 }}>
                   <button onClick={() => copy(response.content, "resp")} style={{
@@ -343,7 +432,7 @@ OLLAMA_ORIGINS="http://localhost:3000,https://myapp.com" ollama serve`;
         {/* ═══ MODELS ═══ */}
         {tab === "models" && (<>
           <Box title="Model Catalog" sub={ramGB ? `~${ramGB} GB detected → ~${(ramGB * .75).toFixed(0)} GB usable for models` : "RAM not exposed by browser — check terminal"}>
-            {!ramGB && <div style={{ marginBottom: 12 }}><CopyBlock id="ram" text='sysctl -n hw.memsize | awk "{print $1/1073741824\" GB\"}"' label="Check actual RAM" /></div>}
+            {!ramGB && <div style={{ marginBottom: 12 }}><CopyBlock copy={copy} copied={copied} id="ram" text='sysctl -n hw.memsize | awk "{print $1/1073741824\" GB\"}"' label="Check actual RAM" /></div>}
             {MODEL_CATALOG.map(m => {
               const rec = getRec(m);
               const inst = installed.some(i => i.name.startsWith(m.id.split(":")[0]));
@@ -357,10 +446,28 @@ OLLAMA_ORIGINS="http://localhost:3000,https://myapp.com" ollama serve`;
                     </div>
                     <div style={{ fontSize: 11, color: C.dim, marginTop: 2 }}>{m.params} · ~{m.vram} GB · {m.speed} · {m.use}</div>
                   </div>
-                  <button onClick={() => copy(`ollama pull ${m.id}`, `p-${m.id}`)} style={{
-                    fontSize: 10, fontFamily: mono, padding: "5px 10px", borderRadius: 5, cursor: "pointer", border: "none", whiteSpace: "nowrap",
-                    background: copied === `p-${m.id}` ? C.green : C.s2, color: copied === `p-${m.id}` ? "#000" : C.dim,
-                  }}>{copied === `p-${m.id}` ? "✓" : "copy pull"}</button>
+                  {(() => {
+                    const pp = pulling[m.id];
+                    if (pp) {
+                      const pct = pp.total ? Math.round((pp.completed || 0) / pp.total * 100) : null;
+                      return (
+                        <div style={{ width: 170, flexShrink: 0 }}>
+                          <div style={{ fontSize: 9, fontFamily: mono, color: pp.error ? C.red : C.dim, marginBottom: 3, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+                            {pp.status}{pct != null ? ` · ${pct}%` : ""}
+                          </div>
+                          <div style={{ height: 5, background: C.s3, borderRadius: 3, overflow: "hidden" }}>
+                            <div style={{ height: "100%", width: `${pct || 0}%`, background: pp.error ? C.red : C.accent, transition: "width .2s" }} />
+                          </div>
+                        </div>
+                      );
+                    }
+                    return (
+                      <div style={{ display: "flex", gap: 6, flexShrink: 0 }}>
+                        <ActBtn onClick={() => copy(`ollama pull ${m.id}`, `p-${m.id}`)}>{copied === `p-${m.id}` ? "✓" : "copy"}</ActBtn>
+                        <ActBtn onClick={() => pullModel(m.id)} color={C.accent}>{inst ? "re-pull" : "pull"}</ActBtn>
+                      </div>
+                    );
+                  })()}
                 </div>
               );
             })}
@@ -391,10 +498,10 @@ OLLAMA_ORIGINS="http://localhost:3000,https://myapp.com" ollama serve`;
 
             {model && (<>
               <div style={{ marginTop: 16 }}>
-                <CopyBlock id="snip-simple" label="Simple — one-shot request, returns the text response" text={snippet(model)} />
+                <CopyBlock copy={copy} copied={copied} id="snip-simple" label="Simple — one-shot request, returns the text response" text={snippet(model)} />
               </div>
               <div style={{ marginTop: 8 }}>
-                <CopyBlock id="snip-stream" label="Streaming — tokens arrive as they're generated" text={streamSnippet(model)} />
+                <CopyBlock copy={copy} copied={copied} id="snip-stream" label="Streaming — tokens arrive as they're generated" text={streamSnippet(model)} />
               </div>
             </>)}
           </Box>
@@ -403,7 +510,7 @@ OLLAMA_ORIGINS="http://localhost:3000,https://myapp.com" ollama serve`;
             <div style={{ fontSize: 12, color: C.dim, lineHeight: 1.6, marginBottom: 10 }}>
               By default Ollama allows requests from any origin. If you run into CORS errors, restart Ollama with the <code style={{ fontFamily: mono, color: C.accent }}>OLLAMA_ORIGINS</code> env var:
             </div>
-            <CopyBlock id="cors" text={corsNote} />
+            <CopyBlock copy={copy} copied={copied} id="cors" text={corsNote} />
           </Box>
 
           <Box title="API Reference">
