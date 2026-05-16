@@ -17,6 +17,36 @@ const C = {
 };
 
 const LS_KEY = "llmanager.chats.v1";
+const QUANT_KEY = "llmanager.quantize.v1";
+
+/* Context quantization: cap the history so Ollama re-processes a smaller
+   prompt. Keeps the most recent messages and truncates very long ones. */
+const HISTORY_MSG_LIMIT = 6;
+const MSG_CHAR_CAP = 2000;
+const quantizeHistory = (history) =>
+  history.slice(-HISTORY_MSG_LIMIT).map(m =>
+    m.content.length > MSG_CHAR_CAP
+      ? { ...m, content: m.content.slice(0, MSG_CHAR_CAP) + " …[truncated]" }
+      : m);
+
+/* Reasoning models (DeepSeek-R1, etc.) emit chain-of-thought either in a
+   separate `thinking` field or wrapped in <think>…</think> inside content.
+   Split it out so it never leaks into the answer or the history. */
+const splitReasoning = (raw, thinking = "") => {
+  let reasoning = thinking, answer = raw;
+  const open = raw.indexOf("<think>");
+  if (open !== -1) {
+    const close = raw.indexOf("</think>");
+    if (close !== -1) {
+      reasoning = (reasoning + "\n" + raw.slice(open + 7, close)).trim();
+      answer = (raw.slice(0, open) + raw.slice(close + 8)).trim();
+    } else {
+      reasoning = (reasoning + "\n" + raw.slice(open + 7)).trim();
+      answer = raw.slice(0, open).trim();
+    }
+  }
+  return { reasoning: reasoning.trim(), answer };
+};
 
 const Icon = ({ name, size = 14 }) => {
   const s = { width: size, height: size, fill: "none", stroke: "currentColor", strokeWidth: 1.7, strokeLinecap: "round", strokeLinejoin: "round" };
@@ -205,6 +235,30 @@ function ModelPicker({ value, models, onChange }) {
   );
 }
 
+/* ── Reasoning (chain-of-thought) panel ── */
+function Reasoning({ text, streaming }) {
+  const [open, setOpen] = useState(false);
+  if (!text) return null;
+  return (
+    <div style={{ marginBottom: 8 }}>
+      <button onClick={() => setOpen(o => !o)} style={{
+        display: "flex", alignItems: "center", gap: 6, padding: "4px 9px",
+        background: C.s1, border: `1px solid ${C.border}`, borderRadius: 6,
+        cursor: "pointer", fontFamily: mono, fontSize: 10.5, color: C.dim,
+      }}>
+        <span style={{ display: "flex", transform: open ? "none" : "rotate(-90deg)" }}><Icon name="chev" size={11} /></span>
+        {streaming ? "Thinking…" : "Reasoning"}
+      </button>
+      {open && (
+        <div style={{
+          marginTop: 6, padding: "8px 12px", background: C.s1, border: `1px solid ${C.border}`,
+          borderRadius: 8, fontSize: 12.5, lineHeight: 1.55, color: C.dim, whiteSpace: "pre-wrap", wordBreak: "break-word",
+        }}>{text}</div>
+      )}
+    </div>
+  );
+}
+
 /* ── Message bubble ── */
 function MessageBubble({ msg, prevModel, onCopy, copied, onRerun, onFork, busy, installed, onFeedback, onWrongModel, wrongModelFor, setWrongModelFor, userMsgsAfter }) {
   if (msg.role === "user") {
@@ -245,6 +299,7 @@ function MessageBubble({ msg, prevModel, onCopy, copied, onRerun, onFork, busy, 
           <div style={{ fontSize: 13, color: C.red, whiteSpace: "pre-wrap" }}>{msg.content}</div>
         ) : (
           <>
+            <Reasoning text={msg.reasoning} streaming={msg.streaming && !msg.content} />
             {msg.content && <Markdown text={msg.content} style={{ fontSize: 14 }} />}
             {msg.streaming && (
               <span style={{ display: "inline-block", width: 7, height: 14, marginLeft: 1, background: C.accent, verticalAlign: "text-bottom", animation: "llm-cursor-blink 1s step-start infinite" }} />
@@ -297,7 +352,7 @@ function IconBtn({ onClick, active, disabled, title, icon }) {
 }
 
 /* ── Composer ── */
-function Composer({ value, setValue, model, models, setModel, onSend, onStop, busy, isReply }) {
+function Composer({ value, setValue, model, models, setModel, onSend, onStop, busy, isReply, quantize, setQuantize }) {
   const ref = useRef(null);
   useEffect(() => {
     if (ref.current) {
@@ -320,6 +375,18 @@ function Composer({ value, setValue, model, models, setModel, onSend, onStop, bu
         />
         <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "6px 6px 4px" }}>
           <ModelPicker value={model} models={models} onChange={setModel} />
+          <button
+            onClick={() => setQuantize(q => !q)}
+            title={`Quantize context — send only the last ${HISTORY_MSG_LIMIT} messages, trimmed, so Ollama re-processes a smaller prompt (faster, less memory). Older context is dropped.`}
+            style={{
+              display: "flex", alignItems: "center", gap: 7, padding: "5px 9px",
+              background: quantize ? "rgba(110,86,207,.18)" : C.s2,
+              border: `1px solid ${quantize ? C.accent : C.border}`, borderRadius: 7,
+              cursor: "pointer", fontFamily: mono, fontSize: 11, color: quantize ? C.text : C.dim,
+            }}>
+            <span style={{ width: 6, height: 6, borderRadius: 99, background: quantize ? C.accent : C.dim, flexShrink: 0 }} />
+            Quantize
+          </button>
           <div style={{ flex: 1 }} />
           {busy ? (
             <button onClick={onStop} style={{
@@ -355,6 +422,7 @@ export default function Chat({ ollamaUrl, installed, ollamaUp }) {
   const [composerModel, setComposerModel] = useState(() => (loadPrefs().autoMode ? AUTO_MODEL : ""));
   const [busy, setBusy] = useState(false);
   const [copied, setCopied] = useState(null);
+  const [quantize, setQuantize] = useState(() => localStorage.getItem(QUANT_KEY) === "1");
   const [wrongModelFor, setWrongModelFor] = useState(null);
   const abortRef = useRef(null);
   const scrollRef = useRef(null);
@@ -384,6 +452,10 @@ export default function Chat({ ollamaUrl, installed, ollamaUp }) {
     }, 400);
     return () => clearTimeout(id);
   }, [convos]);
+
+  useEffect(() => {
+    try { localStorage.setItem(QUANT_KEY, quantize ? "1" : "0"); } catch { /* ignore */ }
+  }, [quantize]);
 
   /* Auto-scroll */
   useEffect(() => {
@@ -425,7 +497,8 @@ export default function Chat({ ollamaUrl, installed, ollamaUp }) {
     if (lastModel && modelNames.includes(lastModel)) setComposerModel(lastModel);
   };
 
-  /* Stream a chat completion from Ollama; calls onToken with the full text so far */
+  /* Stream a chat completion from Ollama; calls onToken(answer, reasoning)
+     with the full text so far. Reasoning output is kept separate. */
   const streamChat = async (model, apiMessages, onToken, signal) => {
     const r = await fetch(`${ollamaUrl}/api/chat`, {
       method: "POST",
@@ -436,7 +509,7 @@ export default function Chat({ ollamaUrl, installed, ollamaUp }) {
     if (!r.ok || !r.body) throw new Error(`HTTP ${r.status}`);
     const reader = r.body.getReader();
     const decoder = new TextDecoder();
-    let buf = "", full = "", usage = {};
+    let buf = "", raw = "", thinking = "", usage = {};
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
@@ -448,11 +521,18 @@ export default function Chat({ ollamaUrl, installed, ollamaUp }) {
         let j;
         try { j = JSON.parse(line); } catch { continue; }
         if (j.error) throw new Error(j.error);
-        if (j.message?.content) { full += j.message.content; onToken(full); }
+        const msg = j.message || {};
+        if (msg.thinking) thinking += msg.thinking;
+        if (msg.content) raw += msg.content;
+        if (msg.thinking || msg.content) {
+          const { reasoning, answer } = splitReasoning(raw, thinking);
+          onToken(answer, reasoning);
+        }
         if (j.done) usage = { tokens: j.eval_count };
       }
     }
-    return { content: full, usage };
+    const { reasoning, answer } = splitReasoning(raw, thinking);
+    return { content: answer, reasoning, usage };
   };
 
   /* Patch a single message inside a convo (patch may be an object or a fn) */
@@ -477,16 +557,16 @@ export default function Chat({ ollamaUrl, installed, ollamaUp }) {
       const useModel = attempts[i];
       if (i > 0) {
         patchMsg(convoId, msgId, m => ({
-          model: useModel, content: "",
+          model: useModel, content: "", reasoning: undefined,
           routing: m.routing ? { ...m.routing, model: useModel } : m.routing,
         }));
       }
       try {
-        const { content, usage } = await streamChat(useModel, apiMessages, (full) => {
-          patchMsg(convoId, msgId, { content: full });
+        const { content, reasoning, usage } = await streamChat(useModel, apiMessages, (answer, think) => {
+          patchMsg(convoId, msgId, { content: answer, reasoning: think });
         }, ctrl.signal);
         patchMsg(convoId, msgId, {
-          content, streaming: false, error: false, model: useModel,
+          content, reasoning, streaming: false, error: false, model: useModel,
           elapsed: ((Date.now() - t0) / 1000).toFixed(1), tokens: usage.tokens,
         });
         setConvos(prev => prev.map(c => c.id === convoId ? { ...c, model: useModel, updatedAt: Date.now() } : c));
@@ -567,7 +647,8 @@ export default function Chat({ ollamaUrl, installed, ollamaUp }) {
       return { ...c, messages: [...base, userMsg, placeholder], updatedAt: Date.now() };
     }));
 
-    await runTurn(convoId, aId, chosenModel, [...history, { role: "user", content: text }], { candidates, routingId: routing?.id });
+    const apiHistory = quantize ? quantizeHistory(history) : history;
+    await runTurn(convoId, aId, chosenModel, [...apiHistory, { role: "user", content: text }], { candidates, routingId: routing?.id });
     setBusy(false);
     maybeREC();
   };
@@ -614,10 +695,10 @@ export default function Chat({ ollamaUrl, installed, ollamaUp }) {
       : (oldMsg.routing ? { ...oldMsg.routing, evalDone: true, model: useModel } : undefined);
 
     patchMsg(active.id, msgId, {
-      model: useModel, content: "", streaming: true, error: false,
+      model: useModel, content: "", reasoning: undefined, streaming: true, error: false,
       elapsed: undefined, tokens: undefined, routing: newRouting,
     });
-    await runTurn(active.id, msgId, useModel, history, { candidates, routingId: routing?.id });
+    await runTurn(active.id, msgId, useModel, quantize ? quantizeHistory(history) : history, { candidates, routingId: routing?.id });
     setBusy(false);
     maybeREC();
   };
@@ -722,6 +803,7 @@ export default function Chat({ ollamaUrl, installed, ollamaUp }) {
           model={composerModel} models={modelNames.length ? [AUTO_MODEL, ...modelNames] : []} setModel={setComposerModel}
           onSend={send} onStop={stop} busy={busy}
           isReply={messages.length > 0}
+          quantize={quantize} setQuantize={setQuantize}
         />
       </main>
     </div>
