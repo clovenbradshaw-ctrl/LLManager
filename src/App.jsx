@@ -41,6 +41,14 @@ const CopyBlock = ({ text, id, label, copy, copied }) => (
   </div>
 );
 
+const ActBtn = ({ onClick, disabled, color, children }) => (
+  <button onClick={onClick} disabled={disabled} style={{
+    fontSize: 10, fontFamily: mono, fontWeight: 600, padding: "4px 10px", borderRadius: 5,
+    border: "none", cursor: disabled ? "default" : "pointer", whiteSpace: "nowrap",
+    background: color || C.s2, color: color ? "#fff" : C.dim, opacity: disabled ? 0.5 : 1,
+  }}>{children}</button>
+);
+
 const Box = ({ title, sub, children }) => (
   <div style={{ background: C.s1, border: `1px solid ${C.border}`, borderRadius: 10, padding: "14px 18px", marginBottom: 10 }}>
     <div style={{ fontSize: 13, fontWeight: 700, color: C.text, marginBottom: sub ? 2 : 10 }}>{title}</div>
@@ -64,6 +72,8 @@ export default function App() {
   const [response, setResponse] = useState(null);
   const [history, setHistory] = useState([]);
   const [copied, setCopied] = useState(null);
+  const [pulling, setPulling] = useState({}); // { [name]: { status, completed, total, error } }
+  const [busy, setBusy] = useState({});       // { [name]: "load" | "unload" | "delete" }
 
   // ── Hardware ──
   useEffect(() => {
@@ -132,6 +142,68 @@ export default function App() {
       setResponse({ id: "err", content: `Error: ${e.message}`, error: true });
     }
     setGenerating(false);
+  };
+
+  // ── Model management ──
+  const pullModel = async (name) => {
+    if (pulling[name] && !pulling[name].error) return;
+    setPulling(p => ({ ...p, [name]: { status: "starting…" } }));
+    try {
+      const res = await fetch(`${ollamaUrl}/api/pull`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name }),
+      });
+      if (!res.ok || !res.body) throw new Error(`HTTP ${res.status}`);
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = "";
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        const lines = buf.split("\n");
+        buf = lines.pop();
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          let j;
+          try { j = JSON.parse(line); } catch { continue; }
+          if (j.error) throw new Error(j.error);
+          setPulling(p => ({ ...p, [name]: { status: j.status, completed: j.completed, total: j.total } }));
+        }
+      }
+      setPulling(p => { const n = { ...p }; delete n[name]; return n; });
+      probe();
+    } catch (e) {
+      setPulling(p => ({ ...p, [name]: { status: `error: ${e.message}`, error: true } }));
+      setTimeout(() => setPulling(p => { const n = { ...p }; delete n[name]; return n; }), 5000);
+    }
+  };
+
+  const setKeepAlive = async (name, keep_alive, action) => {
+    setBusy(b => ({ ...b, [name]: action }));
+    try {
+      await fetch(`${ollamaUrl}/api/generate`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ model: name, keep_alive }),
+      });
+    } catch { /* probe below reflects real state */ }
+    setBusy(b => { const n = { ...b }; delete n[name]; return n; });
+    probe();
+  };
+  const loadModel = (name) => setKeepAlive(name, "10m", "load");
+  const unloadModel = (name) => setKeepAlive(name, 0, "unload");
+
+  const deleteModel = async (name) => {
+    if (!window.confirm(`Delete ${name}? This removes the model files from disk.`)) return;
+    setBusy(b => ({ ...b, [name]: "delete" }));
+    try {
+      await fetch(`${ollamaUrl}/api/delete`, {
+        method: "DELETE", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name }),
+      });
+    } catch { /* probe below reflects real state */ }
+    setBusy(b => { const n = { ...b }; delete n[name]; return n; });
+    probe();
   };
 
   // ── Helpers ──
@@ -269,12 +341,22 @@ OLLAMA_ORIGINS="http://localhost:3000,https://myapp.com" ollama serve`;
                 </div>
               )}
               <div style={{ fontSize: 11, color: C.dim, marginBottom: 4 }}>Installed ({installed.length}):</div>
-              {installed.map(m => (
-                <div key={m.name} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "5px 0", fontSize: 12, borderBottom: `1px solid ${C.s3}` }}>
-                  <span style={{ fontFamily: mono }}>{m.name} <span style={{ color: C.dim, fontSize: 10 }}>· {fmtB(m.size)} · {m.details?.quantization_level || ""}</span></span>
-                  {running.some(r => r.name === m.name) && <Pill color={C.green}>LOADED</Pill>}
-                </div>
-              ))}
+              {installed.map(m => {
+                const loaded = running.some(r => r.name === m.name);
+                const act = busy[m.name];
+                return (
+                  <div key={m.name} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, padding: "6px 0", fontSize: 12, borderBottom: `1px solid ${C.s3}` }}>
+                    <span style={{ fontFamily: mono, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{m.name} <span style={{ color: C.dim, fontSize: 10 }}>· {fmtB(m.size)} · {m.details?.quantization_level || ""}</span></span>
+                    <div style={{ display: "flex", gap: 6, alignItems: "center", flexShrink: 0 }}>
+                      {loaded && <Pill color={C.green}>LOADED</Pill>}
+                      {loaded
+                        ? <ActBtn onClick={() => unloadModel(m.name)} disabled={!!act}>{act === "unload" ? "unloading…" : "unload"}</ActBtn>
+                        : <ActBtn onClick={() => loadModel(m.name)} disabled={!!act}>{act === "load" ? "loading…" : "load"}</ActBtn>}
+                      <ActBtn onClick={() => deleteModel(m.name)} disabled={!!act} color={C.red}>{act === "delete" ? "deleting…" : "delete"}</ActBtn>
+                    </div>
+                  </div>
+                );
+              })}
             </>)}
           </Box>
         </>)}
@@ -364,10 +446,28 @@ OLLAMA_ORIGINS="http://localhost:3000,https://myapp.com" ollama serve`;
                     </div>
                     <div style={{ fontSize: 11, color: C.dim, marginTop: 2 }}>{m.params} · ~{m.vram} GB · {m.speed} · {m.use}</div>
                   </div>
-                  <button onClick={() => copy(`ollama pull ${m.id}`, `p-${m.id}`)} style={{
-                    fontSize: 10, fontFamily: mono, padding: "5px 10px", borderRadius: 5, cursor: "pointer", border: "none", whiteSpace: "nowrap",
-                    background: copied === `p-${m.id}` ? C.green : C.s2, color: copied === `p-${m.id}` ? "#000" : C.dim,
-                  }}>{copied === `p-${m.id}` ? "✓" : "copy pull"}</button>
+                  {(() => {
+                    const pp = pulling[m.id];
+                    if (pp) {
+                      const pct = pp.total ? Math.round((pp.completed || 0) / pp.total * 100) : null;
+                      return (
+                        <div style={{ width: 170, flexShrink: 0 }}>
+                          <div style={{ fontSize: 9, fontFamily: mono, color: pp.error ? C.red : C.dim, marginBottom: 3, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+                            {pp.status}{pct != null ? ` · ${pct}%` : ""}
+                          </div>
+                          <div style={{ height: 5, background: C.s3, borderRadius: 3, overflow: "hidden" }}>
+                            <div style={{ height: "100%", width: `${pct || 0}%`, background: pp.error ? C.red : C.accent, transition: "width .2s" }} />
+                          </div>
+                        </div>
+                      );
+                    }
+                    return (
+                      <div style={{ display: "flex", gap: 6, flexShrink: 0 }}>
+                        <ActBtn onClick={() => copy(`ollama pull ${m.id}`, `p-${m.id}`)}>{copied === `p-${m.id}` ? "✓" : "copy"}</ActBtn>
+                        <ActBtn onClick={() => pullModel(m.id)} color={C.accent}>{inst ? "re-pull" : "pull"}</ActBtn>
+                      </div>
+                    );
+                  })()}
                 </div>
               );
             })}
