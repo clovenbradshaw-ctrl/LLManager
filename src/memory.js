@@ -1,11 +1,11 @@
 /* Per-chat memory — a lightweight "Experience Engine".
 
    In Memory mode a chat does not send its growing conversation history to
-   the model. Instead, knowledge-bearing turns are distilled into a small
-   per-chat knowledge graph (entities, connections, definitions) kept in
-   localStorage alongside the conversation. Each turn rebuilds a fixed-size
-   prompt: system + projected dossier + one-turn position marker. The prompt
-   stays the same size at turn 1 and turn 10,000.
+   the model. Instead, every turn is distilled into a small per-chat knowledge
+   graph (entities, connections, definitions) kept in localStorage alongside
+   the conversation. Each turn rebuilds a fixed-size prompt: system + projected
+   dossier + one-turn position marker. The prompt stays the same size at turn 1
+   and turn 10,000.
 
    This is a dependency-free adaptation of the architecture in experience.md:
    NER is mechanical (capitalised-run + date/number matching) rather than
@@ -18,8 +18,6 @@ The [POSITION] block notes what was discussed on the previous turn.
 Use them to stay consistent and personalised across the chat. If the context
 is empty or does not cover something, answer normally from your own knowledge —
 do not claim you have no memory. Keep responses concise unless asked for detail.`;
-
-export const CASUAL_SYSTEM = `You are a helpful assistant. Reply naturally and concisely.`;
 
 export const EXTRACT_SYSTEM = `Extract new, durable facts from this exchange as JSON.
 Return a JSON array of events. Each event is one of:
@@ -153,18 +151,6 @@ export function extractKeywords(message) {
 
 export function signal(message) {
   return { ner: extractNER(message), keywords: extractKeywords(message) };
-}
-
-/* ── The Gate: is this turn knowledge-bearing? ── */
-export function isKnowledgeBearing(message) {
-  const ner = extractNER(message);
-  const isQuestion = message.includes("?");
-  const words = message.trim().split(/\s+/).filter(Boolean);
-  const isSubstantive = words.length > 4;
-  return ner.names.length > 0
-    || ner.dates.length > 0
-    || isQuestion
-    || (isSubstantive && ner.numbers.length > 0);
 }
 
 /* ── The Reach: search the graph using Signal output ── */

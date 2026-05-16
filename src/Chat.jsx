@@ -8,9 +8,9 @@ import {
   processImplicitSignals, runREC, shouldRunREC,
 } from "./router.js";
 import {
-  MEMORY_SYSTEM, CASUAL_SYSTEM, EXTRACT_SYSTEM, INGEST_SYSTEM,
+  MEMORY_SYSTEM, EXTRACT_SYSTEM, INGEST_SYSTEM,
   emptyMemory, cloneMemory, memoryStats, mergeMemory, chunkText,
-  signal, isKnowledgeBearing, reach, buildDossier, buildPosition,
+  signal, reach, buildDossier, buildPosition,
   parseEvents, applyEvents,
 } from "./memory.js";
 import { loadLibrary, saveLibrary, docStats } from "./library.js";
@@ -98,7 +98,7 @@ function RoutingPill({ routing }) {
 /* ── Mode toggle — per-chat Regular / Memory switch ── */
 const MODE_TIPS = {
   regular: "Regular mode: the full conversation history is sent to the model every turn.",
-  memory: "Memory mode: knowledge-bearing turns are distilled into a per-chat graph and fed back as a fixed-size context block — the prompt never grows with the conversation.",
+  memory: "Memory mode: every turn is distilled into a per-chat graph and fed back as a fixed-size context block — the prompt never grows with the conversation.",
 };
 function ModeToggle({ mode, onChange, disabled }) {
   return (
@@ -122,13 +122,9 @@ function ModeToggle({ mode, onChange, disabled }) {
 
 /* ── Memory pill — shows what a Memory-mode reply drew on ── */
 function MemoryPill({ mem }) {
-  const txt = mem.kb
-    ? `${mem.used} recalled${mem.learned != null ? ` · +${mem.learned} learned` : ""}`
-    : "casual turn — not stored";
+  const txt = `${mem.used} recalled${mem.learned != null ? ` · +${mem.learned} learned` : ""}`;
   return (
-    <span title={mem.kb
-      ? "Memory mode: facts recalled from this chat's graph, and new facts extracted from the exchange."
-      : "Memory mode: this turn was not knowledge-bearing, so nothing was recalled or stored."}
+    <span title="Memory mode: facts recalled from this chat's projected graph, and new facts read back from the exchange."
       style={{
         display: "inline-flex", alignItems: "center", gap: 4, fontSize: 10, fontFamily: mono,
         padding: "2px 8px", borderRadius: 99, background: C.accent + "22", color: C.accent, fontWeight: 600,
@@ -1190,30 +1186,22 @@ export default function Chat({ ollamaUrl, installed, ollamaUp }) {
 
     // Build the API messages. Memory mode replaces the growing history with a
     // fixed-size prompt: system + projected dossier + one-turn position marker.
+    // Every turn is projected and every turn is read back into the graph — the
+    // prompt stays minimal regardless of how much the chat has covered.
     let apiMessages, memCtx = null, memBadge;
     if (mode === "memory") {
       const memory = existing?.memory || emptyMemory();
-      const kb = isKnowledgeBearing(text);
-      if (kb) {
-        const sig = signal(text);
-        const projected = combinedMemory(existing);
-        const entities = reach(sig, projected);
-        const dossier = buildDossier(entities, projected);
-        const position = buildPosition(memory.lastTurn);
-        apiMessages = [
-          { role: "system", content: `${MEMORY_SYSTEM}\n\n${dossier}\n\n${position}`.trim() },
-          { role: "user", content: text },
-        ];
-        memCtx = { kb, sig, entities };
-        memBadge = { kb: true, used: entities.length };
-      } else {
-        apiMessages = [
-          { role: "system", content: CASUAL_SYSTEM },
-          { role: "user", content: text },
-        ];
-        memCtx = { kb: false };
-        memBadge = { kb: false, used: 0 };
-      }
+      const sig = signal(text);
+      const projected = combinedMemory(existing);
+      const entities = reach(sig, projected);
+      const dossier = buildDossier(entities, projected);
+      const position = buildPosition(memory.lastTurn);
+      apiMessages = [
+        { role: "system", content: `${MEMORY_SYSTEM}\n\n${dossier}\n\n${position}`.trim() },
+        { role: "user", content: text },
+      ];
+      memCtx = { sig, entities };
+      memBadge = { used: entities.length };
     } else {
       const apiHistory = quantize ? quantizeHistory(history) : history;
       apiMessages = [...apiHistory, { role: "user", content: text }];
@@ -1235,8 +1223,8 @@ export default function Chat({ ollamaUrl, installed, ollamaUp }) {
     setBusy(false);
     maybeREC();
 
-    // Background: distil new facts from a knowledge-bearing memory-mode turn.
-    if (mode === "memory" && memCtx?.kb && finalContent) {
+    // Background: read every memory-mode turn back into the chat's graph.
+    if (mode === "memory" && memCtx && finalContent) {
       runMemoryExtract(convoId, aId, text, finalContent, chosenModel, memCtx);
     }
   };
@@ -1289,22 +1277,14 @@ export default function Chat({ ollamaUrl, installed, ollamaUp }) {
       const memory = active.memory || emptyMemory();
       const promptMsg = [...active.messages.slice(0, idx)].reverse().find(m => m.role === "user");
       const promptText = promptMsg?.content || "";
-      if (isKnowledgeBearing(promptText)) {
-        const sig = signal(promptText);
-        const projected = combinedMemory(active);
-        const entities = reach(sig, projected);
-        apiMessages = [
-          { role: "system", content: `${MEMORY_SYSTEM}\n\n${buildDossier(entities, projected)}\n\n${buildPosition(memory.lastTurn)}`.trim() },
-          { role: "user", content: promptText },
-        ];
-        memBadge = { kb: true, used: entities.length };
-      } else {
-        apiMessages = [
-          { role: "system", content: CASUAL_SYSTEM },
-          { role: "user", content: promptText },
-        ];
-        memBadge = { kb: false, used: 0 };
-      }
+      const sig = signal(promptText);
+      const projected = combinedMemory(active);
+      const entities = reach(sig, projected);
+      apiMessages = [
+        { role: "system", content: `${MEMORY_SYSTEM}\n\n${buildDossier(entities, projected)}\n\n${buildPosition(memory.lastTurn)}`.trim() },
+        { role: "user", content: promptText },
+      ];
+      memBadge = { used: entities.length };
     } else {
       apiMessages = quantize ? quantizeHistory(history) : history;
     }
@@ -1406,7 +1386,7 @@ export default function Chat({ ollamaUrl, installed, ollamaUp }) {
                     {!modelNames.length
                       ? "No models installed yet. Pull one from the Models tab first."
                       : mode === "memory"
-                        ? "Memory mode is on. Knowledge-bearing turns are distilled into a per-chat graph and replayed as a fixed-size context block, so the prompt never grows with the conversation. Switch back to Regular in the header."
+                        ? "Memory mode is on. Every turn is distilled into a per-chat graph and replayed as a fixed-size context block, so the prompt never grows with the conversation. Use Library in the header to read documents into memory. Switch back to Regular in the header."
                         : "Pick a model below and ask anything. You can switch models mid-conversation — each reply is labelled with the model that produced it. Try Memory mode in the header for a chat whose prompt never grows."}
                   </div>
                 </div>
