@@ -19,6 +19,24 @@ const MODEL_CATALOG = [
   { id: "starcoder2:7b", params: "7B", vram: 4.5, speed: "medium", use: "Code completion" },
 ];
 
+const QUANT_LEVELS = [
+  { q: "Q2_K", bpw: 2.6, note: "Heavy quality loss — only worth it to squeeze a 70B in", tone: "bad" },
+  { q: "Q3_K_M", bpw: 3.4, note: "Noticeable loss — last resort on tight memory", tone: "warn" },
+  { q: "Q4_0", bpw: 4.5, note: "Legacy 4-bit — fine, slightly behind K-quants", tone: "ok" },
+  { q: "Q4_K_M", bpw: 4.8, note: "Sweet spot — best speed/quality balance", tone: "best" },
+  { q: "Q5_K_M", bpw: 5.7, note: "Higher quality, a little slower & larger", tone: "best" },
+  { q: "Q6_K", bpw: 6.6, note: "Near-lossless — diminishing returns", tone: "ok" },
+  { q: "Q8_0", bpw: 8.5, note: "Minimal loss but ~2x the memory bandwidth cost", tone: "warn" },
+  { q: "F16", bpw: 16, note: "Full precision — rarely worth it for local inference", tone: "warn" },
+];
+
+const SPEED_TIERS = [
+  { tier: "gemma2:2b", tps: "100+ tok/s", note: "Fastest — light tasks, quick replies" },
+  { tier: "llama3.2:3b · phi3:mini", tps: "60–80 tok/s", note: "Noticeably smarter, still snappy" },
+  { tier: "mistral · llama3.1:8b", tps: "30–40 tok/s", note: "Strong quality, comfortable" },
+  { tier: "qwen2.5:14b", tps: "15–20 tok/s", note: "Best quality you can run comfortably" },
+];
+
 const mono = `'SF Mono','Menlo','Consolas',monospace`;
 const sans = `-apple-system,system-ui,sans-serif`;
 const C = {
@@ -67,6 +85,7 @@ export default function App() {
   const [hw, setHw] = useState(null);
 
   const [model, setModel] = useState("");
+  const [keepAlivePref, setKeepAlivePref] = useState("10m");
   const [copied, setCopied] = useState(null);
   const [pulling, setPulling] = useState({}); // { [name]: { status, completed, total, error } }
   const [busy, setBusy] = useState({});       // { [name]: "load" | "unload" | "delete" }
@@ -172,7 +191,7 @@ export default function App() {
     setBusy(b => { const n = { ...b }; delete n[name]; return n; });
     probe();
   };
-  const loadModel = (name) => setKeepAlive(name, "10m", "load");
+  const loadModel = (name) => setKeepAlive(name, keepAlivePref === "-1" ? -1 : keepAlivePref, "load");
   const unloadModel = (name) => setKeepAlive(name, 0, "unload");
 
   const deleteModel = async (name) => {
@@ -290,7 +309,7 @@ OLLAMA_ORIGINS="${pageOrigin || "https://myapp.com"},http://localhost:3000" olla
           </div>
         </div>
         <div style={{ display: "flex", gap: 6 }}>
-          {["status", "chat", "models", "connect"].map(t => (
+          {["status", "chat", "models", "optimize", "connect"].map(t => (
             <button key={t} onClick={() => setTab(t)} style={{
               padding: "7px 16px", fontSize: 12, fontWeight: 600, borderRadius: 8, cursor: "pointer", textTransform: "capitalize",
               border: `1px solid ${tab === t ? C.accent : C.border}`, background: tab === t ? C.accent : "transparent", color: tab === t ? "#fff" : C.dim,
@@ -383,6 +402,17 @@ OLLAMA_ORIGINS="${pageOrigin || "https://myapp.com"},http://localhost:3000" olla
                   ))}
                 </div>
               )}
+              <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
+                <span style={{ fontSize: 11, color: C.dim, fontFamily: mono }}>Keep loaded for</span>
+                <select value={keepAlivePref} onChange={e => setKeepAlivePref(e.target.value)} style={{ padding: "5px 10px", fontSize: 11, fontFamily: mono, background: C.bg, color: C.text, border: `1px solid ${C.border}`, borderRadius: 6 }}>
+                  <option value="5m">5m — Ollama default</option>
+                  <option value="10m">10m</option>
+                  <option value="1h">1h</option>
+                  <option value="24h">24h — stays warm all day</option>
+                  <option value="-1">forever (until unload)</option>
+                </select>
+                <span style={{ fontSize: 10, color: C.dim }}>longer = no cold-load delay</span>
+              </div>
               <div style={{ fontSize: 11, color: C.dim, marginBottom: 4 }}>Installed ({installed.length}):</div>
               {installed.map(m => {
                 const loaded = running.some(r => r.name === m.name);
@@ -448,6 +478,84 @@ OLLAMA_ORIGINS="${pageOrigin || "https://myapp.com"},http://localhost:3000" olla
             })}
           </Box>
         </>)}
+
+        {/* ═══ OPTIMIZE ═══ */}
+        {tab === "optimize" && (() => {
+          const tone = { best: C.green, ok: C.accent, warn: C.orange, bad: C.red };
+          const serverEnv = `# Keep models warm across requests (default 5m)
+launchctl setenv OLLAMA_KEEP_ALIVE 24h
+
+# Flash attention — faster, smaller KV cache
+launchctl setenv OLLAMA_FLASH_ATTENTION 1
+
+# Quantize the KV cache to halve its memory footprint
+launchctl setenv OLLAMA_KV_CACHE_TYPE q8_0
+
+# Then restart the server for the env vars to take effect
+ollama serve`;
+          return (<>
+            <Box title="Quantization" sub="The biggest speed lever. Fewer bits per weight = less memory to move per token = faster.">
+              <div style={{ fontSize: 12, color: C.dim, lineHeight: 1.6, marginBottom: 12 }}>
+                A 7B model is ~14&nbsp;GB at F16 but only ~4.4&nbsp;GB at Q4_K_M — and runs 3–4x faster.
+                Quality loss is minimal down to Q4. Below that it degrades fast.
+              </div>
+              {QUANT_LEVELS.map(l => (
+                <div key={l.q} style={{ display: "flex", alignItems: "center", gap: 10, padding: "7px 0", borderBottom: `1px solid ${C.s3}` }}>
+                  <span style={{ fontFamily: mono, fontSize: 12, fontWeight: 600, width: 64, flexShrink: 0, color: tone[l.tone] }}>{l.q}</span>
+                  <span style={{ fontFamily: mono, fontSize: 10, color: C.dim, width: 64, flexShrink: 0 }}>{l.bpw} bpw</span>
+                  <span style={{ fontSize: 11, color: C.dim }}>{l.note}</span>
+                </div>
+              ))}
+            </Box>
+
+            <Box title="Speed on Apple Silicon" sub="Approximate warm throughput — first token is slower if the model cold-loads.">
+              {SPEED_TIERS.map(s => (
+                <div key={s.tier} style={{ display: "flex", alignItems: "center", gap: 10, padding: "7px 0", borderBottom: `1px solid ${C.s3}` }}>
+                  <span style={{ fontFamily: mono, fontSize: 11, fontWeight: 600, width: 180, flexShrink: 0 }}>{s.tier}</span>
+                  <Pill color={C.accent}>{s.tps}</Pill>
+                  <span style={{ fontSize: 11, color: C.dim }}>{s.note}</span>
+                </div>
+              ))}
+              <div style={{ fontSize: 11, color: C.dim, lineHeight: 1.6, marginTop: 12 }}>
+                The hard ceiling is <strong style={{ color: C.text }}>memory bandwidth</strong> (~100&nbsp;GB/s on an M3).
+                Every token reads the whole model from memory, so token speed scales with model size.
+                Quantization helps by shrinking how much data moves per token — everything else is marginal.
+              </div>
+            </Box>
+
+            <Box title="Keep models warm" sub="Cold-loading a model into GPU memory can take 30s+. Keep it resident between requests.">
+              <div style={{ fontSize: 12, color: C.dim, lineHeight: 1.6, marginBottom: 10 }}>
+                Use the keep-alive selector on the <strong style={{ color: C.text }}>Status</strong> tab to load a model
+                and pin it in memory. To make Ollama keep every model warm by default, set the env var below.
+              </div>
+              <CopyBlock copy={copy} copied={copied} id="opt-env" text={serverEnv} label="Server tuning — paste into terminal" />
+            </Box>
+
+            <Box title="Context window" sub="Ollama defaults num_ctx to 4096. Smaller windows shrink the KV cache and speed up the first token.">
+              <div style={{ fontSize: 12, color: C.dim, lineHeight: 1.6 }}>
+                Every request can pass <code style={{ fontFamily: mono, color: C.accent }}>options.num_ctx</code> to size
+                the context window; set a server-wide default with the
+                <code style={{ fontFamily: mono, color: C.accent }}> OLLAMA_CONTEXT_LENGTH</code> env var.
+                Keep it at 2048–4096 for short prompts; raise it only when you actually feed in long documents,
+                since a larger window means a larger KV cache and a slower first token.
+              </div>
+            </Box>
+
+            <Box title="Free up memory & MoE tradeoffs">
+              <div style={{ fontSize: 12, color: C.dim, lineHeight: 1.6, marginBottom: 10 }}>
+                Every GB you free is a GB Ollama can use. Electron apps (Slack, Discord, VS Code) and browser tabs
+                are the usual culprits — check what's eating memory:
+              </div>
+              <CopyBlock copy={copy} copied={copied} id="opt-top" text="top -o mem" label="See what's using memory" />
+              <div style={{ fontSize: 12, color: C.dim, lineHeight: 1.6, marginTop: 10 }}>
+                <strong style={{ color: C.text }}>MoE models</strong> (e.g. Mixtral 8x7B) activate only a fraction of their
+                weights per token, so they run faster than a dense model of the same total size — but they still need
+                <em> all</em> the weights in memory. They only win when you have memory to spare; otherwise a good dense
+                7–8B model is faster.
+              </div>
+            </Box>
+          </>);
+        })()}
 
         {/* ═══ CONNECT ═══ */}
         {tab === "connect" && (<>
