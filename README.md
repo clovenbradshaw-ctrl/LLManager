@@ -15,16 +15,20 @@ is sent to a server. Chrome, Edge, and Firefox allow an HTTPS page to reach
 
 ```bash
 npm install
-npm run dev      # http://localhost:5173/llmanager/
-npm run build    # outputs to dist/
+npm run dev      # http://localhost:5173/
+npm run build    # outputs the static site to docs/
 npm run preview
 ```
 
 ## Deployment
 
-Pushing to `main` triggers `.github/workflows/deploy.yml`, which builds the site
-and publishes it to GitHub Pages. One-time setup: in the repo's
-**Settings → Pages**, set **Source** to **GitHub Actions**.
+The site is published with GitHub Pages' **Deploy from a branch** mode.
 
-The Vite `base` is `/llmanager/` to match the repository name. If you rename the
-repo, update `base` in `vite.config.js`.
+One-time setup: in the repo's **Settings → Pages**, set **Source** to
+**Deploy from a branch**, then choose branch **`main`** and folder **`/docs`**.
+
+To publish a change: run `npm run build` (which regenerates `docs/`), then
+commit and push the updated `docs/` folder to `main`.
+
+The Vite `base` is `"./"` so assets load with relative paths regardless of the
+repository name or URL casing.
