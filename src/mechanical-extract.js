@@ -6,12 +6,13 @@
    no LLM, a few milliseconds per clause — and produces a structured DRAFT
    of INS/DEF/CON events with spans and heuristic coreference.
 
-   The LLM then only REVIEWS the draft (Phase B), one small call per clause:
-   it classifies terrains, splits DEF from EVA, and corrects coreference the
-   heuristic stack got wrong. Same number of calls as the old full walk, but
-   each is "classify these 2 items" (~60 tokens) instead of "read this
-   passage and extract everything" (~500 tokens) — editing a structured
-   draft is easy where generating from raw text is hard. ~80% fewer tokens.
+   Classification is then mostly mechanical too, grounded in the EO
+   reference: terrain follows from the extracted kind, DEF/EVA from a
+   judgment lexicon. The LLM is called (Phase B) only for the cases the
+   reference marks genuinely ambiguous — an organization (Entity vs
+   Network), a quoted work (Kind vs Entity) — a tiny two-way choice. Most
+   passages make zero LLM calls; the model is a scarce adjudicator, not a
+   parser or generator.
 
    compromise.js does English NER. Everything else is domain regex. The
    pipeline is English-only and falls back to the full LLM walk on text it
@@ -202,9 +203,47 @@ export function extractClause(text, clauseIndex, allTitles, corefStack) {
   return result;
 }
 
+/* ═══ EO classification — mechanical, per the canonical reference ═══
+
+   The EO reference fixes most of the classification deterministically, so
+   it never reaches the LLM:
+
+   Terrain (Site = Domain × Object). A named person, place or event is a
+   Figure of Existence — an Entity. Only two extracted kinds are genuinely
+   ambiguous: an organization is an Entity or a Network, a quoted work is a
+   Kind or an Entity. Those, and only those, become an LLM task.
+
+   Operator (DEF vs EVA). DEF establishes what holds — a fact, a value, a
+   status. EVA renders judgment — testing a particular against a standard.
+   A clause carrying evaluative language is EVA; a plain factual claim is
+   DEF. The split is a lexicon check, not an LLM call. */
+const KIND_TERRAIN = {
+  person: "Entity",
+  place: "Entity",
+  event: "Entity",
+  organization: null,   // Entity or Network — the LLM decides
+  work: null,           // Kind or Entity — the LLM decides
+};
+
+export function kindTerrain(kind) {
+  const t = KIND_TERRAIN[kind];
+  return { terrain: t || "?", ambiguous: !t };
+}
+
+/* Evaluative language — judgments, verdicts, tests against a standard. */
+const EVA_LEXICON = /\b(rough|brilliant|great|terrible|poor|excellent|impressive|disappointing|successful|fail(s|ed|ing)?|wonderful|awful|remarkable|outstanding|mediocre|fell short|exceeded|lived up to|confirm(s|ed)?|refut(es|ed)|the point|worth it|beautiful|smart|stupid|best|worst|better|worse|should(n'?t)?|ought to|matters?)\b/i;
+
+/* DEF establishes what holds; EVA renders a judgment. A clause with no
+   evaluative language is a plain factual claim — a DEF. */
+export function classifyDefEva(text) {
+  return EVA_LEXICON.test(String(text || "")) ? "EVA" : "DEF";
+}
+
 /* Convert one clause's extraction into draft graph events plus the LLM
-   classification tasks the review step will need. knownEntities dedups INS
-   across the document. */
+   classification tasks the review step needs. knownEntities dedups INS
+   across the document. Most clauses produce zero LLM tasks — terrain comes
+   from the kind, DEF/EVA from the lexicon; only an organization or a quoted
+   work defers to the LLM. */
 export function clauseToEvents(extraction, knownEntities) {
   const events = [];
   const llmTasks = [];
@@ -220,9 +259,10 @@ export function clauseToEvents(extraction, knownEntities) {
       const key = name.toLowerCase();
       if (knownEntities.has(key)) continue;
       knownEntities.add(key);
-      events.push({ op: "INS", entity: name, terrain: "?", span: name, mechanical: true });
+      const { terrain, ambiguous } = kindTerrain(kind);
+      events.push({ op: "INS", entity: name, terrain, span: name, mechanical: true });
       events.push({ op: "DEF", entity: name, field: "kind", value: kind, span: name, mechanical: true });
-      llmTasks.push({ task: "CLASSIFY_TERRAIN", entity: name });
+      if (ambiguous) llmTasks.push({ task: "CLASSIFY_TERRAIN", entity: name, kind });
     }
   }
   for (const d of extraction.deaths) {
@@ -242,7 +282,10 @@ export function clauseToEvents(extraction, knownEntities) {
     }
   }
   for (const q of extraction.quotes) {
-    llmTasks.push({ task: "CLASSIFY_DEF_OR_EVA", text: q.text, speaker: q.speaker });
+    const op = classifyDefEva(q.text);
+    events.push(op === "EVA"
+      ? { op: "EVA", entity: q.speaker || "?", claim: q.text.slice(0, 100), status: "holds", span: q.text, mechanical: true }
+      : { op: "DEF", entity: q.speaker || "?", field: "quote", value: q.text.slice(0, 100), span: q.text, mechanical: true });
   }
   return { events, llmTasks };
 }
@@ -307,21 +350,22 @@ export const REVIEW_SYSTEM =
   "Classify each item exactly as asked. You are editing a structured draft, "
   + "not writing prose. Return ONLY a JSON array: [{\"index\":1,\"result\":\"...\"}].";
 
-/* Build the review prompt for ONE clause's tasks — a few items, ~60 tokens.
-   The model classifies a tiny structured list; it never generates from raw
-   text. The call stays small enough to fit any window, every clause. */
+/* Build the review prompt for one clause's tasks — only the items the
+   mechanical rules could not settle. Each is a two-way choice between the
+   terrains the EO reference marks ambiguous, so the call stays tiny. */
 export function buildReviewPrompt(llmTasks) {
   if (!llmTasks || !llmTasks.length) return null;
   let prompt = "Classify each item. Return a JSON array, one object per item.\n\n";
   llmTasks.forEach((task, i) => {
-    if (task.task === "CLASSIFY_TERRAIN") {
-      prompt += `${i + 1}. TERRAIN "${task.entity}" → one of: ${TERRAINS}\n`;
-    } else if (task.task === "CLASSIFY_DEF_OR_EVA") {
-      prompt += `${i + 1}. DEF or EVA? "${String(task.text).slice(0, 80)}" `
-        + `(speaker: ${task.speaker || "unknown"}) → "DEF" if a factual claim, "EVA" if a judgment\n`;
-    }
+    if (task.task !== "CLASSIFY_TERRAIN") return;
+    const opts = task.kind === "organization"
+      ? "Entity (one specific organization) or Network (a system, platform, market or industry)"
+      : task.kind === "work"
+      ? "Entity (one specific work) or Kind (a genre or category)"
+      : `one of: ${TERRAINS}`;
+    prompt += `${i + 1}. "${task.entity}" — choose ${opts}\n`;
   });
-  prompt += `\nReturn ONLY a JSON array like:\n[{"index":1,"result":"Entity"},{"index":2,"result":"DEF"}]`;
+  prompt += `\nReturn ONLY a JSON array like: [{"index":1,"result":"Entity"}]`;
   return prompt;
 }
 
@@ -354,31 +398,22 @@ export function parseReview(out) {
 
 const VALID_TERRAINS = new Set(TERRAINS.split(", "));
 
-/* Merge the LLM's classifications back into the draft events. Terrains land
-   on INS events; quote classifications become new DEF or EVA events. COREF
-   events are an audit trail only and are dropped here. */
+/* Merge the LLM's terrain classifications back into the draft INS events.
+   COREF events are an audit trail only and are dropped here. */
 export function mergeReviewResults(draftEvents, llmTasks, llmResults) {
   const resultMap = {};
   for (const r of llmResults || []) resultMap[r.index] = r.result;
 
   (llmTasks || []).forEach((task, i) => {
     const result = resultMap[i + 1];
-    if (!result) return;
-    if (task.task === "CLASSIFY_TERRAIN") {
+    if (result && task.task === "CLASSIFY_TERRAIN") {
       const ins = draftEvents.find(e =>
         e.op === "INS" && e.entity.toLowerCase() === String(task.entity).toLowerCase());
       if (ins && VALID_TERRAINS.has(result)) ins.terrain = result;
-    } else if (task.task === "CLASSIFY_DEF_OR_EVA") {
-      const isEva = String(result).toUpperCase() === "EVA";
-      draftEvents.push(isEva
-        ? { op: "EVA", entity: task.speaker || "?", claim: String(task.text).slice(0, 100),
-            status: "holds", span: task.text, clauseIndex: task.clauseIndex, mechanical: false }
-        : { op: "DEF", entity: task.speaker || "?", field: "quote", value: String(task.text).slice(0, 100),
-            span: task.text, clauseIndex: task.clauseIndex, mechanical: false });
     }
   });
 
-  // Any INS the review did not reach defaults to Entity.
+  // Any ambiguous INS the review did not resolve defaults to Entity.
   for (const e of draftEvents) {
     if (e.op === "INS" && (!e.terrain || e.terrain === "?")) e.terrain = "Entity";
   }
