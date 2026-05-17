@@ -368,14 +368,13 @@ OLLAMA_ORIGINS="${pageOrigin || "https://myapp.com"},http://localhost:3000" olla
       <div style={{ flex: 1, overflowY: "auto" }}>
       <div style={{ padding: "16px 20px", maxWidth: 820, margin: "0 auto" }}>
 
-        {/* ═══ SETTINGS — sub-nav ═══ */}
         <div style={{ display: "flex", gap: 6, marginBottom: 14, flexWrap: "wrap" }}>
-          {[["connection", "Connection"], ["models", "Models"], ["optimize", "Optimize"], ["connect", "Connect"]].map(([id, label]) => (
-            <button key={id} onClick={() => setSettingsSection(id)} style={{
-              padding: "6px 14px", fontSize: 11.5, fontWeight: 600, borderRadius: 7, cursor: "pointer",
-              border: `1px solid ${settingsSection === id ? C.accent : C.border}`,
-              background: settingsSection === id ? "rgba(110,86,207,.18)" : "transparent",
-              color: settingsSection === id ? C.text : C.dim,
+          {[["connection", "Connection"], ["models", "Models"], ["optimize", "Optimize"], ["connect", "Connect"]].map(([k, label]) => (
+            <button key={k} onClick={() => setSettingsSection(k)} style={{
+              padding: "6px 14px", fontSize: 11, fontWeight: 600, borderRadius: 7, cursor: "pointer",
+              border: `1px solid ${settingsSection === k ? C.accent : C.border}`,
+              background: settingsSection === k ? C.accent : "transparent",
+              color: settingsSection === k ? "#fff" : C.dim,
             }}>{label}</button>
           ))}
         </div>
@@ -581,7 +580,7 @@ ollama serve`;
 
             <Box title="Keep models warm" sub="Cold-loading a model into GPU memory can take 30s+. Keep it resident between requests.">
               <div style={{ fontSize: 12, color: C.dim, lineHeight: 1.6, marginBottom: 10 }}>
-                Use the keep-alive selector on the <strong style={{ color: C.text }}>Connection</strong> section to load a model
+                Use the keep-alive selector in the <strong style={{ color: C.text }}>Connection</strong> section to load a model
                 and pin it in memory. To make Ollama keep every model warm by default, set the env var below.
               </div>
               <CopyBlock copy={copy} copied={copied} id="opt-env" text={serverEnv} label="Server tuning — paste into terminal" />
@@ -632,7 +631,7 @@ ollama serve`;
                 ))}
               </>
             ) : (
-              <div style={{ fontSize: 12, color: C.orange }}>No models installed. Pull one from Settings → Models first.</div>
+              <div style={{ fontSize: 12, color: C.orange }}>No models installed. Pull one from the Models section first.</div>
             )}
 
             {model && (<>
