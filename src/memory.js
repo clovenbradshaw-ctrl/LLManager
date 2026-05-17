@@ -29,58 +29,14 @@ export const INTERVALS = {
 
 /* ═══ Prompts: READ (user-facing) ═══ */
 
-export const READ_SYSTEM = `You are a helpful assistant with a situated memory.
+export const READ_SYSTEM = `Answer from the material below. Be direct and concise.
 
-The [STATUS], [CTX] and [POS] blocks below are your memory of this
-conversation and of any documents read into it. They are context for YOU —
-never quote their tags, hashes, or "impression" lines back to the user, and
-never paste the blocks into your reply. Just answer in plain language.
+If the material covers the question, answer from it.
+If it only partly covers it, say what you can see and what is still being read.
+If it doesn't cover it at all, just answer normally.
 
-How to use your memory:
-- For ordinary general questions — arithmetic, definitions, everyday facts,
-  casual conversation — simply answer. You do not need the memory blocks'
-  permission, and an empty memory is not a reason to refuse.
-- For anything about THIS conversation, the people in it, or documents the
-  user imported, answer from the memory blocks. Say plainly when something is
-  only partly read or not yet known, rather than guessing.
-- Memory has three grades: grounded (fully read), forming (being read now),
-  and impressions (scanned, not yet read). Weigh them accordingly; never
-  present a hypothesis or a passing remark as a sourced fact.
-- If the user asks about something that may be in an imported document but is
-  not grounded yet, say so and offer to check the uploaded files.
-
-If an entity reference is ambiguous — a name that could refer to more than one
-thing in memory — say so plainly. Example: "This 'Hardy' may not be the same
-as e_3a7f21b4 (Tom Hardy the actor)." The system will handle the resolution.
-
-Reading [STATUS]:
-  knowledge: counts by grade (grounded / forming / impressions)
-  reading: documents currently being processed and how far along
-  recent shifts: entities whose felt-sense shifted notably just now
-
-Reading [CTX]:
-  E: hash@state | terrain | edges     — grounded entity (read, provenanced)
-  ≈ name | terrain | READING          — a still-forming impression
-  ≈ passage N | from document "..."   — raw unread text from a document
-  ~: canonical name, aka aliases
-  from: where this knowledge originated — an imported document, this
-        conversation, or a system inference. Weigh them differently.
-  h: the system's working interpretation — a hypothesis, NOT a stated fact
-  →←: connection (type) target_hash
-  =: field = value
-  @: "verbatim source span"
-  ⚠: unresolved conflict
-
-Reading [POS]:
-  prev: entity hashes from last turn
-  topic: what we were discussing
-  last: user's previous message
-
-Knowledge from an imported document is source material; knowledge from this
-conversation is what you and the user said; a hypothesis is the system's own
-guess. Never present a hypothesis or a conversational remark as if it were a
-sourced fact. For ≈ entries, say what you can see so far and that it is not
-yet fully read. For grounded entries, answer with confidence and cite spans.`;
+Never quote tags, hashes, or format markers back to the user.
+Never narrate your process. Just answer the question.`;
 
 export const READ_CASUAL = `You are a helpful assistant. Be concise and natural.
 Your messages are recorded in a knowledge graph.`;
@@ -116,7 +72,8 @@ produce exactly ONE action as JSON. ONLY valid JSON, no markdown.
 
 Actions:
 
-FORK — one entity is actually two:
+FORK — the evidence clearly names two separate referents that were recorded
+as one (not merely conflicting facts about a single entity):
 {"action":"FORK","source":"<hash>","new_canonical":"<name>","reason":"<why>"}
 
 MERGE — two entities are actually one:
@@ -132,6 +89,12 @@ RECLASSIFY — terrain assignment is wrong:
 
 NONE — no action needed:
 {"action":"NONE","reason":"<why the ambiguity is not real>"}
+
+Default to NONE. Conflicting facts about one entity are NOT grounds for a
+FORK — contradictory DEFs are allowed to coexist as a recorded conflict, and
+"we do not know this yet" is a valid resting state. Only FORK, MERGE or
+CORRECT when the evidence clearly supports it; missing or incomplete
+information is never enough. When in doubt, choose NONE.
 
 Always include "reason". The action is logged and must be auditable.`;
 
@@ -450,22 +413,29 @@ export async function retrieve(query, { topK = 6 } = {}) {
 
 /* Mechanical document lookup — no model, no embeddings. Splits each opted-in
    document back into passages and scores every passage against the query by
-   keyword and entity-name overlap, returning the top matches as a [DOCUMENTS]
+   keyword and entity-name overlap, returning the top matches as a [DOCS]
    block to inject straight into the prompt. This backs the composer's
    "ask with documents" trigger: a deterministic pull of source text, separate
    from the graph projection. When nothing overlaps (a general question), it
-   falls back to each document's opening passages so the block is never empty. */
+   falls back to each document's opening passages so the block is never empty.
+   Identical passage text is deduplicated, so the same document imported twice
+   never lands the same passage in the block more than once. */
 export function lookupDocuments(query, docs, { topK = 6 } = {}) {
   const qSig = signal(query || "");
   const qKw = qSig.keywords;
   const qNames = qSig.ner.names.map(n => n.toLowerCase());
 
   const passages = [];
+  const seenText = new Set();
   for (const doc of docs || []) {
     const text = (doc?.text || "").trim();
     if (!text) continue;
-    const split = splitPassages(text);
-    split.forEach((p, i) => passages.push({ text: p, index: i, title: doc.title || "document" }));
+    splitPassages(text).forEach((p, i) => {
+      const key = p.trim().toLowerCase();
+      if (seenText.has(key)) return;
+      seenText.add(key);
+      passages.push({ text: p, index: i });
+    });
   }
   if (!passages.length) return "";
 
@@ -482,12 +452,8 @@ export function lookupDocuments(query, docs, { topK = 6 } = {}) {
   let top = scored.filter(p => p.score > 0).sort((a, b) => b.score - a.score).slice(0, topK);
   if (!top.length) top = passages.slice(0, topK); // general question — show the openings
 
-  const lines = top.map(r => `— from "${r.title}" (passage ${r.index + 1}):\n${r.text.trim()}`);
-  return `[DOCUMENTS]\nThe user is indicating they want you to answer with documents. `
-    + `Here is what was returned from that lookup process — the passages most relevant `
-    + `to their question, pulled mechanically from the uploaded files. Treat them as `
-    + `source material: quote or paraphrase as needed, and say plainly if they do not `
-    + `cover the question.\n\n${lines.join("\n\n")}\n[/DOCUMENTS]`;
+  const lines = top.map((r, i) => `${i + 1}: "${r.text.trim()}"`);
+  return `[DOCS]\n${lines.join("\n")}\n[/DOCS]`;
 }
 
 /* The first pass — mechanical NER, no model. Mints SIG entities the instant

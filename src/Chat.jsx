@@ -1179,6 +1179,13 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
   const abortRef = useRef(null);
   const ingestAbortRef = useRef(false);
   const scrollRef = useRef(null);
+  /* Foreground/background GPU arbitration. Ollama runs one request at a time,
+     so the document walk and a user response contend for it. walkPausedRef is
+     raised while a foreground response is in flight; the walk loop yields on
+     it. walkInFlightRef holds the walk's current passage call so a response
+     can wait it out rather than queue behind a fresh one. */
+  const walkPausedRef = useRef(false);
+  const walkInFlightRef = useRef(null);
 
   /* Open the SQLite store once, on mount. Route uncaught errors and
      console.error into the app event log so they surface in the Log tab. */
@@ -1264,10 +1271,13 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
      The graph lives in SQLite under the chat's scope, including any
      documents ingested into it — the embedding-backed Reach queries it
      directly. Async because the Reach embeds the message first. */
-  const memorySystemPrompt = async (convo, sig, text) => {
+  const memorySystemPrompt = async (convo, sig, text, { excludePassages = false } = {}) => {
     store.setScope(convo.id);
-    const results = await retrieve(text);
+    let results = await retrieve(text);
     store.setScope(convo.id);
+    // One representation per passage: when a [DOCS] block carries the raw
+    // unwalked text, drop the redundant ≈ passage entries from the dossier.
+    if (excludePassages) results = results.filter(r => r.type !== "passage");
     const dossier = formatRetrieved(results);
     const parts = [READ_SYSTEM, buildStatus(), dossier, buildPosition(convo?.lastTurn)].filter(Boolean);
     return {
@@ -1714,15 +1724,24 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
     try {
     for (let i = 0; i < passages.length; i++) {
       if (ingestAbortRef.current) { trace[i].status = "stopped"; sync(); break; }
+      // Yield the GPU to any foreground response — the walk waits for the
+      // user, never the other way around.
+      while (walkPausedRef.current && !ingestAbortRef.current) {
+        await new Promise(res => setTimeout(res, 150));
+      }
+      if (ingestAbortRef.current) { trace[i].status = "stopped"; sync(); break; }
       trace[i].status = "reading"; sync();
       try {
         const givenId = givenIds[i] || logPassage(passages[i], docId, i, { title }).id;
         store.setScope(convoId);
         const register = buildRegister();
-        const out = await chatOnce(model, [
+        walkInFlightRef.current = chatOnce(model, [
           { role: "system", content: INGEST_SYSTEM },
           { role: "user", content: `${register}\n\nPASSAGE:\n${passages[i]}` },
         ], EVENT_SCHEMA);
+        let out;
+        try { out = await walkInFlightRef.current; }
+        finally { walkInFlightRef.current = null; }
         const events = parseEvents(out);
         const spanVecs = await store.embedDefSpans(events);
         // Sync apply block.
@@ -1931,7 +1950,9 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
     let apiMessages, memCtx = null, memBadge;
     if (mode === "memory" && dbReady) {
       const sig = signal(text);
-      const sys = await memorySystemPrompt({ id: convoId, lastTurn: existing?.lastTurn }, sig, text);
+      const sys = await memorySystemPrompt(
+        { id: convoId, lastTurn: existing?.lastTurn }, sig, text,
+        { excludePassages: !!docBlock });
       apiMessages = [
         { role: "system", content: docBlock ? `${sys.content}\n\n${docBlock}` : sys.content },
         { role: "user", content: text },
@@ -1967,19 +1988,31 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
       return { ...c, messages: [...base, userMsg, placeholder], updatedAt: Date.now() };
     }));
 
+    // The user is waiting — the response gets the GPU to itself. Pause the
+    // walk and let any passage call already running drain first.
+    walkPausedRef.current = true;
+    if (walkInFlightRef.current) {
+      try { await walkInFlightRef.current; } catch { /* the walk owns its errors */ }
+    }
+
     const finalContent = await runTurn(convoId, aId, chosenModel, apiMessages, { candidates, routingId: routing?.id });
     setBusy(false);
     maybeREC();
 
     // Background: read every memory-mode turn back into the chat's graph.
     // Both messages are recorded in the Given-Log with content hashes; the
-    // model entry carries the dossier projection that produced it.
+    // model entry carries the dossier projection that produced it. The walk
+    // resumes once this turn's extract has run.
     if (mode === "memory" && memCtx && finalContent) {
       const turn = (existing?.messages.filter(m => m.role === "assistant").length || 0) + 1;
       const userGiven = logUserMessage(text, memCtx.sig, convoId, turn);
       const modelGiven = logModelResponse(finalContent, chosenModel, memCtx.dossierHash, convoId, turn);
       patchMsg(convoId, aId, { givenId: modelGiven.id });
-      runExtract(convoId, aId, userGiven, modelGiven, backgroundModel(chosenModel), memCtx);
+      runExtract(convoId, aId, userGiven, modelGiven, backgroundModel(chosenModel), memCtx)
+        .catch(() => {})
+        .finally(() => { walkPausedRef.current = false; });
+    } else {
+      walkPausedRef.current = false;
     }
   };
 
@@ -2049,7 +2082,16 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
       dossierHash: active.mode === "memory" ? memDossierHash : undefined,
       spans: active.mode === "memory" ? memSpans : undefined,
     });
-    await runTurn(active.id, msgId, useModel, apiMessages, { candidates, routingId: routing?.id });
+    // The user is waiting — pause the walk for the duration of the re-run.
+    walkPausedRef.current = true;
+    if (walkInFlightRef.current) {
+      try { await walkInFlightRef.current; } catch { /* the walk owns its errors */ }
+    }
+    try {
+      await runTurn(active.id, msgId, useModel, apiMessages, { candidates, routingId: routing?.id });
+    } finally {
+      walkPausedRef.current = false;
+    }
     setBusy(false);
     maybeREC();
   };
