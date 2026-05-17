@@ -13,6 +13,7 @@ import {
   emptyMemory, cloneMemory, memoryStats, mergeMemory, splitSentences, batchSentences,
   signal, reach, buildDossier, buildPosition, buildLibrary, buildRoster,
   collectSpans, dossierHashOf, makeGiven, appendGiven,
+  WALK_SCHEMA, MUTATE_SCHEMA,
   parseWalk, applyWalk,
   detectMutationTriggers, buildMutateUser, parseMutate, makeMutation, applyMutation,
 } from "./memory.js";
@@ -1008,8 +1009,12 @@ export default function Chat({ ollamaUrl, installed, ollamaUp, provider = "ollam
     return { content: answer, reasoning, usage };
   };
 
-  /* Non-streaming chat call — used for the background memory Extract step. */
-  const chatOnce = async (model, apiMessages) => {
+  /* Non-streaming chat call — used for the background memory calls. When a
+     `format` JSON schema is given, Ollama constrains generation to it via
+     constrained decoding, so the EXTRACT/INGEST/MUTATE output is guaranteed
+     well-formed JSON. (The in-browser runtime is left unconstrained — the
+     walk parser still tolerates fenced or noisy output.) */
+  const chatOnce = async (model, apiMessages, format) => {
     if (isBrowser) {
       const engine = await getBrowserEngine(model);
       const reply = await engine.chat.completions.create({
@@ -1020,7 +1025,10 @@ export default function Chat({ ollamaUrl, installed, ollamaUp, provider = "ollam
     const r = await fetch(`${ollamaUrl}/api/chat`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ model, messages: apiMessages, stream: false, options: { temperature: 0 } }),
+      body: JSON.stringify({
+        model, messages: apiMessages, stream: false, options: { temperature: 0 },
+        ...(format ? { format } : {}),
+      }),
     });
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
     const j = await r.json();
@@ -1094,7 +1102,7 @@ export default function Chat({ ollamaUrl, installed, ollamaUp, provider = "ollam
       const out = await chatOnce(model, [
         { role: "system", content: MUTATE_SYSTEM },
         { role: "user", content: buildMutateUser(snapshot || emptyMemory(), trigger) },
-      ]);
+      ], MUTATE_SCHEMA);
       const parsed = parseMutate(out);
       if (parsed) mut = makeMutation(parsed, { trigger, msgId });
     } catch { /* fail silently — the turn already succeeded */ }
@@ -1120,7 +1128,7 @@ export default function Chat({ ollamaUrl, installed, ollamaUp, provider = "ollam
         { role: "user", content: `${buildRoster(convo?.memory)}\n\nEXCHANGE:\n`
           + `User [${userGiven.id}]: "${userGiven.text.slice(0, 4000)}"\n`
           + `Model [${modelGiven.id}]: "${modelGiven.text.slice(0, 4000)}"` },
-      ]);
+      ], WALK_SCHEMA);
       ops = parseWalk(out);
     } catch { /* fail silently — the turn already succeeded */ }
 
@@ -1196,7 +1204,7 @@ export default function Chat({ ollamaUrl, installed, ollamaUp, provider = "ollam
         const out = await chatOnce(model, [
           { role: "system", content: INGEST_SYSTEM },
           { role: "user", content: `${buildRoster(docMem)}\n\nPASSAGE:\n${passages[i]}` },
-        ]);
+        ], WALK_SCHEMA);
         const ops = parseWalk(out);
         const res = applyWalk(docMem, ops, { source: docGiven.id });
         trace[i].applied = res.applied;
@@ -1220,7 +1228,7 @@ export default function Chat({ ollamaUrl, installed, ollamaUp, provider = "ollam
         const out = await chatOnce(model, [
           { role: "system", content: MUTATE_SYSTEM },
           { role: "user", content: buildMutateUser(docMem, trigger) },
-        ]);
+        ], MUTATE_SCHEMA);
         const parsed = parseMutate(out);
         if (parsed) {
           const mut = makeMutation(parsed, { trigger });

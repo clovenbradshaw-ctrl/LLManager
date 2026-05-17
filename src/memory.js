@@ -101,6 +101,58 @@ with a different entity and needs its own site. CORRECT when a site's canonical
 name is wrong. RECLASSIFY when a site's kind is wrong. NONE when the graph is
 already correct. Keep the reason to one sentence.`;
 
+/* ── Structured-output schemas ──
+
+   Ollama's `format` parameter constrains generation to a JSON schema via
+   constrained decoding: the model can only emit token sequences that keep
+   the output schema-valid. Passing these kills malformed JSON and markdown
+   fences for the EXTRACT, INGEST and MUTATE calls — the structure is
+   guaranteed, only the content quality depends on the model. */
+
+/* The walk op list — INGEST and EXTRACT. A superset of all op fields; only
+   `op` is required, the model fills what each op needs. */
+export const WALK_SCHEMA = {
+  type: "array",
+  items: {
+    type: "object",
+    properties: {
+      op: { type: "string", enum: ["SIG", "DEF", "CON", "REC", "AMBIG"] },
+      id: { type: "string" },
+      name: { type: "string" },
+      canonical: { type: "string" },
+      kind: { type: "string" },
+      hypothesis: { type: "string" },
+      from: { type: "string" },
+      to: { type: "string" },
+      relation: { type: "string" },
+      evidence: { type: "string" },
+      field: { type: "string" },
+      value: { type: "string" },
+      source: { type: "string" },
+      alias: { type: "string" },
+      candidate: { type: "string" },
+      span: { type: "string" },
+    },
+    required: ["op"],
+  },
+};
+
+/* One MUTATE action. */
+export const MUTATE_SCHEMA = {
+  type: "object",
+  properties: {
+    action: { type: "string", enum: ["FORK", "MERGE", "CORRECT", "RECLASSIFY", "NONE"] },
+    target: { type: "string" },
+    other: { type: "string" },
+    name: { type: "string" },
+    from: { type: "string" },
+    canonical: { type: "string" },
+    kind: { type: "string" },
+    reason: { type: "string" },
+  },
+  required: ["action", "reason"],
+};
+
 /* ── Content hashing — sync, for content-addressed ids ── */
 
 function fnv(str) {
