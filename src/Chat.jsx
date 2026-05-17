@@ -9,8 +9,8 @@ import {
 } from "./router.js";
 import {
   MEMORY_SYSTEM, EXTRACT_SYSTEM, INGEST_SYSTEM,
-  emptyMemory, cloneMemory, memoryStats, mergeMemory, chunkText,
-  signal, reach, buildDossier, buildPosition,
+  emptyMemory, cloneMemory, memoryStats, mergeMemory, splitSentences,
+  signal, reach, buildDossier, buildPosition, buildLibrary,
   parseEvents, applyEvents,
 } from "./memory.js";
 import { loadLibrary, saveLibrary, docStats } from "./library.js";
@@ -535,7 +535,7 @@ function HeaderBtn({ icon, label, onClick, disabled, badge }) {
   );
 }
 
-/* ── Per-chunk read trace — one row of the reading process ── */
+/* ── Per-sentence read trace — one row of the reading process ── */
 function ChunkTrace({ chunk }) {
   const [open, setOpen] = useState(false);
   const stColor = chunk.status === "done" ? C.green
@@ -545,7 +545,8 @@ function ChunkTrace({ chunk }) {
   const kws = chunk.signal?.keywords || [];
   const label = chunk.status === "done" ? `+${chunk.applied} facts`
     : chunk.status === "reading" ? "reading…"
-    : chunk.status === "error" ? "error" : "queued";
+    : chunk.status === "error" ? "error"
+    : chunk.status === "skipped" ? "skipped — no content" : "queued";
   return (
     <div style={{ border: `1px solid ${C.border}`, borderRadius: 8, marginBottom: 6, background: C.bg }}>
       <button onClick={() => setOpen(o => !o)} style={{
@@ -557,7 +558,7 @@ function ChunkTrace({ chunk }) {
           <Icon name="chev" size={11} />
         </span>
         <span style={{ width: 7, height: 7, borderRadius: 99, background: stColor, flexShrink: 0 }} />
-        <span>Chunk {chunk.index + 1} · {chunk.chars} chars</span>
+        <span>Sentence {chunk.index + 1} · {chunk.chars} chars</span>
         <span style={{ flex: 1 }} />
         <span style={{ color: stColor }}>{label}</span>
       </button>
@@ -620,7 +621,7 @@ function LibraryModal({ open, onClose, library, activeConvo, canIngest,
     onIngest(text, title.trim(), source);
   };
 
-  const done = ingestTrace.filter(t => t.status === "done" || t.status === "error").length;
+  const done = ingestTrace.filter(t => t.status !== "pending" && t.status !== "reading").length;
   const learned = ingestTrace.reduce((n, t) => n + (t.applied || 0), 0);
   const attached = new Set(activeConvo?.docs || []);
   const btn = (active) => ({
@@ -653,10 +654,10 @@ function LibraryModal({ open, onClose, library, activeConvo, canIngest,
           {/* ── Read new content ── */}
           <div style={{ fontSize: 12, fontWeight: 700, marginBottom: 6 }}>Read new content</div>
           <div style={{ fontSize: 11.5, color: C.dim, lineHeight: 1.6, marginBottom: 10 }}>
-            Paste or upload any text. It is split into chunks, each chunk is mechanically
-            scanned for entities and then read by the model into a knowledge graph. The
-            document is added to the library and opted in to the current chat — every step
-            is shown below.
+            Paste or upload any text. It is split into sentences, each sentence is
+            mechanically scanned for entities and then read by the model into a knowledge
+            graph. The document is added to the library and opted in to the current chat —
+            every sentence is shown below as it is read.
           </div>
           <input value={title} onChange={e => setTitle(e.target.value)} placeholder="Document title (optional)"
             disabled={ingestRunning}
@@ -693,7 +694,7 @@ function LibraryModal({ open, onClose, library, activeConvo, canIngest,
             <div style={{ marginTop: 14 }}>
               <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6,
                 fontFamily: mono, fontSize: 11, color: C.dim }}>
-                <span>{done}/{ingestTrace.length} chunks read</span>
+                <span>{done}/{ingestTrace.length} sentences read</span>
                 <span>·</span>
                 <span style={{ color: C.accent }}>+{learned} facts learned</span>
               </div>
@@ -730,7 +731,7 @@ function LibraryModal({ open, onClose, library, activeConvo, canIngest,
                   <div style={{ fontSize: 12, fontWeight: 600, whiteSpace: "nowrap", overflow: "hidden",
                     textOverflow: "ellipsis" }}>{doc.title}</div>
                   <div style={{ fontSize: 10, fontFamily: mono, color: C.dim }}>
-                    {st.entities} entities · {st.edges} links · {st.defs} facts · {doc.chunks} chunks
+                    {st.entities} entities · {st.edges} links · {st.defs} facts · {doc.sentences} sentences
                   </div>
                 </div>
                 <button onClick={() => onToggleDoc(doc.id)} disabled={!activeConvo} style={btn(on)}>
@@ -808,14 +809,29 @@ export default function Chat({ ollamaUrl, installed, ollamaUp }) {
     return () => clearTimeout(id);
   }, [library]);
 
+  /* The library documents a chat has opted in to. */
+  const attachedDocs = (convo) => (convo?.docs || [])
+    .map(id => library.find(d => d.id === id))
+    .filter(Boolean);
+
   /* Project a chat's own memory together with every opted-in library
      document into a single graph (entities/edges/defs only). */
-  const combinedMemory = (convo) => {
-    const docMems = (convo?.docs || [])
-      .map(id => library.find(d => d.id === id))
-      .filter(Boolean)
-      .map(d => d.memory);
-    return mergeMemory(convo?.memory, ...docMems);
+  const combinedMemory = (convo) =>
+    mergeMemory(convo?.memory, ...attachedDocs(convo).map(d => d.memory));
+
+  /* The memory-mode system prompt: instructions + recalled context +
+     library overview + position marker. Empty sections are dropped so the
+     prompt stays as small as the chat allows. */
+  const memorySystemPrompt = (convo, sig) => {
+    const projected = combinedMemory(convo);
+    const entities = reach(sig, projected);
+    const parts = [
+      MEMORY_SYSTEM,
+      buildDossier(entities, projected),
+      buildLibrary(attachedDocs(convo)),
+      buildPosition((convo?.memory || emptyMemory()).lastTurn),
+    ].filter(Boolean);
+    return { content: parts.join("\n\n"), used: entities.length, entities };
   };
 
   /* Switch the active chat's mode (or just the default for the next new chat).
@@ -1005,10 +1021,10 @@ export default function Chat({ ollamaUrl, installed, ollamaUp }) {
     patchMsg(convoId, msgId, m => ({ mem: { ...(m.mem || {}), learned } }));
   };
 
-  /* Read a block of text into a library document: chunk it, mechanically
-     scan each chunk, then have the model distil it into a knowledge graph.
-     The finished document is added to the library and opted in to the
-     current chat. The per-chunk trace is shown live in the Library modal. */
+  /* Read a block of text into a library document: split it into sentences,
+     mechanically scan each one, then have the model distil it into a
+     knowledge graph. The finished document is added to the library and opted
+     in to the current chat. The per-sentence trace is shown live. */
   const runIngest = async (rawText, title, source) => {
     const text = (rawText || "").trim();
     if (!text || ingestRunning) return;
@@ -1034,8 +1050,8 @@ export default function Chat({ ollamaUrl, installed, ollamaUp }) {
     }
 
     const docId = "d" + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
-    const chunks = chunkText(text);
-    const trace = chunks.map((c, i) => ({
+    const sentences = splitSentences(text);
+    const trace = sentences.map((c, i) => ({
       index: i, chars: c.length, text: c, signal: signal(c),
       status: "pending", rawOutput: "", events: [], applied: 0,
     }));
@@ -1044,12 +1060,17 @@ export default function Chat({ ollamaUrl, installed, ollamaUp }) {
     sync();
 
     const docMem = { entities: {}, edges: {}, defs: {} };
-    for (let i = 0; i < chunks.length; i++) {
+    for (let i = 0; i < sentences.length; i++) {
+      // Skip sentences with no content signal — navigation, boilerplate, etc.
+      const sg = trace[i].signal;
+      if (sg.ner.names.length === 0 && sg.keywords.length <= 1) {
+        trace[i].status = "skipped"; sync(); continue;
+      }
       trace[i].status = "reading"; sync();
       try {
         const out = await chatOnce(model, [
           { role: "system", content: INGEST_SYSTEM },
-          { role: "user", content: chunks[i] },
+          { role: "user", content: sentences[i] },
         ]);
         const events = parseEvents(out);
         trace[i].applied = applyEvents(docMem, events);
@@ -1069,7 +1090,7 @@ export default function Chat({ ollamaUrl, installed, ollamaUp }) {
       title: title || source || (text.slice(0, 40) + (text.length > 40 ? "…" : "")),
       source: source || "pasted text",
       addedAt: new Date().toISOString(),
-      chars: text.length, chunks: chunks.length, learned,
+      chars: text.length, sentences: sentences.length, learned,
       memory: docMem,
       trace: trace.map(t => ({
         index: t.index, chars: t.chars, status: t.status, applied: t.applied,
@@ -1122,7 +1143,7 @@ export default function Chat({ ollamaUrl, installed, ollamaUp }) {
       memory: c.memory || undefined,
       library: attached.map(d => ({
         id: d.id, title: d.title, source: d.source, addedAt: d.addedAt,
-        chars: d.chars, chunks: d.chunks, learned: d.learned,
+        chars: d.chars, sentences: d.sentences, learned: d.learned,
         memory: d.memory, readTrace: d.trace,
       })),
     };
@@ -1190,18 +1211,14 @@ export default function Chat({ ollamaUrl, installed, ollamaUp }) {
     // prompt stays minimal regardless of how much the chat has covered.
     let apiMessages, memCtx = null, memBadge;
     if (mode === "memory") {
-      const memory = existing?.memory || emptyMemory();
       const sig = signal(text);
-      const projected = combinedMemory(existing);
-      const entities = reach(sig, projected);
-      const dossier = buildDossier(entities, projected);
-      const position = buildPosition(memory.lastTurn);
+      const sys = memorySystemPrompt(existing, sig);
       apiMessages = [
-        { role: "system", content: `${MEMORY_SYSTEM}\n\n${dossier}\n\n${position}`.trim() },
+        { role: "system", content: sys.content },
         { role: "user", content: text },
       ];
-      memCtx = { sig, entities };
-      memBadge = { used: entities.length };
+      memCtx = { sig, entities: sys.entities };
+      memBadge = { used: sys.used };
     } else {
       const apiHistory = quantize ? quantizeHistory(history) : history;
       apiMessages = [...apiHistory, { role: "user", content: text }];
@@ -1274,17 +1291,14 @@ export default function Chat({ ollamaUrl, installed, ollamaUp }) {
     // A re-run only regenerates the reply — it does not re-extract memory.
     let apiMessages, memBadge = oldMsg.mem;
     if (active.mode === "memory") {
-      const memory = active.memory || emptyMemory();
       const promptMsg = [...active.messages.slice(0, idx)].reverse().find(m => m.role === "user");
       const promptText = promptMsg?.content || "";
-      const sig = signal(promptText);
-      const projected = combinedMemory(active);
-      const entities = reach(sig, projected);
+      const sys = memorySystemPrompt(active, signal(promptText));
       apiMessages = [
-        { role: "system", content: `${MEMORY_SYSTEM}\n\n${buildDossier(entities, projected)}\n\n${buildPosition(memory.lastTurn)}`.trim() },
+        { role: "system", content: sys.content },
         { role: "user", content: promptText },
       ];
-      memBadge = { used: entities.length };
+      memBadge = { used: sys.used };
     } else {
       apiMessages = quantize ? quantizeHistory(history) : history;
     }

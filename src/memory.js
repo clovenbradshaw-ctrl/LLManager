@@ -13,11 +13,14 @@
    Matrix, since the regular chat is a local-only, single-device app. */
 
 export const MEMORY_SYSTEM = `You are a helpful assistant with long-term memory.
-The [CONTEXT] block holds facts remembered from earlier in this conversation.
+The [CONTEXT] block holds facts recalled from this conversation.
+The [LIBRARY] block lists documents that have been read into this chat — treat
+everything in it as material you have already read and can discuss directly.
 The [POSITION] block notes what was discussed on the previous turn.
-Use them to stay consistent and personalised across the chat. If the context
-is empty or does not cover something, answer normally from your own knowledge —
-do not claim you have no memory. Keep responses concise unless asked for detail.`;
+Use them to answer accurately and stay consistent. If they do not cover
+something, answer normally from your own knowledge — never claim you have no
+memory or that you cannot see a document. Keep responses concise unless asked
+for detail.`;
 
 export const EXTRACT_SYSTEM = `Extract new, durable facts from this exchange as JSON.
 Return a JSON array of events. Each event is one of:
@@ -42,31 +45,30 @@ definitions or decisions stated in the text. Ignore filler and rhetoric.
 Return [] if there is nothing worth remembering.
 Return ONLY the JSON array — no markdown, no commentary.`;
 
-/* Split a large block of text into model-sized chunks, breaking on paragraph
-   then sentence boundaries so a fact is never cut in half. */
-export function chunkText(text, maxChars = 2800) {
-  const clean = String(text || "").replace(/\r\n/g, "\n").trim();
+/* Split text into sentences for reading. Each sentence is read on its own so
+   extraction stays focused — a long chunk makes the model skim and miss facts.
+   Overlong runs (no punctuation) are hard-split; tiny fragments are merged
+   back into the preceding sentence. */
+export function splitSentences(text, maxLen = 1200) {
+  const clean = String(text || "").replace(/\s+/g, " ").trim();
   if (!clean) return [];
-  if (clean.length <= maxChars) return [clean];
-  const chunks = [];
-  let buf = "";
-  const flush = () => { if (buf.trim()) { chunks.push(buf.trim()); buf = ""; } };
-  for (const para of clean.split(/\n\s*\n/)) {
-    if (para.length > maxChars) {
-      flush();
-      let sb = "";
-      for (const s of para.match(/[^.!?]+[.!?]+|[^.!?]+$/g) || [para]) {
-        if (sb && (sb + s).length > maxChars) { chunks.push(sb.trim()); sb = ""; }
-        sb += s;
-      }
-      if (sb.trim()) buf = sb.trim();
-      continue;
+  const raw = clean.match(/[^.!?]+[.!?]+(?:["'”’)\]]+)?|[^.!?]+$/g) || [clean];
+  const pieces = [];
+  for (let s of raw.map(x => x.trim()).filter(Boolean)) {
+    while (s.length > maxLen) {
+      let cut = s.lastIndexOf(" ", maxLen);
+      if (cut < maxLen * 0.5) cut = maxLen;
+      pieces.push(s.slice(0, cut).trim());
+      s = s.slice(cut).trim();
     }
-    if (buf && (buf + "\n\n" + para).length > maxChars) flush();
-    buf = buf ? buf + "\n\n" + para : para;
+    if (s) pieces.push(s);
   }
-  flush();
-  return chunks;
+  const out = [];
+  for (const p of pieces) {
+    if (out.length && p.length < 35) out[out.length - 1] += " " + p;
+    else out.push(p);
+  }
+  return out;
 }
 
 /* Merge several knowledge graphs into one (entities/edges/defs only). Used to
@@ -219,6 +221,32 @@ Last user message: "${lastTurn.userMessage || ""}"
 [/POSITION]`;
 }
 
+/* ── The Library card: a compact, always-present overview of the documents
+   read into a chat, so the model knows what it has even when the query does
+   not lexically match any entity. Bounded per document to keep prompts small. */
+export function buildLibrary(docs) {
+  if (!docs || !docs.length) return "";
+  const lines = ["[LIBRARY]"];
+  for (const d of docs) {
+    const entities = Object.values(d.memory?.entities || {});
+    const edges = Object.values(d.memory?.edges || {});
+    const defs = Object.values(d.memory?.defs || {}).filter(x => x.value);
+    const top = [...entities].sort((a, b) => (b.mentions || 0) - (a.mentions || 0)).slice(0, 16);
+    lines.push(`Document: "${d.title}" — ${entities.length} entities, ${edges.length} connections`);
+    if (top.length) lines.push("  Mentions: " + top.map(e => e.canonical).join(", "));
+    for (const def of defs.slice(0, 8)) {
+      const e = d.memory.entities[def.entity];
+      lines.push(`  ${e ? e.canonical : def.entity} · ${def.field}: ${def.value}`);
+    }
+    for (const g of edges.slice(0, 8)) {
+      const f = d.memory.entities[g.from], t = d.memory.entities[g.to];
+      lines.push(`  ${f ? f.canonical : g.from} —${g.type}→ ${t ? t.canonical : g.to}`);
+    }
+  }
+  lines.push("[/LIBRARY]");
+  return lines.join("\n");
+}
+
 /* ── The Extract: parse the model's JSON event list ── */
 export function parseEvents(text) {
   if (!text) return [];
@@ -233,7 +261,7 @@ export function parseEvents(text) {
     if (!e || typeof e !== "object") return false;
     if (e.op === "INS") return !!e.entity;
     if (e.op === "CON") return !!e.from && !!e.to;
-    if (e.op === "DEF") return !!e.entity && !!e.field;
+    if (e.op === "DEF") return !!e.entity && !!e.field && e.value != null && String(e.value).trim() !== "";
     return false;
   });
 }
