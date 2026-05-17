@@ -20,6 +20,10 @@ import {
   parseEvents, detectMutationTriggers, userCorrectionTrigger, parseMutate, applyMutation, commitTier,
 } from "./memory.js";
 import * as store from "./local-store.js";
+import {
+  extractQuotedTitles, extractClause, clauseToEvents, shouldFallback,
+  buildReviewPrompt, mergeReviewResults, parseReview, REVIEW_SCHEMA, REVIEW_SYSTEM,
+} from "./mechanical-extract.js";
 import { EVENT_SCHEMA, MUTATE_SCHEMA } from "./model-router.js";
 import { loadLibrary, saveLibrary, docStats } from "./library.js";
 import { ROLES, resolveRoleModel, loadRoleConfig, saveRoleConfig } from "./roles.js";
@@ -2004,16 +2008,21 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
       persistDoc();
     }
 
-    // ── Phase 2: the walk — the LLM reads each passage into typed structure
-    //    in the background. The conversation already has Phase 1 to draw on.
+    // ── Phase 2: the walk — two phases per passage. Phase A reads the
+    //    passage mechanically (NLP + regex, no LLM, ~5ms) into a draft of
+    //    INS/DEF/CON events. Phase B is a tiny LLM call that only CLASSIFIES
+    //    that draft — terrains, DEF vs EVA, coreference fixes. The model
+    //    edits structure instead of generating it: same number of calls as
+    //    the old walk, each ~60 tokens instead of ~500.
     const allAmbigs = [];
     const docTouched = new Set();
+    const titles = extractQuotedTitles(text);
+    const corefStack = [];
+    const knownEntities = new Set();
     try {
     for (let i = 0; i < passages.length; i++) {
       if (ingestAbortRef.current) { trace[i].status = "stopped"; sync(); break; }
-      // Chrome passages carry no extractable content — skip the LLM walk and
-      // save the tokens. They are still stored, and their text is attached as
-      // context to the nearest content passage.
+      // Chrome passages carry no extractable content — store, do not read.
       if (classes[i].type === "chrome") {
         trace[i].status = "chrome";
         trace[i].applied = 0;
@@ -2023,42 +2032,53 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
         persistDoc();
         continue;
       }
-      // Yield the GPU to any foreground response — the walk waits for the
-      // user, never the other way around.
-      while (walkPausedRef.current && !ingestAbortRef.current) {
-        await new Promise(res => setTimeout(res, 150));
-      }
-      if (ingestAbortRef.current) { trace[i].status = "stopped"; sync(); break; }
       trace[i].status = "reading"; sync();
       try {
+        // Phase A — mechanical extraction into a draft.
+        const extraction = extractClause(passages[i], i, titles, corefStack);
+        const { events, llmTasks } = clauseToEvents(extraction, knownEntities);
+        for (const e of events) e.clauseIndex = i;
+
+        // Phase B — one small classification call for this passage's draft.
+        let finalEvents;
+        if (llmTasks.length && !ingestAbortRef.current) {
+          let results = [];
+          try {
+            const out = await bgChat(model, [
+              { role: "system", content: REVIEW_SYSTEM },
+              { role: "user", content: buildReviewPrompt(llmTasks) },
+            ], REVIEW_SCHEMA);
+            results = parseReview(out);
+          } catch { /* review failed — apply the mechanical draft as-is */ }
+          finalEvents = mergeReviewResults(events, llmTasks, results);
+        } else {
+          finalEvents = mergeReviewResults(events, [], []);
+        }
+
+        // Fallback — a content passage the mechanical pass found nothing in
+        // gets a full LLM INGEST call, so no content is silently dropped.
+        if (shouldFallback(passages[i], classes[i], extraction) && !ingestAbortRef.current) {
+          store.setScope(convoId);
+          const register = buildRegister();
+          const out = await bgChat(model, [
+            { role: "system", content: INGEST_SYSTEM },
+            { role: "user", content: `${register}\n\nPASSAGE:\n${passages[i]}` },
+          ], EVENT_SCHEMA);
+          finalEvents.push(...parseEvents(out));
+        }
+
         const givenId = givenIds[i] || logPassage(passages[i], docId, i, { title }).id;
+        const spanVecs = await store.embedDefSpans(finalEvents);
         store.setScope(convoId);
-        const register = buildRegister();
-        const ctx = chromeContext[i] || [];
-        const passageText = ctx.length
-          ? `Context: ${ctx.join(" ")}\n\nPassage: "${passages[i]}"`
-          : passages[i];
-        walkInFlightRef.current = chatOnce(model, [
-          { role: "system", content: INGEST_SYSTEM },
-          { role: "user", content: `${register}\n\nPASSAGE:\n${passageText}` },
-        ], EVENT_SCHEMA);
-        let out;
-        try { out = await walkInFlightRef.current; }
-        finally { walkInFlightRef.current = null; }
-        const events = parseEvents(out);
-        const spanVecs = await store.embedDefSpans(events);
-        // Sync apply block.
-        store.setScope(convoId);
-        const res = store.applyEvents(events, givenId, spanVecs);
+        const res = store.applyEvents(finalEvents, givenId, spanVecs);
         for (const id of res.touched) docTouched.add(id);
         trace[i].applied = res.applied;
         trace[i].ambigs = res.ambigs;
         allAmbigs.push(...res.ambigs);
-        trace[i].rawOutput = typeof out === "string" ? out : JSON.stringify(out);
-        trace[i].ops = events;
+        trace[i].ops = finalEvents;
         trace[i].status = "done";
-        logEvent("info", "ingest", `Passage ${i + 1} read`, `+${res.applied} ops`,
-          events.map(formatOp));
+        logEvent("info", "ingest", `Passage ${i + 1} read`,
+          `+${res.applied} ops · ${llmTasks.length} classified`, finalEvents.map(formatOp));
       } catch (e) {
         trace[i].status = "error";
         trace[i].rawOutput = String(e?.message || e);
