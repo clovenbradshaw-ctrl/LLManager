@@ -10,14 +10,18 @@
 
 import { getBrowserEngine } from "./webllm.js";
 
-/* ── Preferred models by task, in priority order ── */
+/* ── Preferred models by task, in priority order ──
+
+   qwen3:30b-a3b leads every task: a 30B MoE with only 3.3B active per token,
+   so it is fast enough for chat and strong enough for extraction. One model
+   for everything means no swaps and no GPU contention between tasks. */
 const TASK_PREFERENCES = {
-  ingest: ["qwen3.5:9b", "qwen3:8b", "qwen2.5:7b", "mistral", "llama3.1:8b", "gemma2:9b"],
-  extract: ["qwen3.5:9b", "qwen3:8b", "qwen2.5:7b", "mistral", "llama3.1:8b"],
-  read: ["qwen3.5:4b", "qwen3:4b", "gemma2:2b", "qwen3:8b", "phi3:mini", "llama3.2:3b"],
-  hypothesis: ["qwen3.5:4b", "qwen3:4b", "gemma2:2b", "qwen3:8b"],
-  mutate: ["qwen3:8b", "qwen3.5:9b", "deepseek-r1:8b", "qwen2.5:7b", "llama3.1:8b"],
-  write: ["qwen3:8b", "qwen3.5:9b", "llama3.1:8b", "gemma2:9b", "mistral"],
+  ingest: ["qwen3:30b-a3b", "qwen3.5:9b", "qwen3:8b", "qwen2.5:7b", "mistral", "llama3.1:8b", "gemma2:9b"],
+  extract: ["qwen3:30b-a3b", "qwen3.5:9b", "qwen3:8b", "qwen2.5:7b", "mistral", "llama3.1:8b"],
+  read: ["qwen3:30b-a3b", "qwen3.5:4b", "qwen3:4b", "gemma2:2b", "qwen3:8b", "phi3:mini", "llama3.2:3b"],
+  hypothesis: ["qwen3:30b-a3b", "qwen3.5:4b", "qwen3:4b", "gemma2:2b", "qwen3:8b"],
+  mutate: ["qwen3:30b-a3b", "qwen3:8b", "qwen3.5:9b", "deepseek-r1:8b", "qwen2.5:7b", "llama3.1:8b"],
+  write: ["qwen3:30b-a3b", "qwen3:8b", "qwen3.5:9b", "llama3.1:8b", "gemma2:9b", "mistral"],
 };
 
 /* ── WebGPU (MLC) equivalents — one model for all tasks ── */

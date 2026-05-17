@@ -35,6 +35,9 @@ If the material covers the question, answer from it.
 If it only partly covers it, say what you can see and what is still being read.
 If it doesn't cover it at all, just answer normally.
 
+When the user asks what the material says or what you have, give a summary
+of the key points — not just "yes" or a one-liner.
+
 Never quote tags, hashes, or format markers back to the user.
 Never narrate your process. Just answer the question.`;
 
@@ -62,6 +65,14 @@ Rules:
 - A DEF is a fact. An EVA is a judgment (does a claim hold, fail, or is contested?).
 - Skip greetings, filler, restatements of existing context.
 - Entity names: lowercase-hyphenated for new canonical names.
+
+EVA status meanings:
+  "holds"     = the text SUPPORTS this claim (it happened, it's true)
+  "fails"     = the text CONTRADICTS this claim (it didn't happen, it's false)
+  "contested" = the text presents conflicting evidence
+
+EVA is about whether the CLAIM holds, not whether the EVENT is good or bad.
+A death is tragic but the claim that it occurred HOLDS.
 
 Terrains: Entity, Network, Paradigm, Void, Kind, Field, Link, Atmosphere, Lens`;
 
@@ -128,9 +139,47 @@ Rules:
 - INS only mints identity + terrain. All attributes go in DEF, including kind.
 - Extract ALL entities, connections, claims. Multiple events per passage is normal.
 - Rhetoric IS data. Author judgments are EVA events.
+
+Coreference rules:
+- Pronouns (he, she, they, his, her, their, it) are NOT entities. They
+  refer to entities already in the register. Use the register hash.
+- Possessive phrases ("his mother", "his oldest brother") refer to a
+  RELATIONSHIP, not a new entity. Create a CON edge to the known entity,
+  or a DEF on the known entity.
+  Example: "his mother died of cancer" with register showing
+  e_c002f85f (Martin Short) →
+  {"op":"DEF","entity":"e_c002f85f","field":"mother_death","value":"cancer","span":"his mother died of cancer"}
+  NOT: {"op":"INS","entity":"his mother","terrain":"Entity"}
+- Temporal phrases ("five years later", "three years after that", "at 20")
+  are NOT entities. They are context for DEFs on existing entities. Include
+  the temporal info in the DEF value.
+  Example: "Five years later, his mother died of cancer" →
+  {"op":"DEF","entity":"e_c002f85f","field":"mother_death","value":"cancer, ~5 years after brother's death","span":"Five years later, his mother died of cancer"}
+- Surname-only references ("Short") resolve to the most recently mentioned
+  entity with that surname in the register. Do NOT create a new entity.
+- "he says" / "she says" — the speaker is the subject of the passage or the
+  most recent named person. Reference by hash.
+
+EVA status meanings:
+  "holds"     = the text SUPPORTS this claim (it happened, it's true)
+  "fails"     = the text CONTRADICTS this claim (it didn't happen, it's false)
+  "contested" = the text presents conflicting evidence
+EVA is about whether the CLAIM holds, not whether the EVENT is good or bad.
+A death is tragic but the claim that it occurred HOLDS.
+
+AMBIG rules:
 - If a name might refer to an existing entity but you are uncertain, flag it:
   {"op":"AMBIG","name":"<name>","candidate":"<hash>","span":"<exact words>"}
   The system will trigger a MUTATE call to resolve it.
+- "candidate" must be a SINGLE entity hash from the register, not a list.
+  Pick the most likely match.
+- If no entity in the register is a plausible match, do NOT emit AMBIG.
+  Just INS a new entity.
+- AMBIG means: "this name MIGHT be the same as this specific entity but I'm
+  not sure." It does NOT mean "I don't know which entity this could be out
+  of all of them."
+  Good:  {"op":"AMBIG","name":"his mother","candidate":"e_c002f85f","span":"his mother died"}
+  Bad:   {"op":"AMBIG","name":"his mother","candidate":"e_a|e_b|e_c|e_d"}
 
 Terrains: Entity, Network, Paradigm, Void, Kind, Field, Link, Atmosphere, Lens`;
 
@@ -273,6 +322,112 @@ export function splitPassages(text) {
   return splitSentences(text).flatMap(s => splitClauses(s));
 }
 
+/* ═══ Chrome detection — rhetorical scaffolding with no extractable content ═══
+
+   Chrome is transitions, attributions, narrative framing and filler. It
+   carries no entities or claims of its own, so it is stored (for narrative
+   context) but skipped by the LLM walk. Mechanical — no model call. */
+const CHROME_PATTERNS = [
+  /^in the (film|book|article|interview|documentary|piece|story)/i,
+  /^(he|she|they|it) (said|says|added|noted|explained|responded|replied|continued|recalled)/i,
+  /^(according to|as .+ (said|noted|put it))/i,
+  /^(meanwhile|however|nonetheless|in contrast|on the other hand)/i,
+  /^(this|that|it) (is|was|would be|has been) (a|an|the)\b/i,
+];
+
+export function classifyPassage(text, index, totalPassages) {
+  const t = String(text || "").trim();
+  const words = t ? t.split(/\s+/).length : 0;
+  const hasQuotedSpeech = /["“”‘’]/.test(t);
+  const hasProperNoun = /[A-Z][a-z]{2,}/.test(t);
+  const hasNumber = /\d/.test(t);
+
+  const isChromePattern = CHROME_PATTERNS.some(p => p.test(t));
+  const isShort = words < 15;
+  const lacksContent = !hasProperNoun && !hasNumber;
+
+  if (isChromePattern && isShort && lacksContent) {
+    return { type: "chrome", confidence: "high" };
+  }
+  if (isChromePattern && !hasQuotedSpeech) {
+    return { type: "chrome", confidence: "medium" };
+  }
+  if (isShort && lacksContent && !hasQuotedSpeech) {
+    return { type: "chrome", confidence: "low" };
+  }
+  return { type: "content", confidence: "high" };
+}
+
+/* Chrome passages are skipped by the walk, but their temporal/narrative
+   information should attach to the nearest content passage (next preferred,
+   previous as fallback). Returns an array of arrays: ctx[i] = chrome texts
+   to prepend when walking content passage i. */
+export function attachChromeContext(passages, classes) {
+  const ctx = passages.map(() => []);
+  for (let i = 0; i < passages.length; i++) {
+    if (classes[i]?.type !== "chrome") continue;
+    let target = -1;
+    for (let j = i + 1; j < passages.length; j++) {
+      if (classes[j]?.type === "content") { target = j; break; }
+    }
+    if (target === -1) {
+      for (let j = i - 1; j >= 0; j--) {
+        if (classes[j]?.type === "content") { target = j; break; }
+      }
+    }
+    if (target !== -1) ctx[target].push(passages[i]);
+  }
+  return ctx;
+}
+
+/* ═══ The Gate — is a chat message knowledge-bearing? ═══
+
+   Meta-conversation about the app ("i put instructions in there", "try now")
+   and casual chatter carry no knowledge. They must skip EXTRACT, so the walk
+   never mints entities for filler. Mechanical — no model call. */
+const META_PATTERNS = [
+  /^(i|we) (put|added|uploaded|pasted|imported|gave|sent)/i,
+  /^(try|check|look|see) (now|again|this|that|it)/i,
+  /^(do|did|can|could|will) you (have|see|find|remember|get|know)/i,
+  /^what('s| is| are) in (the|my|our|that|this)/i,
+  /^(yes|no|ok|okay|sure|thanks|thank you|hello|hi|hey|yep|nope|cool|nice|great)\b/i,
+];
+
+export function gateClassify(message) {
+  const text = String(message || "").trim();
+  const lower = text.toLowerCase();
+
+  if (META_PATTERNS.some(p => p.test(lower))) {
+    return { knowledgeBearing: false, intent: "meta" };
+  }
+
+  const words = text ? text.split(/\s+/).length : 0;
+  const hasProperNoun = /[A-Z][a-z]{2,}/.test(text);
+  if (words < 6 && !hasProperNoun) {
+    return { knowledgeBearing: false, intent: "casual" };
+  }
+
+  return { knowledgeBearing: true, intent: "query" };
+}
+
+/* ═══ Follow-up reference resolution ═══
+
+   "what's it say?" has zero keyword overlap with "Martin Short". When the
+   message is a follow-up reference, fall back to the entities that were
+   active last turn so the Reach still finds context. */
+const FOLLOWUP_REFS = [
+  "it", "that", "this", "the article", "the doc", "the document",
+  "the stuff", "the text", "the file", "the piece", "the story",
+];
+
+export function resolveFollowUpReferences(message, position) {
+  const lower = String(message || "").toLowerCase();
+  const isFollowUp = FOLLOWUP_REFS.some(p =>
+    new RegExp(`\\b${p.replace(/\s+/g, "\\s+")}\\b`).test(lower));
+  if (isFollowUp && position?.entities?.length > 0) return position.entities;
+  return null;
+}
+
 /* ═══ The Signal — mechanical NER + keywords (SIG: candidates only) ═══ */
 
 const COMMON_CAPS = new Set([
@@ -338,7 +493,7 @@ export function signal(message) {
 
 const STATUS_WEIGHT = { walked: 1.0, walking: 0.85, sig: 0.6 };
 
-export async function retrieve(query, { topK = 6 } = {}) {
+export async function retrieve(query, { topK = 6, position = null } = {}) {
   const myScope = store.getScope();
   const sig = signal(query);
   const queryEntities = sig.ner.names.map(n => n.toLowerCase());
@@ -390,6 +545,21 @@ export async function retrieve(query, { topK = 6 } = {}) {
         type: "passage", id: row.id, status: "sig", text: row.text,
         passageIndex: row.passageIdx, documentId: row.documentId,
         ner: pSig.ner.names, score,
+      });
+    }
+  }
+
+  // ── Follow-up references — "what's it say?" carries no keyword signal.
+  // Pull in the entities that were active last turn so CTX is never empty.
+  const followUp = resolveFollowUpReferences(query, position);
+  if (followUp) {
+    for (const eid of followUp) {
+      if (results.some(r => r.type === "entity" && r.id === eid)) continue;
+      const entity = store.entities.get(eid);
+      if (!entity) continue;
+      results.push({
+        type: "entity", id: entity.id, status: entity.status,
+        canonical: entity.canonical, ner: [entity.canonical], score: 0.5,
       });
     }
   }
