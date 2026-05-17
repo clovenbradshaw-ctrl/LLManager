@@ -440,9 +440,8 @@ export const vectors = {
      structure has replaced. The centroid is the compressed memory of every
      context the entity appeared in; it absorbs each clause in real time and
      never needs the individual vectors back. */
-  async addClause(id, entityId, text) {
-    const vec = await embed(text);
-    if (!entityId) return vec;
+  foldClause(entityId, vec) {
+    if (!entityId) return;
     const existing = db.selectObject(
       "SELECT vector, clause_count FROM vec_centroids WHERE scope=? AND entity_id=?", [scope, entityId]);
     if (existing) {
@@ -459,6 +458,10 @@ export const vectors = {
         bind: [scope, entityId, toBlob(vec), 1, Date.now()],
       });
     }
+  },
+  async addClause(id, entityId, text) {
+    const vec = await embed(text);
+    vectors.foldClause(entityId, vec);
     return vec;
   },
   /* A Given-Log clause — chat history or an unwalked document. No graph
@@ -537,24 +540,39 @@ export const vectors = {
   },
 };
 
-/* ── Hashing ── */
+/* ── Hashing ── sync content hashing, so id minting and state versions do
+   not introduce awaits into the apply path (which would let the active
+   scope change mid-write). 64 hex chars mixed from seeded FNV-1a passes. */
 
-export async function mintHash(input) {
-  const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(input));
-  return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, "0")).join("").slice(0, 8);
+function fnv(str, seed) {
+  let h = seed >>> 0;
+  const s = String(str || "");
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = (h + ((h << 1) + (h << 4) + (h << 7) + (h << 8) + (h << 24))) >>> 0;
+  }
+  return h >>> 0;
 }
-export async function mintEntityId(canonical) {
-  return "e_" + await mintHash(`${String(canonical).toLowerCase().trim()}::${Date.now()}::${Math.random()}`);
+export function sha256hex(str) {
+  const seeds = [0x811c9dc5, 0x01000193, 0x9e3779b9, 0x85ebca6b,
+                 0xc2b2ae35, 0x27d4eb2f, 0x165667b1, 0xff51afd7];
+  let out = "";
+  for (let i = 0; i < seeds.length; i++) out += fnv(str + "#" + i, seeds[i]).toString(16).padStart(8, "0");
+  return out;
 }
-export async function mintGivenId(agent, text) {
-  return "g_" + await mintHash(`${agent}::${String(text).slice(0, 100)}::${Date.now()}::${Math.random()}`);
+export function mintHash(input) { return sha256hex(input).slice(0, 8); }
+export function mintEntityId(canonical) {
+  return "e_" + mintHash(`${String(canonical).toLowerCase().trim()}::${Date.now()}::${Math.random()}`);
 }
-export async function computeStateHash(entityId) {
+export function mintGivenId(agent, text) {
+  return "g_" + mintHash(`${agent}::${String(text).slice(0, 100)}::${Date.now()}::${Math.random()}`);
+}
+export function computeStateHash(entityId) {
   const e = entities.get(entityId);
   if (!e) return "0000";
   const d = defs.getFor(entityId).map(x => `${x.field}=${x.value}`).sort();
   const eg = edges.getFor(entityId).map(x => `${x.type}→${x.to_id}`).sort();
-  return (await mintHash([entityId, e.terrain, e.hypothesis || "", ...d, ...eg].join("|"))).slice(0, 4);
+  return sha256hex([entityId, e.terrain, e.hypothesis || "", ...d, ...eg].join("|")).slice(0, 4);
 }
 
 /* ── Apply events (from EXTRACT or INGEST) ── */
@@ -568,14 +586,23 @@ function resolveId(ref, events) {
   return matches.length ? matches[0].id : null;
 }
 
-export async function applyEvents(events, sourceGivenId = null, passageIndex = null) {
+export async function applyEvents(events, sourceGivenId = null) {
+  // Phase 1 (async): embed every DEF span up front.
+  const spanVecs = [];
+  for (let i = 0; i < events.length; i++) {
+    const e = events[i];
+    if (e.op === "DEF" && e.span && e.span.length > 10) spanVecs[i] = await embed(e.span);
+  }
+  // Phase 2 (sync): apply every event — no await, so the active scope
+  // cannot change between writes.
   const results = { applied: 0, skipped: 0, ambigs: [], newEntities: [] };
-  for (const evt of events) {
+  events.forEach((evt, i) => {
     const now = Date.now();
     if (evt.op === "INS") {
-      const existing = entities.search(evt.entity).find(m => m.canonical.toLowerCase() === String(evt.entity).toLowerCase());
-      if (existing) { evt._resolvedId = existing.id; results.applied++; continue; }
-      const id = await mintEntityId(evt.entity);
+      const existing = entities.search(evt.entity)
+        .find(m => m.canonical.toLowerCase() === String(evt.entity).toLowerCase());
+      if (existing) { evt._resolvedId = existing.id; results.applied++; return; }
+      const id = mintEntityId(evt.entity);
       entities.create(id, evt.entity, evt.terrain || "Entity");
       evt._resolvedId = id;
       results.newEntities.push(id);
@@ -590,18 +617,18 @@ export async function applyEvents(events, sourceGivenId = null, passageIndex = n
         const prior = defs.get(eid, evt.field);
         const conflict = prior && prior.value !== String(evt.value) && evt.field !== "kind";
         if (prior && !conflict) defs.retire(prior.id);
-        const defId = "d_" + await mintHash(`${eid}::${evt.field}::${now}::${Math.random()}`);
+        const defId = "d_" + mintHash(`${eid}::${evt.field}::${now}::${Math.random()}`);
         defs.write(defId, eid, evt.field, evt.value, {
           span: evt.span || null, source: sourceGivenId || evt.source || null,
           supersedes: prior ? prior.id : null,
         });
-        if (evt.span && evt.span.length > 10) await vectors.addClause(defId, eid, evt.span);
+        if (spanVecs[i]) vectors.foldClause(eid, spanVecs[i]);
         results.applied++;
       } else results.skipped++;
     } else if (evt.op === "EVA") {
       const eid = resolveId(evt.entity, events);
       if (eid && evt.claim) {
-        const evalId = "v_" + await mintHash(`${eid}::${evt.claim}::${now}::${Math.random()}`);
+        const evalId = "v_" + mintHash(`${eid}::${evt.claim}::${now}::${Math.random()}`);
         evals.write(evalId, eid, evt.claim, evt.status || "holds", {
           span: evt.span || null, source: sourceGivenId || evt.source || null,
         });
@@ -611,7 +638,7 @@ export async function applyEvents(events, sourceGivenId = null, passageIndex = n
       results.ambigs.push({ name: evt.name, candidateHash: evt.candidate, span: evt.span });
       results.skipped++;
     }
-  }
+  });
   return results;
 }
 
