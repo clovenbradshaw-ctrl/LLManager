@@ -126,6 +126,8 @@ async function callOllama(assignment, systemPrompt, userPrompt, options) {
       { role: "user", content: userPrompt },
     ],
     stream: false,
+    // Hold the model resident so consecutive task calls skip the cold reload.
+    keep_alive: "30m",
     options: {
       temperature: options.temperature ?? 0.7,
       num_ctx: options.numCtx ?? 4096,
