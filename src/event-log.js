@@ -19,8 +19,11 @@ const subscribers = new Set();
 const notify = () => { for (const fn of subscribers) fn(events); };
 
 /* level: "info" | "ok" | "warn" | "error"
-   source: short tag for where it came from ("ingest", "chat", "model", …) */
-export function logEvent(level, source, message, detail) {
+   source: short tag for where it came from ("ingest", "chat", "model", …)
+   lines: optional array of strings — expandable detail rendered verbatim,
+          used to carry EO operator notation (the ops a step applied) and
+          the facts recalled/learned on a memory turn. */
+export function logEvent(level, source, message, detail, lines) {
   const event = {
     id: `e${++seq}`,
     ts: Date.now(),
@@ -28,6 +31,7 @@ export function logEvent(level, source, message, detail) {
     source: source || "app",
     message: String(message ?? ""),
     detail: detail == null ? "" : String(detail),
+    lines: Array.isArray(lines) && lines.length ? lines.map(String) : null,
   };
   events = events.concat(event).slice(-MAX_EVENTS);
   notify();
