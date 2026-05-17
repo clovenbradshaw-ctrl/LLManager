@@ -10,11 +10,11 @@ import {
 } from "./router.js";
 import {
   READ_SYSTEM, INGEST_SYSTEM, EXTRACT_SYSTEM, MUTATE_SYSTEM,
-  splitSentences, batchSentences,
-  signal, reach, buildDossier, buildPosition, buildRegister,
+  INTERVALS, splitSentences, batchSentences,
+  signal, reach, firstPass, buildDossier, buildPosition, buildRegister,
   collectSpans, dossierHashOf, logUserMessage, logModelResponse, logPassage,
-  buildExtractPrompt, buildMutatePrompt, parseEvents,
-  detectMutationTriggers, userCorrectionTrigger, parseMutate, applyMutation, commitTier,
+  buildExtractPrompt, buildMutatePrompt, buildHypothesisPrompt, getHypothesisSystemPrompt,
+  parseEvents, detectMutationTriggers, userCorrectionTrigger, parseMutate, applyMutation, commitTier,
 } from "./memory.js";
 import * as store from "./local-store.js";
 import { EVENT_SCHEMA, MUTATE_SCHEMA } from "./model-router.js";
@@ -1166,6 +1166,47 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
     return null;
   };
 
+  /* Generate (or revise) a hypothesis at one level of the hierarchy. A
+     prose model call — strict nesting: each level sees only the level below
+     plus its own revision history. */
+  const runHypothesis = async (convoId, level, targetId, model) => {
+    try {
+      store.setScope(convoId);
+      const prompt = buildHypothesisPrompt(level, targetId);
+      if (!prompt.trim()) return;
+      const out = await chatOnce(model, [
+        { role: "system", content: getHypothesisSystemPrompt(level) },
+        { role: "user", content: prompt },
+      ]);
+      const text = String(out || "").trim().split("\n")[0].replace(/^["']|["']$/g, "").slice(0, 240);
+      if (!text) return;
+      store.setScope(convoId);
+      const key = typeof targetId === "string" ? targetId
+        : (targetId?.documentId || (targetId?.start != null ? `${targetId.start}-${targetId.end}` : "_"));
+      const hist = store.hypotheses.getHistory(level, key);
+      store.hypotheses.write(level, key, text, {
+        afterLabel: new Date().toISOString().slice(0, 16).replace("T", " "),
+        inputCount: hist.length + 1,
+      });
+    } catch { /* hypothesis is best-effort */ }
+  };
+
+  /* After a walk, pick the touched entities that need a (re-)hypothesis:
+     those with none yet, or whose centroid has drifted past 0.15 since the
+     last revision. Capped so a turn fires only a few background calls. */
+  const hypothesizeEntities = async (convoId, touched, model, cap = 3) => {
+    store.setScope(convoId);
+    const due = (touched || []).filter(id => {
+      const e = store.entities.get(id);
+      if (!e) return false;
+      if (!e.hypothesis) return true;
+      const last = store.hypotheses.getCurrent("entity", id);
+      return store.vectors.driftSince(id, last?.created_at || 0).total > 0.15;
+    }).slice(0, cap);
+    for (const id of due) await runHypothesis(convoId, "entity", id, model);
+    return due.length;
+  };
+
   /* The MUTATE call — background, fired only when a mechanical trigger flags
      an ambiguity. Produces exactly one action. FORK/MERGE/CORRECT/RECLASSIFY
      are logged as pending mutations needing user consent (auto-commit tier
@@ -1197,6 +1238,10 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
      graph as INS/CON/DEF/EVA events. Both messages are appended to the
      Given-Log; mechanical triggers then fire a MUTATE call per ambiguity. */
   const runExtract = async (convoId, msgId, userGiven, modelGiven, model, memCtx) => {
+    // First pass — mechanical NER mints SIG entities for the user's message
+    // before the model walk reaches them.
+    try { store.setScope(convoId); await firstPass(userGiven.text); } catch { /* optional */ }
+
     let events = [];
     try {
       store.setScope(convoId);
@@ -1221,6 +1266,8 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
     store.given.write(modelGiven);
     if (userVec) store.vectors.writeUnwalked(userGiven.id, userVec);
     const res = store.applyEvents(events, userGiven.id, spanVecs);
+    // The turn's exchange is now read — its entities are grounded.
+    store.entities.markWalked(res.touched);
     const triggers = detectMutationTriggers(modelGiven.text, events, memCtx.sig);
     const corr = userCorrectionTrigger(userGiven.text, prevEntities);
     if (corr) triggers.push(corr);
@@ -1232,6 +1279,9 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
     };
     setConvos(prev => prev.map(c => c.id === convoId ? { ...c, lastTurn } : c));
     patchMsg(convoId, msgId, m => ({ mem: { ...(m.mem || {}), learned: res.applied } }));
+    bumpDb();
+    // Re-hypothesise entities the turn moved, then resolve any ambiguities.
+    await hypothesizeEntities(convoId, res.touched, model);
     bumpDb();
     for (const t of triggers) await runMutate(convoId, msgId, t, model);
   };
@@ -1276,10 +1326,14 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
 
     // The document is walked into the chat's own graph scope.
     const allAmbigs = [];
+    const docTouched = new Set();
     for (let i = 0; i < passages.length; i++) {
       trace[i].status = "reading"; sync();
       try {
         const passageGiven = logPassage(passages[i], docId, i, { title });
+        // First pass — mechanical NER mints SIG entities before the walk.
+        store.setScope(convoId);
+        await firstPass(passages[i]);
         store.setScope(convoId);
         const register = buildRegister();
         const out = await chatOnce(model, [
@@ -1292,6 +1346,7 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
         store.setScope(convoId);
         store.given.write(passageGiven);
         const res = store.applyEvents(events, passageGiven.id, spanVecs);
+        for (const id of res.touched) docTouched.add(id);
         trace[i].applied = res.applied;
         trace[i].ambigs = res.ambigs;
         allAmbigs.push(...res.ambigs);
@@ -1301,6 +1356,13 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
       } catch (e) {
         trace[i].status = "error";
         trace[i].rawOutput = String(e?.message || e);
+      }
+      // Roll up group and section hypotheses at the configured intervals.
+      if ((i + 1) % INTERVALS.GROUP_HYPOTHESIS === 0) {
+        await runHypothesis(convoId, "group", { start: i - INTERVALS.GROUP_HYPOTHESIS + 1, end: i }, model);
+      }
+      if ((i + 1) % INTERVALS.SECTION_HYPOTHESIS === 0) {
+        await runHypothesis(convoId, "section", { start: i - INTERVALS.SECTION_HYPOTHESIS + 1, end: i }, model);
       }
       sync();
     }
@@ -1327,6 +1389,14 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
         }
       } catch { /* fail silently — the document was still read */ }
     }
+
+    // The document is fully read — ground its entities, drop the unwalked
+    // scaffolding, hypothesise the entities it moved, roll up the document.
+    store.setScope(convoId);
+    store.entities.markWalked([...docTouched]);
+    store.vectors.pruneWalked(docId);
+    await hypothesizeEntities(convoId, [...docTouched], model, 8);
+    await runHypothesis(convoId, "document", { documentId: docId }, model);
 
     const learned = trace.reduce((n, t) => n + (t.applied || 0), 0);
     const doc = {

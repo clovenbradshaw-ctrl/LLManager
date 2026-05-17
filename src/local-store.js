@@ -49,6 +49,13 @@ export async function init() {
     persistent = false;
   }
   db.exec(SCHEMA);
+  // Idempotent migrations for databases created before a column existed.
+  for (const alter of [
+    "ALTER TABLE entities ADD COLUMN status TEXT NOT NULL DEFAULT 'sig'",
+    "ALTER TABLE defs ADD COLUMN drift REAL",
+  ]) {
+    try { db.exec(alter); } catch { /* column already exists */ }
+  }
   return { db, persistent };
 }
 
@@ -91,6 +98,7 @@ const SCHEMA = `
     hypothesis  TEXT,
     aliases     TEXT DEFAULT '[]',
     forked_from TEXT,
+    status      TEXT NOT NULL DEFAULT 'sig',  -- sig | walking | walked
     created_at  INTEGER NOT NULL,
     updated_at  INTEGER NOT NULL,
     PRIMARY KEY (scope, id)
@@ -243,16 +251,28 @@ export const entities = {
     return db.selectObjects("SELECT * FROM entities WHERE scope=? ORDER BY created_at", [scope])
       .map(r => ({ ...r, aliases: JSON.parse(r.aliases || "[]") }));
   },
-  create(id, canonical, terrain, { hypothesis = null, aliases = [], forkedFrom = null } = {}) {
+  create(id, canonical, terrain, { hypothesis = null, aliases = [], forkedFrom = null, status = "sig" } = {}) {
     const now = Date.now();
     db.exec({
-      sql: `INSERT OR REPLACE INTO entities (scope,id,canonical,terrain,hypothesis,aliases,forked_from,created_at,updated_at)
-            VALUES (?,?,?,?,?,?,?,?,?)`,
-      bind: [scope, id, canonical, terrain, hypothesis, JSON.stringify(aliases), forkedFrom, now, now],
+      sql: `INSERT OR REPLACE INTO entities (scope,id,canonical,terrain,hypothesis,aliases,forked_from,status,created_at,updated_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?)`,
+      bind: [scope, id, canonical, terrain, hypothesis, JSON.stringify(aliases), forkedFrom, status, now, now],
     });
   },
   updateHypothesis(id, text) {
     db.exec({ sql: "UPDATE entities SET hypothesis=?, updated_at=? WHERE scope=? AND id=?", bind: [text, Date.now(), scope, id] });
+  },
+  /* Epistemic register: 'sig' (NER impression) → 'walking' (partial walk)
+     → 'walked' (grounded, provenanced). Never downgrades. */
+  setStatus(id, status) {
+    const e = entities.get(id);
+    if (!e) return;
+    const rank = { sig: 0, walking: 1, walked: 2 };
+    if ((rank[status] ?? 0) < (rank[e.status] ?? 0)) return;
+    db.exec({ sql: "UPDATE entities SET status=?, updated_at=? WHERE scope=? AND id=?", bind: [status, Date.now(), scope, id] });
+  },
+  markWalked(ids) {
+    for (const id of ids || []) entities.setStatus(id, "walked");
   },
   updateTerrain(id, terrain) {
     db.exec({ sql: "UPDATE entities SET terrain=?, updated_at=? WHERE scope=? AND id=?", bind: [terrain, Date.now(), scope, id] });
@@ -628,25 +648,38 @@ export async function embedDefSpans(events) {
    the precomputed DEF-span vectors, so no await sits between setScope and
    the writes and the active scope cannot change mid-apply. */
 export function applyEvents(events, sourceGivenId = null, spanVecs = []) {
-  const results = { applied: 0, skipped: 0, ambigs: [], newEntities: [], ruptures: [] };
+  const results = { applied: 0, skipped: 0, ambigs: [], newEntities: [], ruptures: [], touched: [] };
+  const touch = (id) => { if (id && !results.touched.includes(id)) results.touched.push(id); };
   events.forEach((evt, i) => {
     const now = Date.now();
     if (evt.op === "INS") {
       const existing = entities.search(evt.entity)
         .find(m => m.canonical.toLowerCase() === String(evt.entity).toLowerCase());
-      if (existing) { evt._resolvedId = existing.id; results.applied++; return; }
+      if (existing) {
+        // An impression the walk has now reached — upgrade sig → walking.
+        if (existing.status === "sig") entities.setStatus(existing.id, "walking");
+        evt._resolvedId = existing.id;
+        touch(existing.id);
+        results.applied++;
+        return;
+      }
       const id = mintEntityId(evt.entity);
-      entities.create(id, evt.entity, evt.terrain || "Entity");
+      entities.create(id, evt.entity, evt.terrain || "Entity", { status: "walking" });
       evt._resolvedId = id;
       results.newEntities.push(id);
+      touch(id);
       results.applied++;
     } else if (evt.op === "CON") {
       const from = resolveId(evt.from, events), to = resolveId(evt.to, events);
-      if (from && to && from !== to) { edges.create(from, to, evt.type || "related to", sourceGivenId); results.applied++; }
-      else results.skipped++;
+      if (from && to && from !== to) {
+        edges.create(from, to, evt.type || "related to", sourceGivenId);
+        touch(from); touch(to);
+        results.applied++;
+      } else results.skipped++;
     } else if (evt.op === "DEF") {
       const eid = resolveId(evt.entity, events);
       if (eid && evt.field && evt.value != null) {
+        touch(eid);
         const prior = defs.get(eid, evt.field);
         const conflict = prior && prior.value !== String(evt.value) && evt.field !== "kind";
         if (prior && !conflict) defs.retire(prior.id);
@@ -666,6 +699,7 @@ export function applyEvents(events, sourceGivenId = null, spanVecs = []) {
     } else if (evt.op === "EVA") {
       const eid = resolveId(evt.entity, events);
       if (eid && evt.claim) {
+        touch(eid);
         const evalId = "v_" + mintHash(`${eid}::${evt.claim}::${now}::${Math.random()}`);
         evals.write(evalId, eid, evt.claim, evt.status || "holds", {
           span: evt.span || null, source: sourceGivenId || evt.source || null,

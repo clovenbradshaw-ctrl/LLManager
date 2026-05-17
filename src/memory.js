@@ -325,7 +325,12 @@ export function signal(message) {
    against entity centroids and hypothesis vectors. Mechanical NER/keyword
    matches and a 1-hop edge expansion are blended in. */
 
+/* Epistemic weight: a walked, provenanced entity outweighs a vibes-based
+   SIG match. Structure beats impression. */
+const STATUS_WEIGHT = { walked: 1.0, walking: 0.7, sig: 0.4 };
+
 export async function reach(sig, message) {
+  const myScope = store.getScope();
   const cand = new Map();
   const add = (id, s) => cand.set(id, (cand.get(id) || 0) + s);
 
@@ -344,15 +349,49 @@ export async function reach(sig, message) {
     for (const m of byHypothesis) add(m.entityId, m.similarity * 3);
   } catch { /* embedding model unavailable — mechanical signals stand */ }
 
+  store.setScope(myScope); // re-assert after the embed awaits
   for (const id of [...cand.keys()]) {
     for (const nid of store.edges.getNeighbors(id, 1)) if (!cand.has(nid)) add(nid, 0.5);
   }
 
+  // Weight each candidate by its epistemic register before ranking.
   return [...cand.entries()]
-    .sort((a, b) => b[1] - a[1])
+    .map(([id, raw]) => {
+      const entity = store.entities.get(id);
+      if (!entity) return null;
+      const score = raw * (STATUS_WEIGHT[entity.status] ?? 0.4);
+      return { entity, score };
+    })
+    .filter(Boolean)
+    .sort((a, b) => b.score - a.score)
     .slice(0, 6)
-    .map(([id, score]) => ({ entity: store.entities.get(id), tier: score >= 3 ? 1 : score >= 1 ? 2 : 3 }))
-    .filter(r => r.entity);
+    .map(r => ({ entity: r.entity, tier: r.score >= 3 ? 1 : r.score >= 1 ? 2 : 3 }));
+}
+
+/* The first pass — mechanical NER, no model. Mints SIG entities the instant
+   text arrives: an impression with a centroid but no provenance, weighted
+   low until a walk reaches it. Run on document passages and chat turns. */
+export async function firstPass(text) {
+  const myScope = store.getScope();
+  const sig = signal(text);
+  const newOnes = sig.ner.names.filter(n =>
+    n.length > 1 &&
+    !store.entities.search(n).some(m => m.canonical.toLowerCase() === n.toLowerCase()));
+  if (!newOnes.length) return { created: 0 };
+  let vec = null;
+  try { vec = await store.embed(String(text).slice(0, 500)); } catch { /* optional */ }
+  store.setScope(myScope); // re-assert before the sync writes
+  for (const name of newOnes) {
+    const id = store.mintEntityId(name);
+    store.entities.create(id, name, "Entity", { status: "sig" });
+    const kind = sig.ner.typed[name];
+    if (kind) {
+      const defId = "d_" + store.mintHash(`${id}::kind::${Date.now()}::${Math.random()}`);
+      store.defs.write(defId, id, "kind", kind, { source: "ner:firstpass" });
+    }
+    if (vec) store.vectors.foldClause(id, vec); // seeds the centroid, drift 1.0
+  }
+  return { created: newOnes.length };
 }
 
 /* ═══ The Dossier — projected [CTX] block ═══ */
@@ -362,12 +401,34 @@ export function buildDossier(rankedEntities, maxTokens = 350) {
   const blocks = [];
   for (const { entity, tier } of rankedEntities) {
     if (!entity) continue;
+    const status = entity.status || "sig";
+
+    // SIG — impressionistic only. NER found it; no walk, no provenance.
+    if (status === "sig") {
+      if (budget < 20) break;
+      blocks.push(`≈ ${entity.canonical} | ${entity.terrain} | UNREAD\n  (NER-detected, not yet read — impression only, low confidence)`);
+      budget -= 20;
+      continue;
+    }
+
     const stateHash = store.computeStateHash(entity.id);
     const edges = store.edges.getFor(entity.id);
     const defs = store.defs.getFor(entity.id);
     const conflicts = store.defs.getConflicts(entity.id);
     const aliases = entity.aliases?.length ? entity.aliases.join(", ") : null;
 
+    // WALKING — partial structure, still forming. Some claims, no hypothesis yet.
+    if (status === "walking") {
+      if (budget < 40) break;
+      let b = `E: ${entity.id}@${stateHash} | ${entity.terrain} | PARTIAL`;
+      b += `\n  ~ ${entity.canonical}`;
+      b += `\n  h: ${entity.hypothesis || "(forming)"}`;
+      for (const def of defs.slice(0, 2)) b += `\n  = ${def.field}: "${def.value}"`;
+      blocks.push(b); budget -= 40;
+      continue;
+    }
+
+    // WALKED — grounded, provenanced. Show everything.
     if (tier === 1 && budget >= 65) {
       let b = `E: ${entity.id}@${stateHash} | ${entity.terrain} | ${edges.length}`;
       b += `\n  ~ ${entity.canonical}${aliases ? ", aka " + aliases : ""}`;
