@@ -45,11 +45,13 @@ to match it:
     document not yet read closely — flag the answer as a first impression.
 When you are not working from a confident, grounded answer, say so plainly.
 
-[READING] is your running understanding of the documents being read — the
-synthesis formed so far, with how much of each document has been read. When
+[READING] is your running understanding of the documents being read. When
 the user asks what a document is about or what you have learned, answer from
 [READING]: give its understanding and the key threads, and state how much
 has been read. Do not just list raw passages back.
+A "skim" line is a first-pass guess from a glance — say so, and treat it as
+provisional. A "document" line is a synthesis from a full read — answer it
+with confidence.
 
 When the user asks what the material says or what you have, give a summary
 of the key points — not just "yes" or a one-liner.
@@ -449,17 +451,27 @@ export function resolveFollowUpReferences(message, position) {
   return null;
 }
 
-/* Zoom — how far out is this question pitched? A "what is this about" /
-   "what have you learned" / "summarise" question is zoomed OUT: it wants the
-   running understanding (document and section hypotheses), not a single
-   entity. A question naming a specific entity is zoomed IN. The default,
-   when a question names nothing in particular, is also zoomed out. */
-const ZOOM_OUT_RE = /\b(?:what(?:'s| is| are| have you)|tell me|give me|summar(?:y|ise|ize)|overview|gist|main (?:point|idea)|overall|so far|about (?:this|the)|the (?:document|article|doc|text|piece|story))\b/i;
+/* Zoom — how far out is this question pitched? The hypothesis hierarchy
+   (entity → group → section → document) is a stack of zoom levels; the
+   question selects which one to project into [READING]:
 
-export function isZoomedOut(message) {
-  const m = String(message || "");
-  if (ZOOM_OUT_RE.test(m)) return true;
-  return signal(m).ner.names.length === 0;
+     entity   — names an entity the graph knows; wants its facts (from [CTX])
+     group    — asks how things connect/relate; wants the threads
+     document — asks what something is overall about; wants the synthesis
+     section  — the default middle zoom
+
+   This is the availability function over the hypothesis hierarchy. */
+const ZOOM_THEME_RE = /\b(how|why|connects?|connection|relates?|related|relationship|themes?|patterns?|links?|tie|ties)\b/i;
+const ZOOM_OVERVIEW_RE = /\b(summar(?:y|ise|ize)|overview|gist|overall|tell me about|what have you learned|what(?:'s| is| are| is this|'s this)|main (?:point|idea))\b/i;
+
+export function selectZoom(message) {
+  const q = String(message || "");
+  const names = signal(q).ner.names;
+  if (names.some(n => store.entities.search(n).length > 0)) return "entity";
+  if (ZOOM_THEME_RE.test(q)) return "group";
+  if (ZOOM_OVERVIEW_RE.test(q) || /\bwhat\b[^?]*\b(about|says?|covers?|discuss|learned)\b/i.test(q))
+    return "document";
+  return "section";
 }
 
 /* ═══ The Signal — mechanical NER + keywords (SIG: candidates only) ═══ */
@@ -915,35 +927,50 @@ export function collectSpans(results) {
    this about" question wants — but the Reach only retrieves entities and raw
    passages, so they were never shown to the model.
 
-   This projects them at the zoom the question calls for. The document
-   hypothesis is the headline. A zoomed-out question gets the section
-   hypotheses (broad coverage of what has been read); a zoomed-in one gets
-   the finer group hypotheses. Every group/section hypothesis is written for
-   a completed passage range, so the set already covers exactly what the
-   reading cursor has reached. */
+   This projects them at the zoom the question calls for (see selectZoom).
+   The document hypothesis is the headline, marked honestly: a SKIM is the
+   first-pass guess from NER and embeddings before the walk; a walked
+   DOCUMENT hypothesis is situated understanding synthesised up through the
+   hierarchy. Every group/section hypothesis is written for a completed
+   passage range, so the set already covers exactly what the reading cursor
+   has reached. */
 export function buildReadingDigest(query = "") {
-  const docHyps = store.hypotheses.getByLevel("document");
   const sectionHyps = store.hypotheses.getByLevel("section");
   const groupHyps = store.hypotheses.getByLevel("group");
-  if (!docHyps.length && !sectionHyps.length && !groupHyps.length) return "";
-
-  const lines = [];
   const docs = store.documents.all();
+  if (!docs.length && !sectionHyps.length && !groupHyps.length) return "";
+
+  const zoom = selectZoom(query);
+  const lines = [];
+
+  // Per-document headline — title, reading cursor, and the document
+  // hypothesis marked as a skim guess or a walked synthesis.
   for (const d of docs) {
     const total = d.total || 0, walked = d.walked || 0;
-    if (!total) continue;
-    const pct = Math.round((walked / total) * 100);
-    lines.push(walked >= total
-      ? `${d.title || "document"} — fully read (${total} passages)`
-      : `${d.title || "document"} — ${pct}% read (${walked}/${total} passages)`);
+    const docHyp = store.hypotheses.getCurrent("document", d.id);
+    const fully = total > 0 && walked >= total;
+    const progress = !total ? ""
+      : fully ? ` — fully read (${total} passages)`
+      : ` — ${Math.round((walked / total) * 100)}% read (${walked}/${total} passages)`;
+    if (docHyp) {
+      const skim = docHyp.after_label === "skim" || !fully;
+      lines.push(skim
+        ? `skim of "${d.title || "document"}"${progress} — a first-pass guess, not yet fully read: "${docHyp.text}"`
+        : `document "${d.title || "document"}"${progress}: "${docHyp.text}"`);
+    } else if (total) {
+      lines.push(`"${d.title || "document"}"${progress} — no understanding formed yet`);
+    }
   }
-  for (const h of docHyps) lines.push(`understanding so far: "${h.text}"`);
 
-  const detail = isZoomedOut(query)
-    ? (sectionHyps.length ? sectionHyps : groupHyps)
-    : (groupHyps.length ? groupHyps : sectionHyps);
-  const label = (sectionHyps.length && isZoomedOut(query)) ? "section" : "part";
-  detail.slice(0, 10).forEach((h, i) => lines.push(`  ${label} ${i + 1}: "${h.text}"`));
+  // Detail layer at the selected zoom. An entity-zoom question is answered
+  // from [CTX]; the others get the threads (group) or sections.
+  if (zoom !== "entity") {
+    const detail = zoom === "group"
+      ? (groupHyps.length ? groupHyps : sectionHyps)
+      : (sectionHyps.length ? sectionHyps : groupHyps);
+    const label = detail === groupHyps ? "thread" : "section";
+    detail.slice(0, 10).forEach((h, i) => lines.push(`  ${label} ${i + 1}: "${h.text}"`));
+  }
 
   return lines.length ? `[READING]\n${lines.join("\n")}\n[/READING]` : "";
 }

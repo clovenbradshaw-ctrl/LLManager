@@ -1358,12 +1358,18 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
   const ingestAbortRef = useRef(false);
   const scrollRef = useRef(null);
   /* Foreground/background GPU arbitration. Ollama runs one request at a time,
-     so the document walk and a user response contend for it. walkPausedRef is
+     so the document walk, the background learning calls (EXTRACT, MUTATE,
+     HYPOTHESIS) and a user response all contend for it. walkPausedRef is
      raised while a foreground response is in flight; the walk loop yields on
      it. walkInFlightRef holds the walk's current passage call so a response
-     can wait it out rather than queue behind a fresh one. */
+     can wait it out rather than queue behind a fresh one.
+     foregroundBusyRef is raised around a user-facing READ; bgChat() yields on
+     it before every background call. bgInFlightRef holds the current
+     background call so a new user message can drain it before answering. */
   const walkPausedRef = useRef(false);
   const walkInFlightRef = useRef(null);
+  const foregroundBusyRef = useRef(false);
+  const bgInFlightRef = useRef(null);
 
   /* Open the SQLite store once, on mount. Route uncaught errors and
      console.error into the app event log so they surface in the Log tab. */
@@ -1641,6 +1647,18 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
     return j.message?.content || "";
   };
 
+  /* A background model call (EXTRACT, MUTATE, HYPOTHESIS). It yields the GPU
+     to any foreground response: it waits while a READ is in flight, and
+     registers itself in bgInFlightRef so a fresh user message can drain it
+     before answering. The walk is arbitrated separately by walkPausedRef. */
+  const bgChat = async (model, apiMessages, format) => {
+    while (foregroundBusyRef.current) await new Promise(res => setTimeout(res, 120));
+    const p = chatOnce(model, apiMessages, format);
+    bgInFlightRef.current = p;
+    try { return await p; }
+    finally { if (bgInFlightRef.current === p) bgInFlightRef.current = null; }
+  };
+
   /* Patch a single message inside a convo (patch may be an object or a fn) */
   const patchMsg = (convoId, msgId, patch) => {
     setConvos(prev => prev.map(c => c.id === convoId
@@ -1707,7 +1725,7 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
       store.setScope(convoId);
       const prompt = buildHypothesisPrompt(level, targetId);
       if (!prompt.trim()) return;
-      const out = await chatOnce(model, [
+      const out = await bgChat(model, [
         { role: "system", content: getHypothesisSystemPrompt(level) },
         { role: "user", content: prompt },
       ]);
@@ -1734,7 +1752,7 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
       if (!content.length) return;
       const prompt = buildSkimPrompt(content);
       if (!prompt.trim()) return;
-      const out = await chatOnce(model, [
+      const out = await bgChat(model, [
         { role: "system", content: HYPOTHESIS_SKIM },
         { role: "user", content: prompt },
       ]);
@@ -1772,7 +1790,7 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
     try {
       store.setScope(convoId);
       const prompt = buildMutatePrompt(trigger);
-      const out = await chatOnce(model, [
+      const out = await bgChat(model, [
         { role: "system", content: MUTATE_SYSTEM },
         { role: "user", content: prompt },
       ], MUTATE_SCHEMA);
@@ -1802,7 +1820,7 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
     try {
       store.setScope(convoId);
       const prompt = buildExtractPrompt(userGiven.text, modelGiven.text, userGiven.id, modelGiven.id);
-      const out = await chatOnce(model, [
+      const out = await bgChat(model, [
         { role: "system", content: EXTRACT_SYSTEM },
         { role: "user", content: prompt },
       ], EVENT_SCHEMA);
@@ -2338,13 +2356,23 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
     }));
 
     // The user is waiting — the response gets the GPU to itself. Pause the
-    // walk and let any passage call already running drain first.
+    // walk and drain any walk or background (EXTRACT/MUTATE/HYPOTHESIS) call
+    // already running before the response starts.
     walkPausedRef.current = true;
+    foregroundBusyRef.current = true;
     if (walkInFlightRef.current) {
       try { await walkInFlightRef.current; } catch { /* the walk owns its errors */ }
     }
+    if (bgInFlightRef.current) {
+      try { await bgInFlightRef.current; } catch { /* background owns its errors */ }
+    }
 
-    const finalContent = await runTurn(convoId, aId, chosenModel, apiMessages, { candidates, routingId: routing?.id });
+    let finalContent;
+    try {
+      finalContent = await runTurn(convoId, aId, chosenModel, apiMessages, { candidates, routingId: routing?.id });
+    } finally {
+      foregroundBusyRef.current = false;
+    }
     setBusy(false);
     maybeREC();
 
@@ -2441,15 +2469,21 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
       dossierHash: active.mode === "memory" ? memDossierHash : undefined,
       spans: active.mode === "memory" ? memSpans : undefined,
     });
-    // The user is waiting — pause the walk for the duration of the re-run.
+    // The user is waiting — pause the walk and background calls for the
+    // duration of the re-run, draining anything already in flight.
     walkPausedRef.current = true;
+    foregroundBusyRef.current = true;
     if (walkInFlightRef.current) {
       try { await walkInFlightRef.current; } catch { /* the walk owns its errors */ }
+    }
+    if (bgInFlightRef.current) {
+      try { await bgInFlightRef.current; } catch { /* background owns its errors */ }
     }
     try {
       await runTurn(active.id, msgId, useModel, apiMessages, { candidates, routingId: routing?.id });
     } finally {
       walkPausedRef.current = false;
+      foregroundBusyRef.current = false;
     }
     setBusy(false);
     maybeREC();
