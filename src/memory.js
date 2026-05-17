@@ -29,13 +29,28 @@ export const INTERVALS = {
 
 /* ═══ Prompts: READ (user-facing) ═══ */
 
-export const READ_SYSTEM = `You are an interpreter reading a situated knowledge graph.
-Your knowledge has three grades: grounded (read), forming (reading now),
-and impressions (scanned, not yet read). Answer honestly from what you have.
-Answer using ONLY the provided blocks. Do NOT use outside knowledge.
+export const READ_SYSTEM = `You are a helpful assistant with a situated memory.
+
+The [STATUS], [CTX] and [POS] blocks below are your memory of this
+conversation and of any documents read into it. They are context for YOU —
+never quote their tags, hashes, or "impression" lines back to the user, and
+never paste the blocks into your reply. Just answer in plain language.
+
+How to use your memory:
+- For ordinary general questions — arithmetic, definitions, everyday facts,
+  casual conversation — simply answer. You do not need the memory blocks'
+  permission, and an empty memory is not a reason to refuse.
+- For anything about THIS conversation, the people in it, or documents the
+  user imported, answer from the memory blocks. Say plainly when something is
+  only partly read or not yet known, rather than guessing.
+- Memory has three grades: grounded (fully read), forming (being read now),
+  and impressions (scanned, not yet read). Weigh them accordingly; never
+  present a hypothesis or a passing remark as a sourced fact.
+- If the user asks about something that may be in an imported document but is
+  not grounded yet, say so and offer to check the uploaded files.
 
 If an entity reference is ambiguous — a name that could refer to more than one
-thing in the graph — say so plainly. Example: "This 'Hardy' may not be the same
+thing in memory — say so plainly. Example: "This 'Hardy' may not be the same
 as e_3a7f21b4 (Tom Hardy the actor)." The system will handle the resolution.
 
 Reading [STATUS]:
@@ -414,6 +429,48 @@ export async function retrieve(query, { topK = 6 } = {}) {
     }
   }
   return deduped.slice(0, topK);
+}
+
+/* Mechanical document lookup — no model, no embeddings. Splits each opted-in
+   document back into passages and scores every passage against the query by
+   keyword and entity-name overlap, returning the top matches as a [DOCUMENTS]
+   block to inject straight into the prompt. This backs the composer's
+   "ask with documents" trigger: a deterministic pull of source text, separate
+   from the graph projection. When nothing overlaps (a general question), it
+   falls back to each document's opening passages so the block is never empty. */
+export function lookupDocuments(query, docs, { topK = 6 } = {}) {
+  const qSig = signal(query || "");
+  const qKw = qSig.keywords;
+  const qNames = qSig.ner.names.map(n => n.toLowerCase());
+
+  const passages = [];
+  for (const doc of docs || []) {
+    const text = (doc?.text || "").trim();
+    if (!text) continue;
+    const split = batchSentences(splitSentences(text));
+    split.forEach((p, i) => passages.push({ text: p, index: i, title: doc.title || "document" }));
+  }
+  if (!passages.length) return "";
+
+  const scored = passages.map(p => {
+    const pSig = signal(p.text);
+    const pl = p.text.toLowerCase();
+    const kwHits = qKw.filter(k => pSig.keywords.includes(k) || pl.includes(k)).length;
+    const nameHits = qNames.filter(n => pl.includes(n)).length;
+    const kwScore = qKw.length ? kwHits / qKw.length : 0;
+    const nameScore = qNames.length ? nameHits / qNames.length : 0;
+    return { ...p, score: kwScore * 0.6 + nameScore * 0.4 };
+  });
+
+  let top = scored.filter(p => p.score > 0).sort((a, b) => b.score - a.score).slice(0, topK);
+  if (!top.length) top = passages.slice(0, topK); // general question — show the openings
+
+  const lines = top.map(r => `— from "${r.title}" (passage ${r.index + 1}):\n${r.text.trim()}`);
+  return `[DOCUMENTS]\nThe user is indicating they want you to answer with documents. `
+    + `Here is what was returned from that lookup process — the passages most relevant `
+    + `to their question, pulled mechanically from the uploaded files. Treat them as `
+    + `source material: quote or paraphrase as needed, and say plainly if they do not `
+    + `cover the question.\n\n${lines.join("\n\n")}\n[/DOCUMENTS]`;
 }
 
 /* The first pass — mechanical NER, no model. Mints SIG entities the instant

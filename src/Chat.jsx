@@ -11,7 +11,7 @@ import {
 import {
   READ_SYSTEM, INGEST_SYSTEM, EXTRACT_SYSTEM, MUTATE_SYSTEM,
   INTERVALS, splitSentences, batchSentences,
-  signal, retrieve, firstPass, formatRetrieved, buildStatus, buildPosition, buildRegister,
+  signal, retrieve, firstPass, lookupDocuments, formatRetrieved, buildStatus, buildPosition, buildRegister,
   collectSpans, dossierHashOf, logUserMessage, logModelResponse, logPassage,
   buildExtractPrompt, buildMutatePrompt, buildHypothesisPrompt, getHypothesisSystemPrompt,
   parseEvents, detectMutationTriggers, userCorrectionTrigger, parseMutate, applyMutation, commitTier,
@@ -19,6 +19,8 @@ import {
 import * as store from "./local-store.js";
 import { EVENT_SCHEMA, MUTATE_SCHEMA } from "./model-router.js";
 import { loadLibrary, saveLibrary, docStats } from "./library.js";
+import { ROLES, resolveRoleModel, loadRoleConfig, saveRoleConfig } from "./roles.js";
+import { logEvent, getEvents, clearEvents, subscribeEvents, installGlobalCapture } from "./event-log.js";
 
 const mono = `'SF Mono','Menlo','Consolas',monospace`;
 const sans = `-apple-system,system-ui,sans-serif`;
@@ -515,7 +517,7 @@ function IconBtn({ onClick, active, disabled, title, icon }) {
 }
 
 /* ── Composer ── */
-function Composer({ value, setValue, model, groups, setModel, onSend, onStop, busy, isReply, quantize, setQuantize, mode, memModel, memModels, setMemModel }) {
+function Composer({ value, setValue, model, groups, setModel, onSend, onStop, busy, isReply, quantize, setQuantize, mode, askWithDocs, setAskWithDocs, docCount }) {
   const ref = useRef(null);
   useEffect(() => {
     if (ref.current) {
@@ -549,22 +551,6 @@ function Composer({ value, setValue, model, groups, setModel, onSend, onStop, bu
                 }}>
                 <Icon name="memory" size={12} /> Memory
               </span>
-              {memModels.length > 0 && (
-                <span title="Background model — runs EXTRACT, INGEST and MUTATE. Defaults to the chat model above."
-                  style={{ display: "flex", alignItems: "center", gap: 6, fontFamily: mono, fontSize: 10.5, color: C.dim }}>
-                  bg
-                  <select
-                    value={memModel}
-                    onChange={e => setMemModel(e.target.value)}
-                    style={{
-                      background: C.s2, color: C.text, border: `1px solid ${C.border}`,
-                      borderRadius: 7, fontFamily: mono, fontSize: 11, padding: "5px 7px", outline: "none",
-                    }}>
-                    <option value="">(chat model)</option>
-                    {memModels.map(m => <option key={m} value={m}>{m}</option>)}
-                  </select>
-                </span>
-              )}
             </>
           ) : (
             <button
@@ -578,6 +564,21 @@ function Composer({ value, setValue, model, groups, setModel, onSend, onStop, bu
               }}>
               <span style={{ width: 6, height: 6, borderRadius: 99, background: quantize ? C.accent : C.dim, flexShrink: 0 }} />
               Quantize
+            </button>
+          )}
+          {docCount > 0 && (
+            <button
+              onClick={() => setAskWithDocs(v => !v)}
+              title="Ask with documents — pull the most relevant passages from this chat's opted-in documents straight into the prompt for your next message."
+              style={{
+                display: "flex", alignItems: "center", gap: 7, padding: "5px 9px",
+                background: askWithDocs ? "rgba(48,164,108,.18)" : C.s2,
+                border: `1px solid ${askWithDocs ? C.green : C.border}`, borderRadius: 7,
+                cursor: "pointer", fontFamily: mono, fontSize: 11, color: askWithDocs ? C.text : C.dim,
+              }}>
+              <span style={{ width: 6, height: 6, borderRadius: 99,
+                background: askWithDocs ? C.green : C.dim, flexShrink: 0 }} />
+              Ask with documents
             </button>
           )}
           <div style={{ flex: 1 }} />
@@ -689,13 +690,119 @@ function ChunkTrace({ chunk }) {
   );
 }
 
-/* ── Library & reading modal ── */
+/* ── Shared pill-button style for the library UI ── */
+const pillBtn = (active) => ({
+  fontSize: 11, fontFamily: mono, fontWeight: 600, padding: "5px 12px", borderRadius: 6,
+  border: "none", cursor: "pointer", background: active ? C.accent : C.s2,
+  color: active ? "#fff" : C.dim,
+});
+
+const clockTime = (ts) => {
+  try { return new Date(ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }); }
+  catch { return ""; }
+};
+
+/* ── App-wide event-log panel — a live feed of what the app is doing ── */
+function EventLogPanel() {
+  const [events, setEvents] = useState(getEvents);
+  useEffect(() => subscribeEvents(setEvents), []);
+  const levelColor = (l) => l === "error" ? C.red : l === "warn" ? C.orange : l === "ok" ? C.green : C.dim;
+  return (
+    <div>
+      <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10 }}>
+        <div style={{ fontSize: 11.5, color: C.dim, lineHeight: 1.6, flex: 1 }}>
+          Everything the app does — passages read, chat turns, model and graph
+          errors — oldest first. A live feed for this browser session.
+        </div>
+        <button onClick={() => clearEvents()} style={{ ...pillBtn(false), flexShrink: 0 }}>Clear</button>
+      </div>
+      {events.length === 0 ? (
+        <div style={{ fontSize: 11.5, color: C.dim, padding: "20px 0", textAlign: "center" }}>
+          No events yet — read a document or send a message.
+        </div>
+      ) : events.map(e => (
+        <div key={e.id} style={{ display: "flex", gap: 8, padding: "5px 2px",
+          borderBottom: `1px solid ${C.border}`, fontFamily: mono, fontSize: 10.5, alignItems: "baseline" }}>
+          <span style={{ color: C.dim, flexShrink: 0 }}>{clockTime(e.ts)}</span>
+          <span style={{ width: 6, height: 6, borderRadius: 99, background: levelColor(e.level),
+            flexShrink: 0, alignSelf: "center" }} />
+          <span style={{ color: levelColor(e.level), flexShrink: 0, width: 54,
+            overflow: "hidden", textOverflow: "ellipsis" }}>{e.source}</span>
+          <span style={{ color: C.text, wordBreak: "break-word", flex: 1 }}>
+            {e.message}
+            {e.detail && <span style={{ color: C.dim }}> — {e.detail.slice(0, 220)}</span>}
+          </span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+/* ── One library document — stats, read-progress and its passages ── */
+function DocCard({ doc, attached, canToggle, onToggle, onRemove }) {
+  const [open, setOpen] = useState(false);
+  const st = docStats(doc);
+  const trace = Array.isArray(doc.trace) ? doc.trace : [];
+  const done = trace.filter(t => t.status === "done" || t.status === "error").length;
+  const errors = trace.filter(t => t.status === "error").length;
+  const total = trace.length || doc.passages || 0;
+  const pct = total ? Math.round((done / total) * 100) : 100;
+  return (
+    <div style={{ marginBottom: 6, background: C.bg,
+      border: `1px solid ${attached ? C.accent + "66" : C.border}`, borderRadius: 8 }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "9px 11px" }}>
+        <button onClick={() => setOpen(o => !o)} title="Show passages"
+          style={{ background: "transparent", border: "none", cursor: "pointer", display: "flex", color: C.dim, padding: 0 }}>
+          <span style={{ display: "flex", transform: open ? "none" : "rotate(-90deg)" }}>
+            <Icon name="chev" size={11} />
+          </span>
+        </button>
+        <Icon name="doc" size={14} />
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div style={{ fontSize: 12, fontWeight: 600, whiteSpace: "nowrap", overflow: "hidden",
+            textOverflow: "ellipsis" }}>{doc.title}</div>
+          <div style={{ fontSize: 10, fontFamily: mono, color: C.dim }}>
+            {st.entities} sites · {st.edges} links · {done}/{total} passages read
+            {errors ? ` · ${errors} error${errors === 1 ? "" : "s"}` : ""}
+          </div>
+        </div>
+        <button onClick={() => onToggle(doc.id)} disabled={!canToggle}
+          style={{ ...pillBtn(attached), opacity: canToggle ? 1 : 0.5,
+            cursor: canToggle ? "pointer" : "default" }}>
+          {attached ? "✓ in chat" : "opt in"}
+        </button>
+        <button onClick={() => onRemove(doc.id)} title="Remove from library" style={{
+          background: "transparent", border: "none", color: C.dim, cursor: "pointer", display: "flex" }}>
+          <Icon name="trash" size={13} />
+        </button>
+      </div>
+      <div style={{ height: 4, background: C.s3, margin: "0 11px 9px", borderRadius: 3, overflow: "hidden" }}>
+        <div style={{ height: "100%", width: `${pct}%`, background: errors ? C.orange : C.green }} />
+      </div>
+      {open && (
+        <div style={{ padding: "0 11px 10px" }}>
+          {trace.length === 0
+            ? <div style={{ fontSize: 10.5, color: C.dim, fontFamily: mono }}>No passage trace recorded.</div>
+            : trace.map(t => <ChunkTrace key={t.index} chunk={t} />)}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ── Library & reading modal — tabbed: Read / Documents / Log ── */
 function LibraryModal({ open, onClose, library, activeConvo, canIngest,
-                        ingestRunning, ingestTrace, onIngest, onStopIngest, onToggleDoc, onRemoveDoc }) {
+                        ingestRunning, ingestTrace, onIngest, onStopIngest, onToggleDoc, onRemoveDoc,
+                        modelNames = [], roleConfig = {}, onSetRoleModel }) {
   const [text, setText] = useState("");
   const [title, setTitle] = useState("");
   const [source, setSource] = useState("");
+  const [tab, setTab] = useState("read");
   const fileRef = useRef(null);
+
+  /* Follow an active read into the Read tab so progress stays visible. */
+  useEffect(() => { if (ingestRunning) setTab("read"); }, [ingestRunning]);
+
   if (!open) return null;
 
   const loadFile = (e) => {
@@ -716,14 +823,31 @@ function LibraryModal({ open, onClose, library, activeConvo, canIngest,
     onIngest(text, title.trim(), source);
   };
 
-  const done = ingestTrace.filter(t => ["done", "error", "stopped"].includes(t.status)).length;
+  const traceDone = ingestTrace.filter(t => ["done", "error", "stopped"].includes(t.status)).length;
+  const traceScanned = ingestTrace.filter(t => t.status !== "pending").length;
   const learned = ingestTrace.reduce((n, t) => n + (t.applied || 0), 0);
+  const reading = ingestTrace.find(t => t.status === "reading");
+  const firstPassDone = ingestTrace.length > 0 && traceScanned >= ingestTrace.length;
   const attached = new Set(activeConvo?.docs || []);
-  const btn = (active) => ({
-    fontSize: 11, fontFamily: mono, fontWeight: 600, padding: "5px 12px", borderRadius: 6,
-    border: "none", cursor: "pointer", background: active ? C.accent : C.s2,
-    color: active ? "#fff" : C.dim,
-  });
+
+  const TabBtn = ({ id, label, badge, dot }) => (
+    <button onClick={() => setTab(id)} style={{
+      fontSize: 11.5, fontWeight: 600, fontFamily: mono, padding: "6px 13px",
+      borderRadius: 7, border: "none", cursor: "pointer",
+      background: tab === id ? C.accent : "transparent",
+      color: tab === id ? "#fff" : C.dim,
+      display: "flex", alignItems: "center", gap: 6,
+    }}>
+      {label}
+      {dot && <span style={{ width: 6, height: 6, borderRadius: 99, background: C.orange,
+        animation: "llm-pulse 1.4s ease-in-out infinite" }} />}
+      {badge != null && badge !== 0 && (
+        <span style={{ fontSize: 9.5, fontWeight: 700, padding: "0 5px", borderRadius: 99,
+          background: tab === id ? "rgba(255,255,255,.22)" : C.s3,
+          color: tab === id ? "#fff" : C.dim }}>{badge}</span>
+      )}
+    </button>
+  );
 
   return (
     <div onClick={() => onClose()} style={{
@@ -748,138 +872,162 @@ function LibraryModal({ open, onClose, library, activeConvo, canIngest,
           </button>
         </div>
 
+        <div style={{ display: "flex", gap: 4, padding: "8px 14px",
+          borderBottom: `1px solid ${C.border}` }}>
+          <TabBtn id="read" label="Read" dot={ingestRunning} />
+          <TabBtn id="docs" label="Documents" badge={library.length} />
+          <TabBtn id="log" label="Log" />
+        </div>
+
         <div style={{ padding: "14px 18px", overflowY: "auto" }}>
-          {/* ── Read new content ── */}
-          <div style={{ fontSize: 12, fontWeight: 700, marginBottom: 6 }}>Read new content</div>
-          <div style={{ fontSize: 11.5, color: C.dim, lineHeight: 1.6, marginBottom: 10 }}>
-            Paste or upload any text. It is split into sentences, grouped into passages
-            of a few sentences, and read by the model one passage at a time — each passage
-            against the sites already found, so the graph resolves rather than duplicates.
-            The document is added to the library and opted in to the current chat. Every
-            passage and its operations are shown below as it is read.
-          </div>
-          <input value={title} onChange={e => setTitle(e.target.value)} placeholder="Document title (optional)"
-            disabled={ingestRunning}
-            style={{ width: "100%", padding: "8px 11px", marginBottom: 8, background: C.bg, color: C.text,
-              border: `1px solid ${C.border}`, borderRadius: 7, fontSize: 12, fontFamily: mono,
-              boxSizing: "border-box", outline: "none" }} />
-          <textarea value={text} onChange={e => setText(e.target.value)} placeholder="Paste text to read…"
-            disabled={ingestRunning}
-            style={{ width: "100%", minHeight: 110, maxHeight: 220, resize: "vertical", padding: "10px 12px",
-              background: C.bg, color: C.text, border: `1px solid ${C.border}`, borderRadius: 8,
-              fontSize: 12, fontFamily: mono, boxSizing: "border-box", outline: "none" }} />
-          <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 8 }}>
-            <input ref={fileRef} type="file" accept=".txt,.md,.markdown,.csv,.json,text/*"
-              onChange={loadFile} style={{ display: "none" }} />
-            <button onClick={() => fileRef.current?.click()} disabled={ingestRunning} style={btn(false)}>
-              Upload file
-            </button>
-            <span style={{ fontSize: 10.5, fontFamily: mono, color: C.dim }}>
-              {text.length} chars{source ? ` · ${source}` : ""}
-            </span>
-            <div style={{ flex: 1 }} />
-            {ingestRunning ? (
-              <button onClick={onStopIngest} style={{ ...btn(false) }}>
-                Stop reading
+          {/* ═══ READ ═══ */}
+          {tab === "read" && (<>
+            <div style={{ fontSize: 12, fontWeight: 700, marginBottom: 6 }}>Read new content</div>
+            <div style={{ fontSize: 11.5, color: C.dim, lineHeight: 1.6, marginBottom: 10 }}>
+              Paste or upload any text. It is split into sentences, grouped into passages
+              of a few sentences, and read by the model one passage at a time — each passage
+              against the sites already found, so the graph resolves rather than duplicates.
+              The document is added to the library and opted in to the current chat.
+            </div>
+            <input value={title} onChange={e => setTitle(e.target.value)} placeholder="Document title (optional)"
+              disabled={ingestRunning}
+              style={{ width: "100%", padding: "8px 11px", marginBottom: 8, background: C.bg, color: C.text,
+                border: `1px solid ${C.border}`, borderRadius: 7, fontSize: 12, fontFamily: mono,
+                boxSizing: "border-box", outline: "none" }} />
+            <textarea value={text} onChange={e => setText(e.target.value)} placeholder="Paste text to read…"
+              disabled={ingestRunning}
+              style={{ width: "100%", minHeight: 110, maxHeight: 220, resize: "vertical", padding: "10px 12px",
+                background: C.bg, color: C.text, border: `1px solid ${C.border}`, borderRadius: 8,
+                fontSize: 12, fontFamily: mono, boxSizing: "border-box", outline: "none" }} />
+            <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 8 }}>
+              <input ref={fileRef} type="file" accept=".txt,.md,.markdown,.csv,.json,text/*"
+                onChange={loadFile} style={{ display: "none" }} />
+              <button onClick={() => fileRef.current?.click()} disabled={ingestRunning} style={pillBtn(false)}>
+                Upload file
               </button>
-            ) : (
-              <button onClick={ingest} disabled={!text.trim() || !canIngest}
-                style={{ ...btn(true), opacity: (!text.trim() || !canIngest) ? 0.5 : 1 }}>
-                Read into memory
-              </button>
+              <span style={{ fontSize: 10.5, fontFamily: mono, color: C.dim }}>
+                {text.length} chars{source ? ` · ${source}` : ""}
+              </span>
+              <div style={{ flex: 1 }} />
+              {ingestRunning ? (
+                <button onClick={onStopIngest} style={pillBtn(false)}>
+                  Stop reading
+                </button>
+              ) : (
+                <button onClick={ingest} disabled={!text.trim() || !canIngest}
+                  style={{ ...pillBtn(true), opacity: (!text.trim() || !canIngest) ? 0.5 : 1 }}>
+                  Read into memory
+                </button>
+              )}
+            </div>
+            {!canIngest && (
+              <div style={{ fontSize: 10.5, color: C.orange, marginTop: 6 }}>
+                No model available — pull one from Settings → Models first.
+              </div>
             )}
-          </div>
-          {!canIngest && (
-            <div style={{ fontSize: 10.5, color: C.orange, marginTop: 6 }}>
-              No model available — pull one from Settings → Models first.
-            </div>
-          )}
 
-          {/* ── Memory models — which model does each background graph role ── */}
-          <div style={{ fontSize: 12, fontWeight: 700, margin: "18px 0 4px" }}>Memory models</div>
-          <div style={{ fontSize: 11.5, color: C.dim, lineHeight: 1.6, marginBottom: 10 }}>
-            Reading text into the graph is background work, separate from the
-            conversation. Each role picks its own model — leave a role on Auto
-            to use the best installed match. The walk runs with constrained
-            decoding, so even a small fast model stays structurally valid.
-          </div>
-          {Object.values(ROLES).map(role => {
-            const auto = resolveRoleModel(role.id, modelNames, "", { ...roleConfig, [role.id]: null });
-            return (
-              <div key={role.id} style={{ display: "flex", alignItems: "center", gap: 10,
-                padding: "8px 11px", marginBottom: 6, background: C.bg,
-                border: `1px solid ${C.border}`, borderRadius: 8 }}>
-                <div style={{ flex: 1, minWidth: 0 }}>
-                  <div style={{ fontSize: 12, fontWeight: 600 }}>{role.label}</div>
-                  <div style={{ fontSize: 10, color: C.dim, lineHeight: 1.5 }}>{role.desc}</div>
+            {/* ── Memory models ── */}
+            <div style={{ fontSize: 12, fontWeight: 700, margin: "18px 0 4px" }}>Memory models</div>
+            <div style={{ fontSize: 11.5, color: C.dim, lineHeight: 1.6, marginBottom: 10 }}>
+              Reading text into the graph is background work, separate from the
+              conversation. Each role picks its own model — leave a role on Auto
+              to use the best installed match.
+            </div>
+            {Object.values(ROLES).map(role => {
+              const auto = resolveRoleModel(role.id, modelNames, "", { ...roleConfig, [role.id]: null });
+              return (
+                <div key={role.id} style={{ display: "flex", alignItems: "center", gap: 10,
+                  padding: "8px 11px", marginBottom: 6, background: C.bg,
+                  border: `1px solid ${C.border}`, borderRadius: 8 }}>
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ fontSize: 12, fontWeight: 600 }}>{role.label}</div>
+                    <div style={{ fontSize: 10, color: C.dim, lineHeight: 1.5 }}>{role.desc}</div>
+                  </div>
+                  <select
+                    value={roleConfig[role.id] && modelNames.includes(roleConfig[role.id]) ? roleConfig[role.id] : ""}
+                    onChange={e => onSetRoleModel?.(role.id, e.target.value)}
+                    style={{ padding: "5px 8px", background: C.s2, color: C.text,
+                      border: `1px solid ${C.border}`, borderRadius: 6, fontSize: 11,
+                      fontFamily: mono, outline: "none", maxWidth: 200 }}>
+                    <option value="">Auto{auto ? ` · ${auto}` : ""}</option>
+                    {modelNames.map(n => <option key={n} value={n}>{n}</option>)}
+                  </select>
                 </div>
-                <select
-                  value={roleConfig[role.id] && modelNames.includes(roleConfig[role.id]) ? roleConfig[role.id] : ""}
-                  onChange={e => onSetRoleModel?.(role.id, e.target.value)}
-                  style={{ padding: "5px 8px", background: C.s2, color: C.text,
-                    border: `1px solid ${C.border}`, borderRadius: 6, fontSize: 11,
-                    fontFamily: mono, outline: "none", maxWidth: 200 }}>
-                  <option value="">Auto{auto ? ` · ${auto}` : ""}</option>
-                  {modelNames.map(n => <option key={n} value={n}>{n}</option>)}
-                </select>
-              </div>
-            );
-          })}
+              );
+            })}
 
-          {ingestTrace.length > 0 && (
-            <div style={{ marginTop: 14 }}>
-              <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6,
-                fontFamily: mono, fontSize: 11, color: C.dim }}>
-                <span>{done}/{ingestTrace.length} passages read</span>
-                <span>·</span>
-                <span style={{ color: C.accent }}>+{learned} facts learned</span>
-              </div>
-              <div style={{ height: 5, background: C.s3, borderRadius: 3, overflow: "hidden", marginBottom: 10 }}>
-                <div style={{ height: "100%", background: C.accent, transition: "width .2s",
-                  width: `${ingestTrace.length ? (done / ingestTrace.length) * 100 : 0}%` }} />
-              </div>
-              {ingestTrace.map(t => <ChunkTrace key={t.index} chunk={t} />)}
-            </div>
-          )}
-
-          {/* ── Library list ── */}
-          <div style={{ fontSize: 12, fontWeight: 700, margin: "20px 0 6px" }}>
-            Library · {library.length} document{library.length === 1 ? "" : "s"}
-          </div>
-          <div style={{ fontSize: 11.5, color: C.dim, lineHeight: 1.6, marginBottom: 10 }}>
-            {activeConvo
-              ? "Toggle a document to opt this chat in or out. Opted-in documents are merged into the chat's memory and projected into every prompt."
-              : "Open or start a chat to opt documents in to it."}
-          </div>
-          {library.length === 0 ? (
-            <div style={{ fontSize: 11.5, color: C.dim, padding: "14px 0", textAlign: "center" }}>
-              Nothing read yet. Read some content above to build your first document.
-            </div>
-          ) : library.map(doc => {
-            const st = docStats(doc);
-            const on = attached.has(doc.id);
-            return (
-              <div key={doc.id} style={{ display: "flex", alignItems: "center", gap: 10,
-                padding: "9px 11px", marginBottom: 6, background: C.bg,
-                border: `1px solid ${on ? C.accent + "66" : C.border}`, borderRadius: 8 }}>
-                <Icon name="doc" size={14} />
-                <div style={{ flex: 1, minWidth: 0 }}>
-                  <div style={{ fontSize: 12, fontWeight: 600, whiteSpace: "nowrap", overflow: "hidden",
-                    textOverflow: "ellipsis" }}>{doc.title}</div>
-                  <div style={{ fontSize: 10, fontFamily: mono, color: C.dim }}>
-                    {st.entities} sites · {st.edges} links · {doc.passages} passages
+            {/* ── Live reading progress ── */}
+            {ingestTrace.length > 0 && (
+              <div style={{ marginTop: 14 }}>
+                {/* First-pass banner — the document is embedded and chattable
+                    in a general way before the slow per-passage walk finishes. */}
+                <div style={{ display: "flex", alignItems: "center", gap: 8,
+                  padding: "9px 11px", marginBottom: 8, borderRadius: 8,
+                  background: (firstPassDone ? C.green : C.orange) + "14",
+                  border: `1px solid ${(firstPassDone ? C.green : C.orange)}40` }}>
+                  <span style={{ width: 8, height: 8, borderRadius: 99,
+                    background: firstPassDone ? C.green : C.orange,
+                    animation: ingestRunning ? "llm-pulse 1.4s ease-in-out infinite" : "none" }} />
+                  <div style={{ fontSize: 11, lineHeight: 1.5 }}>
+                    {firstPassDone ? (
+                      <><b style={{ color: C.green }}>First pass done.</b>{" "}
+                        <span style={{ color: C.dim }}>
+                          The document is embedded — you can ask about it in general terms now.
+                          {ingestRunning ? " The detailed read is still running below." : ""}
+                        </span></>
+                    ) : (
+                      <><b style={{ color: C.orange }}>First pass — embedding…</b>{" "}
+                        <span style={{ color: C.dim }}>
+                          {traceScanned}/{ingestTrace.length} passages scanned. Once this finishes
+                          the document is chattable while the detailed read continues.
+                        </span></>
+                    )}
                   </div>
                 </div>
-                <button onClick={() => onToggleDoc(doc.id)} disabled={!activeConvo} style={btn(on)}>
-                  {on ? "✓ in chat" : "opt in"}
-                </button>
-                <button onClick={() => onRemoveDoc(doc.id)} title="Remove from library" style={{
-                  background: "transparent", border: "none", color: C.dim, cursor: "pointer", display: "flex" }}>
-                  <Icon name="trash" size={13} />
-                </button>
+                <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6,
+                  fontFamily: mono, fontSize: 11, color: C.dim }}>
+                  <span>{traceDone}/{ingestTrace.length} passages read</span>
+                  <span>·</span>
+                  <span style={{ color: C.accent }}>+{learned} facts learned</span>
+                  {reading && <><span>·</span><span style={{ color: C.orange }}>
+                    reading passage {reading.index + 1}</span></>}
+                </div>
+                <div style={{ height: 5, background: C.s3, borderRadius: 3, overflow: "hidden", marginBottom: 10 }}>
+                  <div style={{ height: "100%", background: C.accent, transition: "width .2s",
+                    width: `${ingestTrace.length ? (traceDone / ingestTrace.length) * 100 : 0}%` }} />
+                </div>
+                {ingestTrace.map(t => <ChunkTrace key={t.index} chunk={t} />)}
               </div>
-            );
-          })}
+            )}
+          </>)}
+
+          {/* ═══ DOCUMENTS ═══ */}
+          {tab === "docs" && (<>
+            <div style={{ fontSize: 12, fontWeight: 700, marginBottom: 6 }}>
+              Library · {library.length} document{library.length === 1 ? "" : "s"}
+            </div>
+            <div style={{ fontSize: 11.5, color: C.dim, lineHeight: 1.6, marginBottom: 10 }}>
+              {activeConvo
+                ? "Toggle a document to opt this chat in or out. Opted-in documents are merged into the chat's memory and projected into every prompt. Expand a document to see its read-progress and every passage."
+                : "Open or start a chat to opt documents in to it. Expand a document to see its read-progress and every passage."}
+            </div>
+            {ingestRunning && (
+              <div style={{ fontSize: 10.5, color: C.orange, marginBottom: 10, fontFamily: mono }}>
+                A document is being read now — see the Read tab for live progress.
+              </div>
+            )}
+            {library.length === 0 ? (
+              <div style={{ fontSize: 11.5, color: C.dim, padding: "14px 0", textAlign: "center" }}>
+                Nothing read yet. Use the Read tab to build your first document.
+              </div>
+            ) : library.map(doc => (
+              <DocCard key={doc.id} doc={doc} attached={attached.has(doc.id)}
+                canToggle={!!activeConvo} onToggle={onToggleDoc} onRemove={onRemoveDoc} />
+            ))}
+          </>)}
+
+          {/* ═══ LOG ═══ */}
+          {tab === "log" && <EventLogPanel />}
         </div>
       </div>
     </div>
@@ -971,6 +1119,16 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
   const [logOpen, setLogOpen] = useState(false);
   const [ingestRunning, setIngestRunning] = useState(false);
   const [ingestTrace, setIngestTrace] = useState([]);
+  const [askWithDocs, setAskWithDocs] = useState(false);
+  const [roleConfig, setRoleConfig] = useState(loadRoleConfig);
+
+  const setRoleModel = (roleId, modelName) => {
+    setRoleConfig(prev => {
+      const next = { ...prev, [roleId]: modelName || null };
+      saveRoleConfig(next);
+      return next;
+    });
+  };
   /* The graph lives in SQLite (local-store.js), scoped per chat. dbReady
      gates memory operations; dbVersion bumps to re-render after a write. */
   const [dbReady, setDbReady] = useState(false);
@@ -980,10 +1138,14 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
   const ingestAbortRef = useRef(false);
   const scrollRef = useRef(null);
 
-  /* Open the SQLite store once, on mount. */
+  /* Open the SQLite store once, on mount. Route uncaught errors and
+     console.error into the app event log so they surface in the Log tab. */
   useEffect(() => {
+    installGlobalCapture();
     let live = true;
-    store.init().then(() => { if (live) setDbReady(true); }).catch(() => {});
+    store.init()
+      .then(() => { if (live) { setDbReady(true); logEvent("ok", "store", "Local graph store ready"); } })
+      .catch((e) => logEvent("error", "store", "Graph store failed to open", e?.message));
     return () => { live = false; };
   }, []);
 
@@ -1413,7 +1575,8 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
   const runIngest = async (rawText, title, source) => {
     const text = (rawText || "").trim();
     if (!text || ingestRunning) return;
-    const model = backgroundModel(composerModel === AUTO_MODEL ? modelNames[0] : composerModel);
+    const model = resolveRoleModel("ingest", modelNames,
+      backgroundModel(composerModel === AUTO_MODEL ? modelNames[0] : composerModel), roleConfig);
     if (!model) return;
 
     // A document needs a Memory-mode chat to belong to — make or adopt one.
@@ -1445,6 +1608,8 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
     sync();
     store.setScope(convoId);
     store.documents.register(docId, title || source || "document", passages.length);
+    logEvent("info", "ingest", `Reading "${title || source || "document"}"`,
+      `${passages.length} passages · ${model}`);
 
     // ── Phase 1: first pass — instant. Mechanical NER + embedding over
     //    every passage, so the whole document is chattable as impressions
@@ -1464,6 +1629,8 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
       trace[i].status = "queued"; sync();
     }
     bumpDb();
+    logEvent("ok", "ingest", "First pass done — document embedded and chattable",
+      `${passages.length} passages scanned`);
 
     // ── Phase 2: the walk — the LLM reads each passage into typed structure
     //    in the background. The conversation already has Phase 1 to draw on.
@@ -1493,9 +1660,11 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
         trace[i].rawOutput = typeof out === "string" ? out : JSON.stringify(out);
         trace[i].ops = events;
         trace[i].status = "done";
+        logEvent("info", "ingest", `Passage ${i + 1} read`, `+${res.applied} ops`);
       } catch (e) {
         trace[i].status = "error";
         trace[i].rawOutput = String(e?.message || e);
+        logEvent("error", "ingest", `Passage ${i + 1} failed`, e?.message || String(e));
       }
       // Roll up group and section hypotheses at the configured intervals.
       if ((i + 1) % INTERVALS.GROUP_HYPOTHESIS === 0) {
@@ -1568,6 +1737,8 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
       ? { ...c, docs: [...(c.docs || []), docId], updatedAt: Date.now() } : c));
     bumpDb();
     setIngestRunning(false);
+    logEvent("ok", "ingest", `Finished reading "${doc.title}"`,
+      `${passages.length} passages · +${learned} facts`);
   };
 
   /* Opt the active chat in or out of a library document. */
@@ -1639,6 +1810,8 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
     if (autoMode && !modelNames.length) return;
     setBusy(true);
     setDraft("");
+    logEvent("info", "chat", `Sent a ${mode}-mode turn`,
+      `${text.length} chars${autoMode ? " · Auto" : ` · ${composerModel}`}`);
 
     let convoId = activeId;
     let history = [];
@@ -1682,19 +1855,34 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
     // fixed-size prompt: system + projected dossier + one-turn position marker.
     // Every turn is projected and every turn is read back into the graph — the
     // prompt stays minimal regardless of how much the chat has covered.
+    // "Ask with documents": a manual, mechanical pull of the most relevant
+    // passages from this chat's opted-in library documents into the prompt.
+    let docBlock = "";
+    if (askWithDocs) {
+      const docs = attachedDocs(existing);
+      docBlock = lookupDocuments(text, docs);
+      logEvent(docBlock ? "info" : "warn", "lookup",
+        docBlock ? `Ask with documents — injected passages from ${docs.length} file(s)`
+                 : "Ask with documents on, but no document text to pull from");
+    }
+
     let apiMessages, memCtx = null, memBadge;
     if (mode === "memory" && dbReady) {
       const sig = signal(text);
       const sys = await memorySystemPrompt({ id: convoId, lastTurn: existing?.lastTurn }, sig, text);
       apiMessages = [
-        { role: "system", content: sys.content },
+        { role: "system", content: docBlock ? `${sys.content}\n\n${docBlock}` : sys.content },
         { role: "user", content: text },
       ];
       memCtx = { sig, results: sys.results, dossierHash: sys.dossierHash, spans: sys.spans };
       memBadge = { used: sys.used };
     } else {
       const apiHistory = quantize ? quantizeHistory(history) : history;
-      apiMessages = [...apiHistory, { role: "user", content: text }];
+      apiMessages = [
+        ...(docBlock ? [{ role: "system", content: docBlock }] : []),
+        ...apiHistory,
+        { role: "user", content: text },
+      ];
     }
 
     const userMsg = { id: "u" + Date.now(), role: "user", content: text };
@@ -1967,7 +2155,7 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
           isReply={messages.length > 0}
           quantize={quantize} setQuantize={setQuantize}
           mode={mode}
-          memModel={memModel} memModels={modelNames} setMemModel={setMemModel}
+          askWithDocs={askWithDocs} setAskWithDocs={setAskWithDocs} docCount={docCount}
         />
       </main>
       <LibraryModal
@@ -1976,6 +2164,7 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
         ingestRunning={ingestRunning} ingestTrace={ingestTrace}
         onIngest={runIngest} onStopIngest={() => { ingestAbortRef.current = true; }}
         onToggleDoc={toggleDoc} onRemoveDoc={removeDoc}
+        modelNames={modelNames} roleConfig={roleConfig} onSetRoleModel={setRoleModel}
       />
       <GivenLogModal
         open={logOpen} onClose={() => setLogOpen(false)}
