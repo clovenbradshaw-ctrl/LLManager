@@ -13,6 +13,7 @@ import {
   INTERVALS, splitPassages, classifyPassage, attachChromeContext, gateClassify,
   signal, retrieve, firstPass, lookupDocuments, formatRetrieved, buildStatus, buildPosition,
   buildReadingDigest, buildRegister,
+  shouldWalk, estimateTokens, shouldHypothesizeEntity, shouldHypothesizeGroup, shouldRollUpSection,
   collectSpans, dossierHashOf, logUserMessage, logModelResponse, logPassage,
   buildExtractPrompt, buildMutatePrompt, buildHypothesisPrompt, buildSkimPrompt,
   getHypothesisSystemPrompt, HYPOTHESIS_SKIM,
@@ -1193,7 +1194,9 @@ function DocPickerModal({ open, onClose, library, activeConvo, onToggleDoc,
                   <div style={{ fontSize: 12, fontWeight: 600, whiteSpace: "nowrap",
                     overflow: "hidden", textOverflow: "ellipsis" }}>{doc.title}</div>
                   <div style={{ fontSize: 10, fontFamily: mono, color: C.dim }}>
-                    {total ? `${done}/${total} passages read` : "not read yet"}
+                    {doc.strategy === "raw"
+                      ? "read directly · fits the window"
+                      : total ? `${done}/${total} passages read` : "not read yet"}
                   </div>
                 </div>
                 <span style={{ fontSize: 10, fontFamily: mono, fontWeight: 600,
@@ -1773,6 +1776,9 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
     const due = (touched || []).filter(id => {
       const e = store.entities.get(id);
       if (!e) return false;
+      // Only compress an entity once its evidence overflows its dossier slot;
+      // a small entity is shown as raw DEFs, which are more faithful.
+      if (!shouldHypothesizeEntity(id)) return false;
       if (!e.hypothesis) return true;
       const last = store.hypotheses.getCurrent("entity", id);
       return store.vectors.driftSince(id, last?.created_at || 0).total > 0.15;
@@ -1908,6 +1914,9 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
 
     const docId = "d" + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
     const passages = splitPassages(text);
+    // Scale decides the pipeline: a document that fits the window is read raw,
+    // a small one walks to DEFs, a large one compresses up the hierarchy.
+    const plan = shouldWalk(text);
     // Chrome detection — classify each passage's terrain before the walk.
     // Chrome (transitions, attributions, filler) is stored but not walked.
     const classes = passages.map((p, i) => classifyPassage(p, i, passages.length));
@@ -1928,7 +1937,7 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
       source: source || "pasted text",
       addedAt: new Date().toISOString(),
       chars: text.length, passages: passages.length, scope: convoId, text,
-      textHash,
+      textHash, strategy: plan.strategy,
     };
     const snapshotDoc = () => ({
       ...docMeta,
@@ -1942,6 +1951,15 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
     });
     const persistDoc = () => setLibrary(prev =>
       [snapshotDoc(), ...prev.filter(d => d.id !== docId)]);
+
+    // A raw-strategy document fits the prompt window whole: it is injected
+    // as-is and is chattable immediately, so the walk below is supplementary,
+    // never on the critical path. The walk still runs in the background when
+    // a model is free — it just is not needed for the document to be usable.
+    if (plan.strategy === "raw") {
+      logEvent("info", "ingest", `"${docMeta.title}" fits the window — chattable now`,
+        `${estimateTokens(text)} tokens · reading it raw, walk runs in the background`);
+    }
 
     setIngestRunning(true);
     ingestAbortRef.current = false;
@@ -1980,7 +1998,8 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
 
     // Before the walk reads a word, form the first impression a person would
     // on a glance — so the document carries a working hypothesis immediately.
-    if (!ingestAbortRef.current) {
+    // Only when the document is large enough that hypotheses earn their cost.
+    if (plan.hypothesize && !ingestAbortRef.current) {
       await runSkimHypothesis(convoId, docId, passages, classes, model);
       persistDoc();
     }
@@ -2045,12 +2064,17 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
         trace[i].rawOutput = String(e?.message || e);
         logEvent("error", "ingest", `Passage ${i + 1} failed`, e?.message || String(e));
       }
-      // Roll up group and section hypotheses at the configured intervals.
-      if ((i + 1) % INTERVALS.GROUP_HYPOTHESIS === 0) {
-        await runHypothesis(convoId, "group", { start: i - INTERVALS.GROUP_HYPOTHESIS + 1, end: i }, model);
+      // Roll up group/section hypotheses — but only when this scale needs
+      // them, and only once the layer below actually overflows its budget.
+      if (plan.hypothesize && (i + 1) % INTERVALS.GROUP_HYPOTHESIS === 0) {
+        const start = i - INTERVALS.GROUP_HYPOTHESIS + 1;
+        if (shouldHypothesizeGroup(start, i))
+          await runHypothesis(convoId, "group", { start, end: i }, model);
       }
-      if ((i + 1) % INTERVALS.SECTION_HYPOTHESIS === 0) {
-        await runHypothesis(convoId, "section", { start: i - INTERVALS.SECTION_HYPOTHESIS + 1, end: i }, model);
+      if (plan.hypothesize && (i + 1) % INTERVALS.SECTION_HYPOTHESIS === 0) {
+        const start = i - INTERVALS.SECTION_HYPOTHESIS + 1;
+        if (shouldRollUpSection())
+          await runHypothesis(convoId, "section", { start, end: i }, model);
       }
       store.setScope(convoId);
       store.documents.setWalked(docId, i + 1);
@@ -2134,7 +2158,10 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
       store.documents.setWalked(docId, passages.length);
       store.vectors.pruneWalked(docId);
       await hypothesizeEntities(convoId, [...docTouched], model, 8);
-      await runHypothesis(convoId, "document", { documentId: docId }, model);
+      // The document hypothesis is the top of the compression hierarchy —
+      // only roll it up when the scale called for hypotheses at all.
+      if (plan.hypothesize)
+        await runHypothesis(convoId, "document", { documentId: docId }, model);
     } catch (e) {
       console.error("ingest rollup failed", e);
     }
@@ -2299,18 +2326,37 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
     // passages from this chat's opted-in library documents — but only from
     // documents not yet fully read; once read, the [CTX] graph carries them.
     let docBlock = "", docSpans = [];
-    if (askWithDocs) {
+    if (mode === "memory") {
       const docs = attachedDocs(existing);
-      // Make sure every opted-in document is embedded in this chat's scope,
-      // so the pull can search it by embedding regardless of where it was read.
-      for (const d of docs) await ensureDocEmbedded(convoId, d);
-      store.setScope(convoId);
-      const lk = await lookupDocuments(text, docs);
-      docBlock = lk.text;
-      docSpans = lk.spans;
-      logEvent(docBlock ? "info" : "warn", "lookup",
-        docBlock ? `Ask with documents — ${docSpans.length} passage(s) from ${docs.length} file(s)`
-                 : "Ask with documents on, but no document text to pull from");
+      // Raw documents fit the window — inject them whole, every turn, so they
+      // are usable the moment they are added (no walk needed to read them).
+      const rawDocs = docs.filter(d => d.strategy === "raw" && d.text);
+      if (rawDocs.length) {
+        docBlock = "[DOCS]\n" + rawDocs.map(d =>
+          `--- ${d.title || "document"} (read directly) ---\n${d.text.trim()}`).join("\n\n")
+          + "\n[/DOCS]";
+        docSpans = rawDocs.map(d => ({
+          entity: d.title || d.id, kind: "passage",
+          text: d.text.length > 220 ? d.text.slice(0, 220) + "…" : d.text,
+          source: `${d.title || "document"} · full text`,
+        }));
+      }
+      // "Ask with documents": an embedding pull from the larger, walked
+      // documents — only from those not yet fully read; once read the [CTX]
+      // graph carries them.
+      if (askWithDocs) {
+        const bigDocs = docs.filter(d => d.strategy !== "raw");
+        for (const d of bigDocs) await ensureDocEmbedded(convoId, d);
+        store.setScope(convoId);
+        const lk = await lookupDocuments(text, bigDocs);
+        if (lk.text) {
+          docBlock = docBlock ? `${docBlock}\n\n${lk.text}` : lk.text;
+          docSpans = [...docSpans, ...lk.spans];
+        }
+        logEvent(lk.text ? "info" : "warn", "lookup",
+          lk.text ? `Ask with documents — ${lk.spans.length} passage(s) from ${bigDocs.length} file(s)`
+                  : "Ask with documents on, but no document text to pull from");
+      }
     }
 
     let apiMessages, memCtx = null, memBadge;

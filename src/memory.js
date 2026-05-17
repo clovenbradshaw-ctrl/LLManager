@@ -814,6 +814,55 @@ function originLine(entityId) {
   return parts.length ? parts.join(" + ") : null;
 }
 
+/* ═══ Adaptive scale — compression activates only when the window overflows ═══
+
+   A hypothesis is lossy compression of facts, forced by a finite prompt
+   window. If the evidence already fits, compressing it is pure overhead and
+   loses fidelity for nothing. Every layer — the walk, entity hypotheses,
+   group/section/document hypotheses — exists to fit an unbounded document
+   into a bounded window, and each activates only when the layer below
+   overflows its budget. Below the window the system is plain RAG with
+   provenance; above it, it compresses progressively up the hierarchy. */
+export const DOSSIER_BUDGET = 350;   // tokens for the whole [CTX] dossier
+const TIER_1_BUDGET = 65;            // tokens for one walked entity's slot
+
+export function estimateTokens(text) {
+  return Math.ceil(String(text || "").length / 4);
+}
+
+/* Tokens to show an entity's evidence raw — every DEF and edge, uncompressed. */
+function entityEvidenceTokens(entityId) {
+  return store.defs.getFor(entityId).length * 12 + store.edges.getFor(entityId).length * 8;
+}
+
+/* Does this entity's evidence overflow its dossier slot? Below the slot the
+   DEFs are shown directly — more faithful than any hypothesis of them. */
+export function shouldHypothesizeEntity(entityId) {
+  return entityEvidenceTokens(entityId) > TIER_1_BUDGET;
+}
+
+/* Do the entity hypotheses in a passage range overflow the digest budget?
+   Below it, the entity hypotheses are shown directly — no group needed. */
+export function shouldHypothesizeGroup(start, end) {
+  return store.entities.getInRange(start, end).length * 20 > 100;
+}
+
+/* Do the accumulated group hypotheses overflow — time to roll them up? */
+export function shouldRollUpSection() {
+  return store.hypotheses.getByLevel("group").length > 3;
+}
+
+/* The ingest strategy for a document, decided by its size against the window:
+     raw       — fits the dossier whole; do not walk, read it directly
+     defs-only — walk to DEFs, which still fit; no hypotheses
+     full      — walk and compress through the hypothesis hierarchy */
+export function shouldWalk(text) {
+  const tokens = estimateTokens(text);
+  if (tokens <= DOSSIER_BUDGET) return { strategy: "raw", hypothesize: false };
+  if (tokens <= DOSSIER_BUDGET * 3) return { strategy: "defs-only", hypothesize: false };
+  return { strategy: "full", hypothesize: true };
+}
+
 /* A grounded (walked) entity block — structured and provenanced. */
 function formatWalked(entity, full = true) {
   const stateHash = store.computeStateHash(entity.id);
@@ -823,21 +872,31 @@ function formatWalked(entity, full = true) {
   let b = `E: ${entity.id}@${stateHash} | ${entity.terrain} | ${edges.length}`;
   b += `\n  ~ ${entity.canonical}${entity.aliases?.length ? ", aka " + entity.aliases.join(", ") : ""}`;
   if (from) b += `\n  from: ${from}`;
-  b += `\n  h: ${(entity.hypothesis || "?").slice(0, 130)}`;
-  if (full) {
+
+  if (shouldHypothesizeEntity(entity.id)) {
+    // Evidence overflows the slot — show the compressed hypothesis + top DEFs.
+    b += `\n  h: ${(entity.hypothesis || "?").slice(0, 130)}`;
+    let spanDone = false;
+    for (const def of defs.slice(0, full ? 3 : 2)) {
+      b += `\n  = ${def.field}: "${def.value}"`;
+      if (def.span && !spanDone && full) { b += ` @"${def.span.slice(0, 50)}"`; spanDone = true; }
+    }
+    if (full) {
+      for (const c of store.defs.getConflicts(entity.id).slice(0, 1)) b += `\n  ⚠ ${c.field}: ${c.vals}`;
+    }
+  } else {
+    // Evidence fits the slot — show every DEF and edge raw. The facts
+    // themselves are more faithful than any hypothesis compressing them.
     for (const edge of edges.slice(0, 3)) {
       const dir = edge.from_id === entity.id ? "→" : "←";
       const target = edge.from_id === entity.id ? edge.to_id : edge.from_id;
       b += `\n  ${dir} ${target} (${edge.type})`;
     }
     let spanDone = false;
-    for (const def of defs.slice(0, 3)) {
+    for (const def of defs) {
       b += `\n  = ${def.field}: "${def.value}"`;
       if (def.span && !spanDone) { b += ` @"${def.span.slice(0, 50)}"`; spanDone = true; }
     }
-    for (const c of store.defs.getConflicts(entity.id).slice(0, 1)) b += `\n  ⚠ ${c.field}: ${c.vals}`;
-  } else {
-    for (const def of defs.slice(0, 2)) b += `\n  = ${def.field}: "${def.value}"`;
   }
   return b;
 }
@@ -957,8 +1016,6 @@ export function buildReadingDigest(query = "") {
       lines.push(skim
         ? `skim of "${d.title || "document"}"${progress} — a first-pass guess, not yet fully read: "${docHyp.text}"`
         : `document "${d.title || "document"}"${progress}: "${docHyp.text}"`);
-    } else if (total) {
-      lines.push(`"${d.title || "document"}"${progress} — no understanding formed yet`);
     }
   }
 
