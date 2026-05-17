@@ -1649,6 +1649,29 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
       status: "pending", rawOutput: "", ops: [], applied: 0,
     }));
     const sync = () => setIngestTrace(trace.map(t => ({ ...t })));
+
+    // Snapshot the document for the library. Persisted after the (instant)
+    // first pass and again after every walked passage, so a refresh mid-walk
+    // keeps the document and its progress instead of losing it.
+    const docMeta = {
+      id: docId,
+      title: title || source || (text.slice(0, 40) + (text.length > 40 ? "…" : "")),
+      source: source || "pasted text",
+      addedAt: new Date().toISOString(),
+      chars: text.length, passages: passages.length, scope: convoId, text,
+    };
+    const snapshotDoc = () => ({
+      ...docMeta,
+      learned: trace.reduce((n, t) => n + (t.applied || 0), 0),
+      trace: trace.map(t => ({
+        index: t.index, chars: t.chars, status: t.status, applied: t.applied,
+        signal: { names: t.signal.ner.names, dates: t.signal.ner.dates, keywords: t.signal.keywords },
+        ops: t.ops, ambigs: t.ambigs || [], rawOutput: t.rawOutput,
+      })),
+    });
+    const persistDoc = () => setLibrary(prev =>
+      [snapshotDoc(), ...prev.filter(d => d.id !== docId)]);
+
     setIngestRunning(true);
     ingestAbortRef.current = false;
     sync();
@@ -1677,6 +1700,12 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
     bumpDb();
     logEvent("ok", "ingest", "First pass done — document embedded and chattable",
       `${passages.length} passages scanned`);
+
+    // The document is chattable now — add it to the library and opt the chat
+    // in immediately, so it survives a refresh even before the walk finishes.
+    persistDoc();
+    setConvos(prev => prev.map(c => c.id === convoId
+      ? { ...c, docs: [...new Set([...(c.docs || []), docId])], updatedAt: Date.now() } : c));
 
     // ── Phase 2: the walk — the LLM reads each passage into typed structure
     //    in the background. The conversation already has Phase 1 to draw on.
@@ -1723,6 +1752,7 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
       store.setScope(convoId);
       store.documents.setWalked(docId, i + 1);
       sync();
+      persistDoc();
     }
     } catch (e) {
       /* unexpected failure — the document is left partially read */
@@ -1766,25 +1796,10 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
     }
 
     const learned = trace.reduce((n, t) => n + (t.applied || 0), 0);
-    const doc = {
-      id: docId,
-      title: title || source || (text.slice(0, 40) + (text.length > 40 ? "…" : "")),
-      source: source || "pasted text",
-      addedAt: new Date().toISOString(),
-      chars: text.length, passages: passages.length, learned, scope: convoId,
-      text,
-      trace: trace.map(t => ({
-        index: t.index, chars: t.chars, status: t.status, applied: t.applied,
-        signal: { names: t.signal.ner.names, dates: t.signal.ner.dates, keywords: t.signal.keywords },
-        ops: t.ops, ambigs: t.ambigs || [], rawOutput: t.rawOutput,
-      })),
-    };
-    setLibrary(prev => [doc, ...prev]);
-    setConvos(prev => prev.map(c => c.id === convoId
-      ? { ...c, docs: [...(c.docs || []), docId], updatedAt: Date.now() } : c));
+    persistDoc();
     bumpDb();
     setIngestRunning(false);
-    logEvent("ok", "ingest", `Finished reading "${doc.title}"`,
+    logEvent("ok", "ingest", `Finished reading "${docMeta.title}"`,
       `${passages.length} passages · +${learned} facts`);
   };
 
