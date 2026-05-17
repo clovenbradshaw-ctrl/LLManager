@@ -29,6 +29,26 @@ const C = {
 
 const CHAT_STORE_KEY = "llm-manager-chat-threads";
 const MAX_SAVED_THREADS = 30;
+const SETTINGS_STORE_KEY = "llm-manager-settings";
+
+const DEFAULT_SETTINGS = {
+  ollamaUrl: "http://localhost:11434",
+  temperature: 0.7,
+  num_ctx: 4096,
+  num_predict: -1,
+  keepAlive: "5m",
+};
+
+const loadStoredSettings = () => {
+  try {
+    const raw = localStorage.getItem(SETTINGS_STORE_KEY);
+    if (!raw) return { ...DEFAULT_SETTINGS };
+    const parsed = JSON.parse(raw);
+    return { ...DEFAULT_SETTINGS, ...(parsed && typeof parsed === "object" ? parsed : {}) };
+  } catch {
+    return { ...DEFAULT_SETTINGS };
+  }
+};
 
 const makeThread = (model = "") => {
   const now = Date.now();
@@ -106,6 +126,14 @@ const Box = ({ title, sub, children }) => (
   </div>
 );
 
+const Field = ({ label, hint, children }) => (
+  <div style={{ marginBottom: 16 }}>
+    <div style={{ fontSize: 12, fontWeight: 600, color: C.text, marginBottom: hint ? 3 : 6 }}>{label}</div>
+    {hint && <div style={{ fontSize: 11, color: C.dim, marginBottom: 7 }}>{hint}</div>}
+    {children}
+  </div>
+);
+
 const ChatBubble = ({ message, copy, copied }) => {
   const isUser = message.role === "user";
   const isAssistant = message.role === "assistant";
@@ -154,7 +182,9 @@ const ChatBubble = ({ message, copy, copied }) => {
 
 export default function App() {
   const [tab, setTab] = useState("status");
-  const [ollamaUrl, setOllamaUrl] = useState("http://localhost:11434");
+  const [settingsSection, setSettingsSection] = useState("connection");
+  const [settings, setSettings] = useState(loadStoredSettings);
+  const ollamaUrl = settings.ollamaUrl;
   const [ollamaUp, setOllamaUp] = useState(null);
   const [ollamaVer, setOllamaVer] = useState("");
   const [installed, setInstalled] = useState([]);
@@ -177,6 +207,12 @@ export default function App() {
   useEffect(() => {
     localStorage.setItem(CHAT_STORE_KEY, JSON.stringify(sortedThreads.slice(0, MAX_SAVED_THREADS)));
   }, [sortedThreads]);
+
+  useEffect(() => {
+    localStorage.setItem(SETTINGS_STORE_KEY, JSON.stringify(settings));
+  }, [settings]);
+
+  const updateSettings = (patch) => setSettings(prev => ({ ...prev, ...patch }));
 
   useEffect(() => {
     if (!activeThreadId && sortedThreads.length) setActiveThreadId(sortedThreads[0].id);
@@ -272,7 +308,17 @@ export default function App() {
     try {
       const r = await fetch(`${ollamaUrl}/api/chat`, {
         method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ model, messages: [...priorMessages, { role: "user", content: userText }], stream: true }),
+        body: JSON.stringify({
+          model,
+          messages: [...priorMessages, { role: "user", content: userText }],
+          stream: true,
+          keep_alive: settings.keepAlive,
+          options: {
+            temperature: settings.temperature,
+            num_ctx: settings.num_ctx,
+            num_predict: settings.num_predict,
+          },
+        }),
       });
       if (!r.ok || !r.body) throw new Error(`HTTP ${r.status}`);
       const reader = r.body.getReader();
@@ -368,7 +414,7 @@ export default function App() {
     setBusy(b => { const n = { ...b }; delete n[name]; return n; });
     probe();
   };
-  const loadModel = (name) => setKeepAlive(name, "10m", "load");
+  const loadModel = (name) => setKeepAlive(name, settings.keepAlive === "0" ? "10m" : settings.keepAlive, "load");
   const unloadModel = (name) => setKeepAlive(name, 0, "unload");
 
   const deleteModel = async (name) => {
@@ -409,7 +455,7 @@ async function askLLM(prompt, options = {}) {
         ...(options.system ? [{ role: "system", content: options.system }] : []),
         { role: "user", content: prompt }
       ],
-      temperature: options.temperature ?? 0.7,
+      temperature: options.temperature ?? ${settings.temperature},
       max_tokens: options.max_tokens ?? 2048,
       stream: false,
     }),
@@ -457,6 +503,11 @@ OLLAMA_ORIGINS="*" ollama serve
 # Or restrict to specific origins:
 OLLAMA_ORIGINS="http://localhost:3000,https://myapp.com" ollama serve`;
 
+  const fieldSelectStyle = {
+    width: "100%", padding: "8px 12px", fontSize: 12, fontFamily: mono,
+    background: C.bg, color: C.text, border: `1px solid ${C.border}`, borderRadius: 6,
+  };
+
   return (
     <div style={{ fontFamily: sans, background: C.bg, color: C.text, minHeight: "100vh" }}>
       <div style={{ padding: "16px 20px 12px", borderBottom: `1px solid ${C.border}`, display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 10 }}>
@@ -467,7 +518,7 @@ OLLAMA_ORIGINS="http://localhost:3000,https://myapp.com" ollama serve`;
           </div>
         </div>
         <div style={{ display: "flex", gap: 6 }}>
-          {["status", "run", "models", "connect"].map(t => (
+          {["status", "run", "settings"].map(t => (
             <button key={t} onClick={() => setTab(t)} style={{
               padding: "7px 16px", fontSize: 12, fontWeight: 600, borderRadius: 8, cursor: "pointer", textTransform: "capitalize",
               border: `1px solid ${tab === t ? C.accent : C.border}`, background: tab === t ? C.accent : "transparent", color: tab === t ? "#fff" : C.dim,
@@ -494,16 +545,17 @@ OLLAMA_ORIGINS="http://localhost:3000,https://myapp.com" ollama serve`;
           </Box>
 
           <Box title="Ollama">
-            <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 12 }}>
-              <input value={ollamaUrl} onChange={e => setOllamaUrl(e.target.value)} style={{ flex: 1, padding: "8px 12px", fontSize: 12, fontFamily: mono, background: C.bg, color: C.text, border: `1px solid ${C.border}`, borderRadius: 6 }} />
-              <button onClick={probe} style={{ padding: "7px 14px", fontSize: 11, fontWeight: 600, background: C.s2, color: C.dim, border: `1px solid ${C.border}`, borderRadius: 6, cursor: "pointer" }}>Probe</button>
+            <div style={{ fontSize: 12, fontFamily: mono, marginBottom: ollamaUp === false ? 12 : 10, color: ollamaUp === true ? C.green : ollamaUp === false ? C.red : C.dim }}>
+              {ollamaUp === true ? `🟢 Connected · v${ollamaVer}` : ollamaUp === false ? "🔴 Not reachable" : "⏳ Checking…"}
+              <span style={{ color: C.dim }}> · {ollamaUrl}</span>
             </div>
             {ollamaUp === false && (
               <div style={{ background: C.red + "12", border: `1px solid ${C.red}30`, borderRadius: 8, padding: "12px 16px" }}>
-                <div style={{ fontSize: 12, fontWeight: 600, color: C.red, marginBottom: 8 }}>Not reachable</div>
+                <div style={{ fontSize: 12, fontWeight: 600, color: C.red, marginBottom: 8 }}>Start Ollama to continue</div>
                 <CopyBlock copy={copy} copied={copied} text="brew install ollama" id="inst" label="1. Install" />
                 <CopyBlock copy={copy} copied={copied} text="ollama serve" id="srv" label="2. Start server" />
                 <CopyBlock copy={copy} copied={copied} text="ollama pull gemma2:2b" id="fp" label="3. Pull a model" />
+                <div style={{ fontSize: 11, color: C.dim, marginTop: 8 }}>Using a non-default address? Set it in Settings → Connection.</div>
               </div>
             )}
             {ollamaUp === true && (<>
@@ -518,23 +570,9 @@ OLLAMA_ORIGINS="http://localhost:3000,https://myapp.com" ollama serve`;
                   ))}
                 </div>
               )}
-              <div style={{ fontSize: 11, color: C.dim, marginBottom: 4 }}>Installed ({installed.length}):</div>
-              {installed.map(m => {
-                const loaded = running.some(r => r.name === m.name);
-                const act = busy[m.name];
-                return (
-                  <div key={m.name} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, padding: "6px 0", fontSize: 12, borderBottom: `1px solid ${C.s3}` }}>
-                    <span style={{ fontFamily: mono, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{m.name} <span style={{ color: C.dim, fontSize: 10 }}>· {fmtB(m.size)} · {m.details?.quantization_level || ""}</span></span>
-                    <div style={{ display: "flex", gap: 6, alignItems: "center", flexShrink: 0 }}>
-                      {loaded && <Pill color={C.green}>LOADED</Pill>}
-                      {loaded
-                        ? <ActBtn onClick={() => unloadModel(m.name)} disabled={!!act}>{act === "unload" ? "unloading…" : "unload"}</ActBtn>
-                        : <ActBtn onClick={() => loadModel(m.name)} disabled={!!act}>{act === "load" ? "loading…" : "load"}</ActBtn>}
-                      <ActBtn onClick={() => deleteModel(m.name)} disabled={!!act} color={C.red}>{act === "delete" ? "deleting…" : "delete"}</ActBtn>
-                    </div>
-                  </div>
-                );
-              })}
+              <div style={{ fontSize: 12, color: C.dim }}>
+                {installed.length} model{installed.length === 1 ? "" : "s"} installed — manage them in <span style={{ color: C.accent }}>Settings → Models</span>.
+              </div>
             </>)}
           </Box>
         </>)}
@@ -631,8 +669,62 @@ OLLAMA_ORIGINS="http://localhost:3000,https://myapp.com" ollama serve`;
           </div>
         )}
 
-        {/* ═══ MODELS ═══ */}
-        {tab === "models" && (<>
+        {/* ═══ SETTINGS ═══ */}
+        {tab === "settings" && (<>
+          <div style={{ display: "flex", gap: 6, marginBottom: 14, flexWrap: "wrap" }}>
+            {[["connection", "Connection"], ["models", "Models"], ["optimize", "Optimize"], ["connect", "Connect"]].map(([k, label]) => (
+              <button key={k} onClick={() => setSettingsSection(k)} style={{
+                padding: "6px 14px", fontSize: 11, fontWeight: 600, borderRadius: 7, cursor: "pointer",
+                border: `1px solid ${settingsSection === k ? C.accent : C.border}`,
+                background: settingsSection === k ? C.accent : "transparent",
+                color: settingsSection === k ? "#fff" : C.dim,
+              }}>{label}</button>
+            ))}
+          </div>
+
+          {/* ─ Connection ─ */}
+          {settingsSection === "connection" && (<>
+            <Box title="Ollama Connection" sub="The address LLM Manager uses to reach your local Ollama server. Saved to this browser.">
+              <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 10 }}>
+                <input value={ollamaUrl} onChange={e => updateSettings({ ollamaUrl: e.target.value })} style={{ flex: 1, padding: "8px 12px", fontSize: 12, fontFamily: mono, background: C.bg, color: C.text, border: `1px solid ${C.border}`, borderRadius: 6 }} />
+                <button onClick={probe} style={{ padding: "7px 14px", fontSize: 11, fontWeight: 600, background: C.s2, color: C.dim, border: `1px solid ${C.border}`, borderRadius: 6, cursor: "pointer" }}>Probe</button>
+              </div>
+              <div style={{ fontSize: 12, fontFamily: mono, color: ollamaUp === true ? C.green : ollamaUp === false ? C.red : C.dim }}>
+                {ollamaUp === true ? `🟢 Connected · Ollama v${ollamaVer} · ${installed.length} models` : ollamaUp === false ? "🔴 Not reachable — is `ollama serve` running?" : "⏳ Checking…"}
+              </div>
+            </Box>
+            <Box title="CORS Setup" sub="If another browser app on a different origin gets blocked">
+              <div style={{ fontSize: 12, color: C.dim, lineHeight: 1.6, marginBottom: 10 }}>
+                By default Ollama allows requests from any origin. If you run into CORS errors, restart Ollama with the <code style={{ fontFamily: mono, color: C.accent }}>OLLAMA_ORIGINS</code> env var:
+              </div>
+              <CopyBlock copy={copy} copied={copied} id="cors" text={corsNote} />
+            </Box>
+          </>)}
+
+          {/* ─ Models ─ */}
+          {settingsSection === "models" && (<>
+          <Box title="Installed Models" sub="Load keeps a model in memory for faster responses; delete removes its files from disk.">
+            {ollamaUp !== true ? (
+              <div style={{ fontSize: 12, color: C.red }}>Ollama is not reachable — check the Connection tab.</div>
+            ) : installed.length === 0 ? (
+              <div style={{ fontSize: 12, color: C.dim }}>No models installed yet. Pull one from the catalog below.</div>
+            ) : installed.map(m => {
+              const loaded = running.some(r => r.name === m.name);
+              const act = busy[m.name];
+              return (
+                <div key={m.name} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, padding: "6px 0", fontSize: 12, borderBottom: `1px solid ${C.s3}` }}>
+                  <span style={{ fontFamily: mono, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{m.name} <span style={{ color: C.dim, fontSize: 10 }}>· {fmtB(m.size)} · {m.details?.quantization_level || ""}</span></span>
+                  <div style={{ display: "flex", gap: 6, alignItems: "center", flexShrink: 0 }}>
+                    {loaded && <Pill color={C.green}>LOADED</Pill>}
+                    {loaded
+                      ? <ActBtn onClick={() => unloadModel(m.name)} disabled={!!act}>{act === "unload" ? "unloading…" : "unload"}</ActBtn>
+                      : <ActBtn onClick={() => loadModel(m.name)} disabled={!!act}>{act === "load" ? "loading…" : "load"}</ActBtn>}
+                    <ActBtn onClick={() => deleteModel(m.name)} disabled={!!act} color={C.red}>{act === "delete" ? "deleting…" : "delete"}</ActBtn>
+                  </div>
+                </div>
+              );
+            })}
+          </Box>
           <Box title="Model Catalog" sub={ramGB ? `~${ramGB} GB detected → ~${(ramGB * .75).toFixed(0)} GB usable for models` : "RAM not exposed by browser — check terminal"}>
             {!ramGB && <div style={{ marginBottom: 12 }}><CopyBlock copy={copy} copied={copied} id="ram" text='sysctl -n hw.memsize | awk "{print $1/1073741824\" GB\"}"' label="Check actual RAM" /></div>}
             {MODEL_CATALOG.map(m => {
@@ -674,10 +766,44 @@ OLLAMA_ORIGINS="http://localhost:3000,https://myapp.com" ollama serve`;
               );
             })}
           </Box>
-        </>)}
+          </>)}
 
-        {/* ═══ CONNECT ═══ */}
-        {tab === "connect" && (<>
+          {/* ─ Optimize ─ */}
+          {settingsSection === "optimize" && (
+            <Box title="Generation Settings" sub="Applied to every chat request in the Run tab. Saved to this browser.">
+              <Field label={`Temperature — ${settings.temperature.toFixed(1)}`} hint="Lower is focused and deterministic; higher is creative and varied.">
+                <input type="range" min="0" max="2" step="0.1" value={settings.temperature}
+                  onChange={e => updateSettings({ temperature: parseFloat(e.target.value) })}
+                  style={{ width: "100%", accentColor: C.accent }} />
+              </Field>
+              <Field label="Context window" hint="num_ctx — tokens of conversation history the model can see. Larger uses more memory.">
+                <select value={settings.num_ctx} onChange={e => updateSettings({ num_ctx: parseInt(e.target.value, 10) })} style={fieldSelectStyle}>
+                  {[2048, 4096, 8192, 16384, 32768].map(n => <option key={n} value={n}>{n.toLocaleString()} tokens</option>)}
+                </select>
+              </Field>
+              <Field label="Max response length" hint="num_predict — cap on tokens generated per reply. -1 means no limit.">
+                <input type="number" min="-1" value={settings.num_predict}
+                  onChange={e => { const v = parseInt(e.target.value, 10); updateSettings({ num_predict: Number.isNaN(v) ? -1 : v }); }}
+                  style={fieldSelectStyle} />
+              </Field>
+              <Field label="Keep model loaded" hint="keep_alive — how long the model stays in memory after a request, avoiding reload latency.">
+                <select value={settings.keepAlive} onChange={e => updateSettings({ keepAlive: e.target.value })} style={fieldSelectStyle}>
+                  <option value="0">Unload immediately</option>
+                  <option value="5m">5 minutes</option>
+                  <option value="30m">30 minutes</option>
+                  <option value="1h">1 hour</option>
+                  <option value="-1">Keep loaded indefinitely</option>
+                </select>
+              </Field>
+              <button onClick={() => updateSettings({ temperature: DEFAULT_SETTINGS.temperature, num_ctx: DEFAULT_SETTINGS.num_ctx, num_predict: DEFAULT_SETTINGS.num_predict, keepAlive: DEFAULT_SETTINGS.keepAlive })}
+                style={{ padding: "7px 14px", fontSize: 11, fontFamily: mono, fontWeight: 600, borderRadius: 6, border: `1px solid ${C.border}`, background: C.s2, color: C.dim, cursor: "pointer" }}>
+                Reset to defaults
+              </button>
+            </Box>
+          )}
+
+          {/* ─ Connect ─ */}
+          {settingsSection === "connect" && (<>
           <Box title="Connect Other Browser Apps" sub="Any web app running locally can call your Ollama models directly via fetch. Copy these snippets into your app code.">
             <div style={{ fontSize: 12, color: C.dim, lineHeight: 1.6, marginBottom: 14 }}>
               Ollama exposes an <strong style={{ color: C.text }}>OpenAI-compatible API</strong> at <code style={{ fontFamily: mono, color: C.accent }}>{ollamaUrl}/v1/chat/completions</code>.
@@ -708,13 +834,6 @@ OLLAMA_ORIGINS="http://localhost:3000,https://myapp.com" ollama serve`;
             </>)}
           </Box>
 
-          <Box title="CORS Setup" sub="If your browser app is on a different origin and gets blocked">
-            <div style={{ fontSize: 12, color: C.dim, lineHeight: 1.6, marginBottom: 10 }}>
-              By default Ollama allows requests from any origin. If you run into CORS errors, restart Ollama with the <code style={{ fontFamily: mono, color: C.accent }}>OLLAMA_ORIGINS</code> env var:
-            </div>
-            <CopyBlock copy={copy} copied={copied} id="cors" text={corsNote} />
-          </Box>
-
           <Box title="API Reference">
             <div style={{ fontFamily: mono, fontSize: 11, color: C.dim, lineHeight: 2.2 }}>
               <div><span style={{ color: C.text, display: "inline-block", width: 200 }}>OpenAI chat completions</span> <span style={{ color: C.green }}>POST</span> {ollamaUrl}/v1/chat/completions</div>
@@ -725,6 +844,7 @@ OLLAMA_ORIGINS="http://localhost:3000,https://myapp.com" ollama serve`;
               <div><span style={{ color: C.text, display: "inline-block", width: 200 }}>Model info</span> <span style={{ color: C.green }}>POST</span> {ollamaUrl}/api/show</div>
             </div>
           </Box>
+          </>)}
         </>)}
       </div>
     </div>
