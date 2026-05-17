@@ -873,8 +873,14 @@ export function applyEvents(events, sourceGivenId = null, spanVecs = []) {
         results.applied++;
       } else results.skipped++;
     } else if (evt.op === "AMBIG") {
-      results.ambigs.push({ name: evt.name, candidateHash: evt.candidate, span: evt.span });
-      results.skipped++;
+      // Reject multi-candidate AMBIGs — "candidate" must be a single hash,
+      // not a pipe-joined dump of every entity in the register.
+      if (evt.candidate && String(evt.candidate).includes("|")) {
+        results.skipped++;
+      } else {
+        results.ambigs.push({ name: evt.name, candidateHash: evt.candidate, span: evt.span });
+        results.skipped++;
+      }
     }
   });
   return results;

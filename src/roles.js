@@ -26,7 +26,7 @@ export const ROLES = {
     label: "Extract",
     desc: "Per-turn graph walk — fires every knowledge-bearing turn. Favours speed.",
     prefer: [
-      "qwen3:4b", "qwen3:1.7b", "qwen3:0.6b", "qwen3",
+      "qwen3:30b-a3b", "qwen3:4b", "qwen3:1.7b", "qwen3:0.6b", "qwen3",
       "qwen2.5:3b", "llama3.2:3b", "phi3:mini", "gemma2:2b", "qwen2.5",
     ],
   },
@@ -35,7 +35,7 @@ export const ROLES = {
     label: "Ingest",
     desc: "Document walk — longer passages, run once per document. Favours quality.",
     prefer: [
-      "qwen3:8b", "gemma2:9b", "llama3.1:8b", "qwen2.5:7b",
+      "qwen3:30b-a3b", "qwen3:8b", "gemma2:9b", "llama3.1:8b", "qwen2.5:7b",
       "deepseek-r1:8b", "phi3:medium", "mistral", "qwen3",
     ],
   },

@@ -10,7 +10,7 @@ import {
 } from "./router.js";
 import {
   READ_SYSTEM, INGEST_SYSTEM, EXTRACT_SYSTEM, MUTATE_SYSTEM,
-  INTERVALS, splitPassages,
+  INTERVALS, splitPassages, classifyPassage, attachChromeContext, gateClassify,
   signal, retrieve, firstPass, lookupDocuments, formatRetrieved, buildStatus, buildPosition, buildRegister,
   collectSpans, dossierHashOf, logUserMessage, logModelResponse, logPassage,
   buildExtractPrompt, buildMutatePrompt, buildHypothesisPrompt, getHypothesisSystemPrompt,
@@ -656,6 +656,7 @@ function ChunkTrace({ chunk }) {
   const [open, setOpen] = useState(false);
   const stColor = chunk.status === "done" ? C.green
     : chunk.status === "error" ? C.red
+    : chunk.status === "chrome" ? C.dim
     : (chunk.status === "reading" || chunk.status === "scanning") ? C.orange : C.dim;
   const ner = chunk.signal?.ner || chunk.signal || { names: [], dates: [], numbers: [] };
   const kws = chunk.signal?.keywords || [];
@@ -663,6 +664,7 @@ function ChunkTrace({ chunk }) {
     : chunk.status === "reading" ? "reading…"
     : chunk.status === "scanning" ? "scanning…"
     : chunk.status === "error" ? "error"
+    : chunk.status === "chrome" ? "chrome · skipped"
     : chunk.status === "stopped" ? "stopped" : "queued";
   return (
     <div style={{ border: `1px solid ${C.border}`, borderRadius: 8, marginBottom: 6, background: C.bg }}>
@@ -785,7 +787,7 @@ function DocCard({ doc, attached, canToggle, onToggle, onRemove }) {
   const [open, setOpen] = useState(false);
   const st = docStats(doc);
   const trace = Array.isArray(doc.trace) ? doc.trace : [];
-  const done = trace.filter(t => t.status === "done" || t.status === "error").length;
+  const done = trace.filter(t => ["done", "error", "chrome"].includes(t.status)).length;
   const errors = trace.filter(t => t.status === "error").length;
   const total = trace.length || doc.passages || 0;
   const pct = total ? Math.round((done / total) * 100) : 100;
@@ -865,7 +867,7 @@ function LibraryModal({ open, onClose, library, activeConvo, canIngest,
     onIngest(text, title.trim(), source);
   };
 
-  const traceDone = ingestTrace.filter(t => ["done", "error", "stopped"].includes(t.status)).length;
+  const traceDone = ingestTrace.filter(t => ["done", "error", "stopped", "chrome"].includes(t.status)).length;
   const traceScanned = ingestTrace.filter(t => t.status !== "pending").length;
   const learned = ingestTrace.reduce((n, t) => n + (t.applied || 0), 0);
   const reading = ingestTrace.find(t => t.status === "reading");
@@ -1273,7 +1275,7 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
      directly. Async because the Reach embeds the message first. */
   const memorySystemPrompt = async (convo, sig, text, { excludePassages = false } = {}) => {
     store.setScope(convo.id);
-    let results = await retrieve(text);
+    let results = await retrieve(text, { position: convo?.lastTurn });
     store.setScope(convo.id);
     // One representation per passage: when a [DOCS] block carries the raw
     // unwalked text, drop the redundant ≈ passage entries from the dossier.
@@ -1652,10 +1654,28 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
     }
     if (!dbReady) { setIngestRunning(false); return; }
 
+    // Library deduplication — if this exact text was already read, reuse the
+    // existing document instead of minting a second graph for it.
+    const textHash = store.mintHash(text);
+    const dup = library.find(d => d.textHash === textHash);
+    if (dup) {
+      logEvent("info", "ingest", `Duplicate document — reusing "${dup.title}"`, dup.id);
+      setConvos(prev => prev.map(c => c.id === convoId
+        ? { ...c, mode: "memory", updatedAt: Date.now(),
+            docs: [...new Set([...(c.docs || []), dup.id])] }
+        : c));
+      return;
+    }
+
     const docId = "d" + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
     const passages = splitPassages(text);
+    // Chrome detection — classify each passage's terrain before the walk.
+    // Chrome (transitions, attributions, filler) is stored but not walked.
+    const classes = passages.map((p, i) => classifyPassage(p, i, passages.length));
+    const chromeContext = attachChromeContext(passages, classes);
     const trace = passages.map((c, i) => ({
       index: i, chars: c.length, text: c, signal: signal(c),
+      classification: classes[i],
       status: "pending", rawOutput: "", ops: [], applied: 0,
     }));
     const sync = () => setIngestTrace(trace.map(t => ({ ...t })));
@@ -1669,12 +1689,14 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
       source: source || "pasted text",
       addedAt: new Date().toISOString(),
       chars: text.length, passages: passages.length, scope: convoId, text,
+      textHash,
     };
     const snapshotDoc = () => ({
       ...docMeta,
       learned: trace.reduce((n, t) => n + (t.applied || 0), 0),
       trace: trace.map(t => ({
         index: t.index, chars: t.chars, status: t.status, applied: t.applied,
+        classification: t.classification,
         signal: { names: t.signal.ner.names, dates: t.signal.ner.dates, keywords: t.signal.keywords },
         ops: t.ops, ambigs: t.ambigs || [], rawOutput: t.rawOutput,
       })),
@@ -1724,6 +1746,18 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
     try {
     for (let i = 0; i < passages.length; i++) {
       if (ingestAbortRef.current) { trace[i].status = "stopped"; sync(); break; }
+      // Chrome passages carry no extractable content — skip the LLM walk and
+      // save the tokens. They are still stored, and their text is attached as
+      // context to the nearest content passage.
+      if (classes[i].type === "chrome") {
+        trace[i].status = "chrome";
+        trace[i].applied = 0;
+        store.setScope(convoId);
+        store.documents.setWalked(docId, i + 1);
+        sync();
+        persistDoc();
+        continue;
+      }
       // Yield the GPU to any foreground response — the walk waits for the
       // user, never the other way around.
       while (walkPausedRef.current && !ingestAbortRef.current) {
@@ -1735,9 +1769,13 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
         const givenId = givenIds[i] || logPassage(passages[i], docId, i, { title }).id;
         store.setScope(convoId);
         const register = buildRegister();
+        const ctx = chromeContext[i] || [];
+        const passageText = ctx.length
+          ? `Context: ${ctx.join(" ")}\n\nPassage: "${passages[i]}"`
+          : passages[i];
         walkInFlightRef.current = chatOnce(model, [
           { role: "system", content: INGEST_SYSTEM },
-          { role: "user", content: `${register}\n\nPASSAGE:\n${passages[i]}` },
+          { role: "user", content: `${register}\n\nPASSAGE:\n${passageText}` },
         ], EVENT_SCHEMA);
         let out;
         try { out = await walkInFlightRef.current; }
@@ -1776,6 +1814,47 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
     } catch (e) {
       /* unexpected failure — the document is left partially read */
       console.error("ingest failed", e);
+    }
+
+    // Chrome audit — a "chrome" passage that names an entity the walk never
+    // saw was misclassified. Reclassify it as content and walk it now.
+    for (let i = 0; i < passages.length; i++) {
+      if (ingestAbortRef.current) break;
+      if (classes[i].type !== "chrome") continue;
+      const names = signal(passages[i]).ner.names;
+      store.setScope(convoId);
+      const unknowns = names.filter(n => store.entities.search(n).length === 0);
+      if (!unknowns.length) continue;
+      classes[i] = { type: "content", confidence: "revised" };
+      trace[i].classification = classes[i];
+      trace[i].status = "reading"; sync();
+      try {
+        const givenId = givenIds[i] || logPassage(passages[i], docId, i, { title }).id;
+        store.setScope(convoId);
+        const register = buildRegister();
+        const out = await chatOnce(model, [
+          { role: "system", content: INGEST_SYSTEM },
+          { role: "user", content: `${register}\n\nPASSAGE:\n${passages[i]}` },
+        ], EVENT_SCHEMA);
+        const events = parseEvents(out);
+        const spanVecs = await store.embedDefSpans(events);
+        store.setScope(convoId);
+        const res = store.applyEvents(events, givenId, spanVecs);
+        for (const id of res.touched) docTouched.add(id);
+        trace[i].applied = res.applied;
+        trace[i].ambigs = res.ambigs;
+        allAmbigs.push(...res.ambigs);
+        trace[i].rawOutput = typeof out === "string" ? out : JSON.stringify(out);
+        trace[i].ops = events;
+        trace[i].status = "done";
+        logEvent("info", "ingest", `Passage ${i + 1} reclassified as content`,
+          `+${res.applied} ops · introduced ${unknowns.join(", ")}`, events.map(formatOp));
+      } catch (e) {
+        trace[i].status = "error";
+        trace[i].rawOutput = String(e?.message || e);
+      }
+      sync();
+      persistDoc();
     }
 
     // Each AMBIG the ingest emitted fires a MUTATE call for a clean decision.
@@ -2004,13 +2083,23 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
     // model entry carries the dossier projection that produced it. The walk
     // resumes once this turn's extract has run.
     if (mode === "memory" && memCtx && finalContent) {
-      const turn = (existing?.messages.filter(m => m.role === "assistant").length || 0) + 1;
-      const userGiven = logUserMessage(text, memCtx.sig, convoId, turn);
-      const modelGiven = logModelResponse(finalContent, chosenModel, memCtx.dossierHash, convoId, turn);
-      patchMsg(convoId, aId, { givenId: modelGiven.id });
-      runExtract(convoId, aId, userGiven, modelGiven, backgroundModel(chosenModel), memCtx)
-        .catch(() => {})
-        .finally(() => { walkPausedRef.current = false; });
+      // The Gate — meta-conversation about the app and casual chatter carry
+      // no knowledge. They skip EXTRACT entirely so the walk never mints
+      // entities for filler.
+      const gate = gateClassify(text);
+      if (!gate.knowledgeBearing) {
+        logEvent("info", "memory",
+          `Skipped extract — message is not knowledge-bearing (${gate.intent})`);
+        walkPausedRef.current = false;
+      } else {
+        const turn = (existing?.messages.filter(m => m.role === "assistant").length || 0) + 1;
+        const userGiven = logUserMessage(text, memCtx.sig, convoId, turn);
+        const modelGiven = logModelResponse(finalContent, chosenModel, memCtx.dossierHash, convoId, turn);
+        patchMsg(convoId, aId, { givenId: modelGiven.id });
+        runExtract(convoId, aId, userGiven, modelGiven, backgroundModel(chosenModel), memCtx)
+          .catch(() => {})
+          .finally(() => { walkPausedRef.current = false; });
+      }
     } else {
       walkPausedRef.current = false;
     }
