@@ -11,7 +11,7 @@ import {
 import {
   READ_SYSTEM, INGEST_SYSTEM, EXTRACT_SYSTEM, MUTATE_SYSTEM,
   INTERVALS, splitSentences, batchSentences,
-  signal, reach, firstPass, buildDossier, buildStatus, buildPosition, buildRegister,
+  signal, retrieve, firstPass, formatRetrieved, buildStatus, buildPosition, buildRegister,
   collectSpans, dossierHashOf, logUserMessage, logModelResponse, logPassage,
   buildExtractPrompt, buildMutatePrompt, buildHypothesisPrompt, getHypothesisSystemPrompt,
   parseEvents, detectMutationTriggers, userCorrectionTrigger, parseMutate, applyMutation, commitTier,
@@ -855,6 +855,71 @@ function LibraryModal({ open, onClose, library, activeConvo, canIngest,
   );
 }
 
+/* ── Given-Log row — one recorded message, long imports collapsed ── */
+function LogRow({ entry }) {
+  const [open, setOpen] = useState(false);
+  const text = entry.text || "";
+  const long = text.length > 240;
+  const body = (open || !long) ? text : text.slice(0, 240) + "…";
+  const agentColor = entry.agent === "user" ? C.accent
+    : (entry.agent || "").startsWith("model:") ? C.green : C.orange;
+  const agentLabel = entry.agent === "user" ? "you"
+    : (entry.agent || "").startsWith("model:") ? entry.agent.slice(6)
+    : entry.agent === "system:walker" ? "document" : (entry.agent || "?");
+  return (
+    <div style={{ borderBottom: `1px solid ${C.border}`, padding: "8px 2px" }}>
+      <div style={{ display: "flex", gap: 8, alignItems: "center", fontFamily: mono, fontSize: 10, marginBottom: 3 }}>
+        <span style={{ color: agentColor, fontWeight: 700 }}>{agentLabel}</span>
+        <span style={{ color: C.dim }}>{entry.mode}{entry.passage_idx != null ? ` · p${entry.passage_idx + 1}` : ""}</span>
+        <span style={{ flex: 1 }} />
+        <span style={{ color: C.dim }}>{entry.id}</span>
+      </div>
+      <div style={{ fontSize: 12, color: C.text, lineHeight: 1.5, whiteSpace: "pre-wrap", wordBreak: "break-word" }}>{body}</div>
+      {long && (
+        <button onClick={() => setOpen(o => !o)} style={{
+          marginTop: 3, background: "transparent", border: "none", color: C.accent,
+          fontFamily: mono, fontSize: 10, cursor: "pointer", padding: 0 }}>
+          {open ? "show less" : `show more (${text.length} chars)`}
+        </button>
+      )}
+    </div>
+  );
+}
+
+/* ── Given-Log modal — the append-only record of every message in a chat ── */
+function GivenLogModal({ open, onClose, entries }) {
+  if (!open) return null;
+  return (
+    <div onClick={onClose} style={{
+      position: "fixed", inset: 0, background: "rgba(0,0,0,.62)", zIndex: 50,
+      display: "flex", alignItems: "center", justifyContent: "center", padding: 24,
+    }}>
+      <div onClick={e => e.stopPropagation()} style={{
+        width: "min(680px, 100%)", maxHeight: "86vh", display: "flex", flexDirection: "column",
+        background: C.s1, border: `1px solid ${C.border}`, borderRadius: 14,
+        boxShadow: "0 20px 56px rgba(0,0,0,.55)",
+      }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "14px 18px",
+          borderBottom: `1px solid ${C.border}` }}>
+          <Icon name="memory" size={15} />
+          <div style={{ fontSize: 13.5, fontWeight: 700, flex: 1 }}>Given-Log · {entries.length} entries</div>
+          <button onClick={onClose} style={{ background: "transparent", border: "none",
+            color: C.dim, cursor: "pointer", display: "flex" }}>
+            <Icon name="x" size={16} />
+          </button>
+        </div>
+        <div style={{ flex: 1, overflowY: "auto", padding: "6px 18px 14px" }}>
+          {entries.length === 0
+            ? <div style={{ padding: "24px 0", fontSize: 12, color: C.dim, textAlign: "center" }}>
+                No log entries yet — chat or read a document in Memory mode.
+              </div>
+            : entries.map(e => <LogRow key={e.id} entry={e} />)}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 /* ── Main chat ── */
 export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [], ollamaUp }) {
   // Auto-routing and routing feedback operate on the Ollama roster only.
@@ -872,6 +937,7 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
   const [wrongModelFor, setWrongModelFor] = useState(null);
   const [library, setLibrary] = useState(loadLibrary);
   const [libOpen, setLibOpen] = useState(false);
+  const [logOpen, setLogOpen] = useState(false);
   const [ingestRunning, setIngestRunning] = useState(false);
   const [ingestTrace, setIngestTrace] = useState([]);
   /* The graph lives in SQLite (local-store.js), scoped per chat. dbReady
@@ -965,16 +1031,16 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
      directly. Async because the Reach embeds the message first. */
   const memorySystemPrompt = async (convo, sig, text) => {
     store.setScope(convo.id);
-    const ranked = await reach(sig, text);
+    const results = await retrieve(text);
     store.setScope(convo.id);
-    const dossier = buildDossier(ranked);
+    const dossier = formatRetrieved(results);
     const parts = [READ_SYSTEM, buildStatus(), dossier, buildPosition(convo?.lastTurn)].filter(Boolean);
     return {
       content: parts.join("\n\n"),
-      used: ranked.length,
-      ranked,
+      used: results.length,
+      results,
       dossierHash: dossierHashOf(dossier),
-      spans: collectSpans(ranked),
+      spans: collectSpans(results),
     };
   };
 
@@ -1295,7 +1361,7 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
     if (corr) triggers.push(corr);
 
     const lastTurn = {
-      entities: (memCtx.ranked || []).map(r => r.entity.id),
+      entities: (memCtx.results || []).filter(r => r.type === "entity").map(r => r.id),
       topic: (memCtx.sig?.keywords || []).slice(0, 3).join(" "),
       userMessage: userGiven.text.slice(0, 100),
     };
@@ -1593,7 +1659,7 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
         { role: "system", content: sys.content },
         { role: "user", content: text },
       ];
-      memCtx = { sig, ranked: sys.ranked, dossierHash: sys.dossierHash, spans: sys.spans };
+      memCtx = { sig, results: sys.results, dossierHash: sys.dossierHash, spans: sys.spans };
       memBadge = { used: sys.used };
     } else {
       const apiHistory = quantize ? quantizeHistory(history) : history;
@@ -1786,6 +1852,9 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
           )}
           <HeaderBtn icon="book" label="Library" onClick={() => setLibOpen(true)}
             badge={library.length || undefined} />
+          {active && mode === "memory" && dbReady && (
+            <HeaderBtn icon="memory" label="Log" onClick={() => setLogOpen(true)} />
+          )}
           {active && <HeaderBtn icon="download" label="Export" onClick={() => exportConvo(active)} />}
           {headerModel && (
             <span style={{ display: "flex", alignItems: "center", gap: 6, padding: "5px 10px", background: C.s1, border: `1px solid ${C.border}`, borderRadius: 7, fontFamily: mono, fontSize: 11.5, flexShrink: 0 }}>
@@ -1875,6 +1944,10 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
         ingestRunning={ingestRunning} ingestTrace={ingestTrace}
         onIngest={runIngest} onStopIngest={() => { ingestAbortRef.current = true; }}
         onToggleDoc={toggleDoc} onRemoveDoc={removeDoc}
+      />
+      <GivenLogModal
+        open={logOpen} onClose={() => setLogOpen(false)}
+        entries={(logOpen && active && dbReady) ? (store.setScope(active.id), store.given.getAll()) : []}
       />
     </div>
   );

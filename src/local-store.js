@@ -548,6 +548,44 @@ export function recentShifts(sinceMs = 5 * 60 * 1000, limit = 3) {
     [scope, Date.now() - sinceMs, limit]);
 }
 
+/* ── Provenance — where a piece of knowledge came from ──
+
+   Not every thought carries the same weight. A claim from an imported
+   document is source material; a claim from the conversation is something
+   said in chat; a hypothesis is the system's own inference. originOf
+   classifies a source id; entityOrigin aggregates over an entity. */
+
+export function originOf(sourceId) {
+  if (!sourceId) return { class: "unknown", label: "unattributed" };
+  const s = String(sourceId);
+  if (s === "ner:firstpass") return { class: "scan", label: "an unread NER scan" };
+  if (s.startsWith("mutate:")) return { class: "inference", label: "graph maintenance" };
+  if (s.startsWith("inference")) return { class: "inference", label: "a system inference" };
+  const g = given.get(s);
+  if (!g) return { class: "unknown", label: "unattributed" };
+  if (g.mode === "document" || g.agent === "system:walker" || g.agent === "system:firstpass") {
+    const doc = g.document_id ? documents.get(g.document_id) : null;
+    return { class: "document", label: doc?.title ? `document "${doc.title}"` : "an imported document" };
+  }
+  if (g.agent === "user") return { class: "conversation", label: "you said in this conversation" };
+  if (g.agent && g.agent.startsWith("model:")) return { class: "conversation", label: "the assistant said in this conversation" };
+  return { class: "unknown", label: "unattributed" };
+}
+
+export function entityOrigin(entityId) {
+  const classes = new Set();
+  const docs = new Set();
+  const note = (src) => {
+    const o = originOf(src);
+    classes.add(o.class);
+    if (o.class === "document") docs.add(o.label);
+  };
+  for (const d of defs.getFor(entityId)) note(d.source);
+  for (const e of edges.getFor(entityId)) if (e.source) note(e.source);
+  for (const m of mentions.forEntity(entityId)) note(m.given_id);
+  return { classes: [...classes], documents: [...docs] };
+}
+
 /* ── Embeddings ── */
 
 export const vectors = {
@@ -615,6 +653,22 @@ export const vectors = {
     return db.selectObjects("SELECT entity_id, vector FROM vec_centroids WHERE scope=?", [scope])
       .map(r => ({ entityId: r.entity_id, similarity: cosineSim(qv, toVec(r.vector)) }))
       .sort((a, b) => b.similarity - a.similarity).slice(0, topK);
+  },
+  /* Decoded vectors for the multi-signal retriever to score against. */
+  dumpCentroids() {
+    return db.selectObjects("SELECT entity_id, vector FROM vec_centroids WHERE scope=?", [scope])
+      .map(r => ({ entityId: r.entity_id, vec: toVec(r.vector) }));
+  },
+  dumpHypotheses() {
+    return db.selectObjects("SELECT entity_id, vector FROM vec_hypotheses WHERE scope=?", [scope])
+      .map(r => ({ entityId: r.entity_id, vec: toVec(r.vector) }));
+  },
+  dumpUnwalked() {
+    return db.selectObjects(`
+      SELECT v.id, v.vector, g.text, g.passage_idx, g.document_id
+      FROM vec_unwalked v JOIN given g ON v.id = g.id AND v.scope = g.scope
+      WHERE v.scope=?`, [scope])
+      .map(r => ({ id: r.id, vec: toVec(r.vector), text: r.text, passageIdx: r.passage_idx, documentId: r.document_id }));
   },
   /* The nearest walked (grounded) entity to a SIG entity's centroid —
      "this impression looks like something we already know." */

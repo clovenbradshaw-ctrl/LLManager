@@ -44,10 +44,13 @@ Reading [STATUS]:
   recent shifts: entities whose felt-sense shifted notably just now
 
 Reading [CTX]:
-  E: hash@state | terrain | edges     — grounded (read, provenanced)
-  ≈: name | terrain | READING         — still reading (provisional, low confidence)
+  E: hash@state | terrain | edges     — grounded entity (read, provenanced)
+  ≈ name | terrain | READING          — a still-forming impression
+  ≈ passage N | from document "..."   — raw unread text from a document
   ~: canonical name, aka aliases
-  h: current hypothesis
+  from: where this knowledge originated — an imported document, this
+        conversation, or a system inference. Weigh them differently.
+  h: the system's working interpretation — a hypothesis, NOT a stated fact
   →←: connection (type) target_hash
   =: field = value
   @: "verbatim source span"
@@ -58,10 +61,11 @@ Reading [POS]:
   topic: what we were discussing
   last: user's previous message
 
-For ≈ entries, say what you can see so far and that you are still reading;
-do not speculate beyond the NER tags and co-occurrences shown. For grounded
-entries, answer with confidence and cite spans. If asked about something you
-have only an impression of, say so.`;
+Knowledge from an imported document is source material; knowledge from this
+conversation is what you and the user said; a hypothesis is the system's own
+guess. Never present a hypothesis or a conversational remark as if it were a
+sourced fact. For ≈ entries, say what you can see so far and that it is not
+yet fully read. For grounded entries, answer with confidence and cite spans.`;
 
 export const READ_CASUAL = `You are a helpful assistant. Be concise and natural.
 Your messages are recorded in a knowledge graph.`;
@@ -328,53 +332,88 @@ export function signal(message) {
   return { ner: extractNER(message), keywords: extractKeywords(message) };
 }
 
-/* ═══ The Reach — embedding recall + mechanical scoring ═══
+/* ═══ The Reach — SIG-level RAG ═══
 
-   The embedding phase runs prior to prompting: the message is matched
-   against entity centroids and hypothesis vectors. Mechanical NER/keyword
-   matches and a 1-hop edge expansion are blended in. */
+   Standard RAG has one signal: embedding similarity. The Reach has five —
+   embedding similarity, NER entity overlap, keyword overlap, co-occurrence
+   density and passage position — and provenance on every result. It mixes
+   grounded entities (structured, cheap per token) with unwalked passages
+   (raw text), then deduplicates so a 350-token dossier is never wasted on a
+   passage that an entity already covers. */
 
-/* Epistemic weight: a walked, provenanced entity outweighs a vibes-based
-   SIG match. Structure beats impression. */
-const STATUS_WEIGHT = { walked: 1.0, walking: 0.7, sig: 0.4 };
+const STATUS_WEIGHT = { walked: 1.0, walking: 0.85, sig: 0.6 };
 
-export async function reach(sig, message) {
+export async function retrieve(query, { topK = 6 } = {}) {
   const myScope = store.getScope();
-  const cand = new Map();
-  const add = (id, s) => cand.set(id, (cand.get(id) || 0) + s);
+  const sig = signal(query);
+  const queryEntities = sig.ner.names.map(n => n.toLowerCase());
+  const queryKeywords = sig.keywords;
+  let queryVec = null;
+  try { queryVec = await store.embed(query); } catch { /* embeddings optional */ }
+  store.setScope(myScope); // re-assert after the embed await
 
-  for (const name of sig.ner.names) {
-    for (const e of store.entities.search(name)) add(e.id, 3);
-  }
-  for (const kw of sig.keywords.slice(0, 12)) {
-    for (const e of store.entities.search(kw)) add(e.id, 1);
-  }
-  try {
-    const [byCentroid, byHypothesis] = await Promise.all([
-      store.vectors.findSimilarEntities(message, 6),
-      store.vectors.findSimilarByHypothesis(message, 6),
-    ]);
-    for (const m of byCentroid) add(m.entityId, m.similarity * 4);
-    for (const m of byHypothesis) add(m.entityId, m.similarity * 3);
-  } catch { /* embedding model unavailable — mechanical signals stand */ }
+  const results = [];
 
-  store.setScope(myScope); // re-assert after the embed awaits
-  for (const id of [...cand.keys()]) {
-    for (const nid of store.edges.getNeighbors(id, 1)) if (!cand.has(nid)) add(nid, 0.5);
+  // ── Tier A: entities (all grades carry a centroid from the first pass) ──
+  const hypMap = {};
+  for (const h of store.vectors.dumpHypotheses()) hypMap[h.entityId] = h.vec;
+  for (const row of store.vectors.dumpCentroids()) {
+    const entity = store.entities.get(row.entityId);
+    if (!entity) continue;
+    const centroidSim = queryVec ? cosineSim(queryVec, row.vec) : 0;
+    const hypSim = (queryVec && hypMap[row.entityId]) ? cosineSim(queryVec, hypMap[row.entityId]) : 0;
+    const name = entity.canonical.toLowerCase();
+    const nameMatch = queryEntities.some(qe => name.includes(qe) || qe.includes(name)
+      || (entity.aliases || []).some(a => a.toLowerCase().includes(qe)));
+    const kwMatch = queryKeywords.some(k => name.includes(k) || (entity.hypothesis || "").toLowerCase().includes(k));
+    let score = (centroidSim * 0.3) + (hypSim * 0.3) + (nameMatch ? 0.4 : 0) + (kwMatch ? 0.1 : 0);
+    score *= (STATUS_WEIGHT[entity.status] ?? 0.6);
+    if (score > 0.12) {
+      results.push({
+        type: "entity", id: entity.id, status: entity.status,
+        canonical: entity.canonical, ner: [entity.canonical], score,
+      });
+    }
   }
 
-  // Weight each candidate by its epistemic register before ranking.
-  return [...cand.entries()]
-    .map(([id, raw]) => {
-      const entity = store.entities.get(id);
-      if (!entity) return null;
-      const score = raw * (STATUS_WEIGHT[entity.status] ?? 0.4);
-      return { entity, score };
-    })
-    .filter(Boolean)
-    .sort((a, b) => b.score - a.score)
-    .slice(0, 6)
-    .map(r => ({ entity: r.entity, tier: r.score >= 3 ? 1 : r.score >= 1 ? 2 : 3 }));
+  // ── Tier B: unwalked passages, scored by five signals ──
+  for (const row of store.vectors.dumpUnwalked()) {
+    const pSig = signal(row.text);
+    const passageEntities = pSig.ner.names.map(n => n.toLowerCase());
+    const embSim = queryVec ? cosineSim(queryVec, row.vec) : 0;
+    const nerOverlap = queryEntities.filter(qe =>
+      passageEntities.some(pe => pe.includes(qe) || qe.includes(pe))).length;
+    const nerScore = queryEntities.length ? nerOverlap / queryEntities.length : 0;
+    const kwOverlap = queryKeywords.filter(k => pSig.keywords.includes(k)).length;
+    const kwScore = queryKeywords.length ? kwOverlap / queryKeywords.length : 0;
+    const cooccur = Math.min(nerOverlap / 3, 1);
+    const total = store.documents.get(row.documentId)?.total || 0;
+    const positionScore = (row.passageIdx === 0 || (total && row.passageIdx === total - 1)) ? 0.1 : 0;
+    const score = (embSim * 0.35) + (nerScore * 0.25) + (kwScore * 0.15) + (cooccur * 0.15) + positionScore;
+    if (score > 0.10) {
+      results.push({
+        type: "passage", id: row.id, status: "sig", text: row.text,
+        passageIndex: row.passageIdx, documentId: row.documentId,
+        ner: pSig.ner.names, score,
+      });
+    }
+  }
+
+  results.sort((a, b) => b.score - a.score);
+
+  // Deduplicate — a structured entity beats a raw passage that only repeats
+  // names the entity already carries.
+  const seen = new Set();
+  const deduped = [];
+  for (const r of results) {
+    if (r.type === "entity") { seen.add(r.canonical.toLowerCase()); deduped.push(r); }
+    else {
+      const nl = (r.ner || []).map(n => n.toLowerCase());
+      const covered = nl.length > 0 && nl.every(n => [...seen].some(s => s.includes(n) || n.includes(s)));
+      if (!covered) deduped.push(r);
+    }
+  }
+  return deduped.slice(0, topK);
 }
 
 /* The first pass — mechanical NER, no model. Mints SIG entities the instant
@@ -459,72 +498,94 @@ export function buildStatus() {
   return `[STATUS]\n${lines.join("\n")}\n[/STATUS]`;
 }
 
-/* ═══ The Dossier — projected [CTX] block ═══ */
+/* Where an entity's knowledge came from — one line, so the model can weigh
+   a source document differently from something said in conversation. */
+function originLine(entityId) {
+  const o = store.entityOrigin(entityId);
+  const parts = [...o.documents];
+  if (o.classes.includes("conversation")) parts.push("this conversation");
+  if (!parts.length && o.classes.includes("scan")) parts.push("an unread NER scan");
+  if (!parts.length && o.classes.includes("inference")) parts.push("a system inference");
+  return parts.length ? parts.join(" + ") : null;
+}
 
-export function buildDossier(rankedEntities, maxTokens = 350) {
+/* A grounded (walked) entity block — structured and provenanced. */
+function formatWalked(entity, full = true) {
+  const stateHash = store.computeStateHash(entity.id);
+  const edges = store.edges.getFor(entity.id);
+  const defs = store.defs.getFor(entity.id);
+  const from = originLine(entity.id);
+  let b = `E: ${entity.id}@${stateHash} | ${entity.terrain} | ${edges.length}`;
+  b += `\n  ~ ${entity.canonical}${entity.aliases?.length ? ", aka " + entity.aliases.join(", ") : ""}`;
+  if (from) b += `\n  from: ${from}`;
+  b += `\n  h: ${(entity.hypothesis || "?").slice(0, 130)}`;
+  if (full) {
+    for (const edge of edges.slice(0, 3)) {
+      const dir = edge.from_id === entity.id ? "→" : "←";
+      const target = edge.from_id === entity.id ? edge.to_id : edge.from_id;
+      b += `\n  ${dir} ${target} (${edge.type})`;
+    }
+    let spanDone = false;
+    for (const def of defs.slice(0, 3)) {
+      b += `\n  = ${def.field}: "${def.value}"`;
+      if (def.span && !spanDone) { b += ` @"${def.span.slice(0, 50)}"`; spanDone = true; }
+    }
+    for (const c of store.defs.getConflicts(entity.id).slice(0, 1)) b += `\n  ⚠ ${c.field}: ${c.vals}`;
+  } else {
+    for (const def of defs.slice(0, 2)) b += `\n  = ${def.field}: "${def.value}"`;
+  }
+  return b;
+}
+
+/* A forming (walking) entity block — partial structure, still being read. */
+function formatWalking(entity) {
+  const from = originLine(entity.id);
+  let b = `E: ${entity.id}@${store.computeStateHash(entity.id)} | ${entity.terrain} | PARTIAL`;
+  b += `\n  ~ ${entity.canonical}`;
+  if (from) b += `\n  from: ${from}`;
+  b += `\n  h: ${entity.hypothesis || "(forming)"}`;
+  for (const def of store.defs.getFor(entity.id).slice(0, 2)) b += `\n  = ${def.field}: "${def.value}"`;
+  return b;
+}
+
+/* ═══ Format the retrieved results into the [CTX] block ═══
+
+   Mixed-grade: grounded entities (E:), forming entities (PARTIAL), SIG
+   impressions and raw unwalked passages (≈). Each carries its provenance. */
+export function formatRetrieved(results, maxTokens = 350) {
   let budget = maxTokens;
   const blocks = [];
-  for (const { entity, tier } of rankedEntities) {
-    if (!entity) continue;
-    const status = entity.status || "sig";
-
-    // SIG — impressionistic. NER found it, not yet walked: a provisional
-    // entry that shows what can be seen so far without claiming provenance.
-    if (status === "sig") {
-      if (budget < 25) break;
-      blocks.push(buildProvisionalEntry(entity));
-      budget -= 25;
-      continue;
-    }
-
-    const stateHash = store.computeStateHash(entity.id);
-    const edges = store.edges.getFor(entity.id);
-    const defs = store.defs.getFor(entity.id);
-    const conflicts = store.defs.getConflicts(entity.id);
-    const aliases = entity.aliases?.length ? entity.aliases.join(", ") : null;
-
-    // WALKING — partial structure, still forming. Some claims, no hypothesis yet.
-    if (status === "walking") {
-      if (budget < 40) break;
-      let b = `E: ${entity.id}@${stateHash} | ${entity.terrain} | PARTIAL`;
-      b += `\n  ~ ${entity.canonical}`;
-      b += `\n  h: ${entity.hypothesis || "(forming)"}`;
-      for (const def of defs.slice(0, 2)) b += `\n  = ${def.field}: "${def.value}"`;
-      blocks.push(b); budget -= 40;
-      continue;
-    }
-
-    // WALKED — grounded, provenanced. Show everything.
-    if (tier === 1 && budget >= 65) {
-      let b = `E: ${entity.id}@${stateHash} | ${entity.terrain} | ${edges.length}`;
-      b += `\n  ~ ${entity.canonical}${aliases ? ", aka " + aliases : ""}`;
-      b += `\n  h: ${(entity.hypothesis || "?").slice(0, 130)}`;
-      for (const edge of edges.slice(0, 3)) {
-        const dir = edge.from_id === entity.id ? "→" : "←";
-        const target = edge.from_id === entity.id ? edge.to_id : edge.from_id;
-        b += `\n  ${dir} ${target} (${edge.type})`;
+  for (const r of results) {
+    if (budget <= 0) break;
+    if (r.type === "entity") {
+      const entity = store.entities.get(r.id);
+      if (!entity) continue;
+      if (entity.status === "walked") {
+        if (budget >= 65) { blocks.push(formatWalked(entity, true)); budget -= 65; }
+        else if (budget >= 35) { blocks.push(formatWalked(entity, false)); budget -= 35; }
+      } else if (entity.status === "walking") {
+        if (budget >= 40) { blocks.push(formatWalking(entity)); budget -= 40; }
+      } else {
+        if (budget >= 25) { blocks.push(buildProvisionalEntry(entity)); budget -= 25; }
       }
-      let spanDone = false;
-      for (const def of defs.slice(0, 3)) {
-        b += `\n  = ${def.field}: "${def.value}"`;
-        if (def.span && !spanDone) { b += ` @"${def.span.slice(0, 50)}"`; spanDone = true; }
+    } else { // raw unwalked passage
+      const doc = store.documents.get(r.documentId);
+      const docLabel = doc?.title ? `document "${doc.title}"` : "an imported document";
+      if (budget >= 40) {
+        const t = r.text.length > 200 ? r.text.slice(0, 200) + "…" : r.text;
+        let b = `≈ passage ${r.passageIndex + 1} | from ${docLabel} | UNREAD`;
+        b += `\n  "${t}"`;
+        if (r.ner?.length) b += `\n  mentions: ${r.ner.join(", ")}`;
+        blocks.push(b); budget -= 40;
+      } else if (budget >= 20) {
+        blocks.push(`≈ passage ${r.passageIndex + 1} from ${docLabel} | "${r.text.slice(0, 120)}…"`);
+        budget -= 20;
       }
-      for (const c of conflicts.slice(0, 1)) b += `\n  ⚠ ${c.field}: ${c.vals}`;
-      blocks.push(b); budget -= 65;
-    } else if (tier === 2 && budget >= 35) {
-      let b = `E: ${entity.id}@${stateHash} | ${entity.terrain}`;
-      b += `\n  ~ ${entity.canonical}`;
-      b += `\n  h: ${(entity.hypothesis || "?").slice(0, 130)}`;
-      for (const def of defs.slice(0, 2)) b += `\n  = ${def.field}: "${def.value}"`;
-      blocks.push(b); budget -= 35;
-    } else if (budget >= 15) {
-      blocks.push(`E: ${entity.id}@${stateHash} | ${entity.terrain}\n  ~ ${entity.canonical}\n  h: ${(entity.hypothesis || "?").slice(0, 100)}`);
-      budget -= 15;
-    } else break;
+    }
   }
   return blocks.length
     ? `[CTX]\n${blocks.join("\n\n")}\n[/CTX]`
-    : "[CTX]\n(no matching entities)\n[/CTX]";
+    : "[CTX]\n(no matching context)\n[/CTX]";
 }
 
 export function dossierHashOf(dossier) {
@@ -534,16 +595,20 @@ export function dossierHashOf(dossier) {
   return "d_" + h.toString(16).padStart(8, "0");
 }
 
-/* Source spans behind the projected dossier — DEF spans and EVA judgments. */
-export function collectSpans(rankedEntities) {
+/* Source spans behind the projected dossier — DEF spans, EVA judgments and
+   the raw text of any unwalked passages, each tagged with its origin. */
+export function collectSpans(results) {
   const spans = [];
-  for (const { entity } of rankedEntities) {
-    if (!entity) continue;
-    for (const d of store.defs.getFor(entity.id)) {
-      spans.push({ entity: entity.id, kind: "def", text: `${d.field}: ${d.value}`, source: d.source || d.span || null });
-    }
-    for (const v of store.evals.getFor(entity.id)) {
-      spans.push({ entity: entity.id, kind: "eva", text: `${v.claim} [${v.status}]`, source: v.source || null });
+  for (const r of results || []) {
+    if (r.type === "entity") {
+      for (const d of store.defs.getFor(r.id)) {
+        spans.push({ entity: r.id, kind: "def", text: `${d.field}: ${d.value}`, source: d.source || d.span || null });
+      }
+      for (const v of store.evals.getFor(r.id)) {
+        spans.push({ entity: r.id, kind: "eva", text: `${v.claim} [${v.status}]`, source: v.source || null });
+      }
+    } else if (r.type === "passage") {
+      spans.push({ entity: r.documentId, kind: "passage", text: r.text.slice(0, 200), source: r.id });
     }
   }
   return spans;
