@@ -11,7 +11,7 @@ import {
 import {
   READ_SYSTEM, INGEST_SYSTEM, EXTRACT_SYSTEM, MUTATE_SYSTEM,
   INTERVALS, splitSentences, batchSentences,
-  signal, retrieve, firstPass, formatRetrieved, buildStatus, buildPosition, buildRegister,
+  signal, retrieve, firstPass, lookupDocuments, formatRetrieved, buildStatus, buildPosition, buildRegister,
   collectSpans, dossierHashOf, logUserMessage, logModelResponse, logPassage,
   buildExtractPrompt, buildMutatePrompt, buildHypothesisPrompt, getHypothesisSystemPrompt,
   parseEvents, detectMutationTriggers, userCorrectionTrigger, parseMutate, applyMutation, commitTier,
@@ -517,7 +517,7 @@ function IconBtn({ onClick, active, disabled, title, icon }) {
 }
 
 /* ── Composer ── */
-function Composer({ value, setValue, model, groups, setModel, onSend, onStop, busy, isReply, quantize, setQuantize, mode }) {
+function Composer({ value, setValue, model, groups, setModel, onSend, onStop, busy, isReply, quantize, setQuantize, mode, askWithDocs, setAskWithDocs, docCount }) {
   const ref = useRef(null);
   useEffect(() => {
     if (ref.current) {
@@ -564,6 +564,21 @@ function Composer({ value, setValue, model, groups, setModel, onSend, onStop, bu
               }}>
               <span style={{ width: 6, height: 6, borderRadius: 99, background: quantize ? C.accent : C.dim, flexShrink: 0 }} />
               Quantize
+            </button>
+          )}
+          {docCount > 0 && (
+            <button
+              onClick={() => setAskWithDocs(v => !v)}
+              title="Ask with documents — pull the most relevant passages from this chat's opted-in documents straight into the prompt for your next message."
+              style={{
+                display: "flex", alignItems: "center", gap: 7, padding: "5px 9px",
+                background: askWithDocs ? "rgba(48,164,108,.18)" : C.s2,
+                border: `1px solid ${askWithDocs ? C.green : C.border}`, borderRadius: 7,
+                cursor: "pointer", fontFamily: mono, fontSize: 11, color: askWithDocs ? C.text : C.dim,
+              }}>
+              <span style={{ width: 6, height: 6, borderRadius: 99,
+                background: askWithDocs ? C.green : C.dim, flexShrink: 0 }} />
+              Ask with documents
             </button>
           )}
           <div style={{ flex: 1 }} />
@@ -1104,6 +1119,7 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
   const [logOpen, setLogOpen] = useState(false);
   const [ingestRunning, setIngestRunning] = useState(false);
   const [ingestTrace, setIngestTrace] = useState([]);
+  const [askWithDocs, setAskWithDocs] = useState(false);
   const [roleConfig, setRoleConfig] = useState(loadRoleConfig);
 
   const setRoleModel = (roleId, modelName) => {
@@ -1839,19 +1855,34 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
     // fixed-size prompt: system + projected dossier + one-turn position marker.
     // Every turn is projected and every turn is read back into the graph — the
     // prompt stays minimal regardless of how much the chat has covered.
+    // "Ask with documents": a manual, mechanical pull of the most relevant
+    // passages from this chat's opted-in library documents into the prompt.
+    let docBlock = "";
+    if (askWithDocs) {
+      const docs = attachedDocs(existing);
+      docBlock = lookupDocuments(text, docs);
+      logEvent(docBlock ? "info" : "warn", "lookup",
+        docBlock ? `Ask with documents — injected passages from ${docs.length} file(s)`
+                 : "Ask with documents on, but no document text to pull from");
+    }
+
     let apiMessages, memCtx = null, memBadge;
     if (mode === "memory" && dbReady) {
       const sig = signal(text);
       const sys = await memorySystemPrompt({ id: convoId, lastTurn: existing?.lastTurn }, sig, text);
       apiMessages = [
-        { role: "system", content: sys.content },
+        { role: "system", content: docBlock ? `${sys.content}\n\n${docBlock}` : sys.content },
         { role: "user", content: text },
       ];
       memCtx = { sig, results: sys.results, dossierHash: sys.dossierHash, spans: sys.spans };
       memBadge = { used: sys.used };
     } else {
       const apiHistory = quantize ? quantizeHistory(history) : history;
-      apiMessages = [...apiHistory, { role: "user", content: text }];
+      apiMessages = [
+        ...(docBlock ? [{ role: "system", content: docBlock }] : []),
+        ...apiHistory,
+        { role: "user", content: text },
+      ];
     }
 
     const userMsg = { id: "u" + Date.now(), role: "user", content: text };
@@ -2124,6 +2155,7 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
           isReply={messages.length > 0}
           quantize={quantize} setQuantize={setQuantize}
           mode={mode}
+          askWithDocs={askWithDocs} setAskWithDocs={setAskWithDocs} docCount={docCount}
         />
       </main>
       <LibraryModal

@@ -431,6 +431,48 @@ export async function retrieve(query, { topK = 6 } = {}) {
   return deduped.slice(0, topK);
 }
 
+/* Mechanical document lookup — no model, no embeddings. Splits each opted-in
+   document back into passages and scores every passage against the query by
+   keyword and entity-name overlap, returning the top matches as a [DOCUMENTS]
+   block to inject straight into the prompt. This backs the composer's
+   "ask with documents" trigger: a deterministic pull of source text, separate
+   from the graph projection. When nothing overlaps (a general question), it
+   falls back to each document's opening passages so the block is never empty. */
+export function lookupDocuments(query, docs, { topK = 6 } = {}) {
+  const qSig = signal(query || "");
+  const qKw = qSig.keywords;
+  const qNames = qSig.ner.names.map(n => n.toLowerCase());
+
+  const passages = [];
+  for (const doc of docs || []) {
+    const text = (doc?.text || "").trim();
+    if (!text) continue;
+    const split = batchSentences(splitSentences(text));
+    split.forEach((p, i) => passages.push({ text: p, index: i, title: doc.title || "document" }));
+  }
+  if (!passages.length) return "";
+
+  const scored = passages.map(p => {
+    const pSig = signal(p.text);
+    const pl = p.text.toLowerCase();
+    const kwHits = qKw.filter(k => pSig.keywords.includes(k) || pl.includes(k)).length;
+    const nameHits = qNames.filter(n => pl.includes(n)).length;
+    const kwScore = qKw.length ? kwHits / qKw.length : 0;
+    const nameScore = qNames.length ? nameHits / qNames.length : 0;
+    return { ...p, score: kwScore * 0.6 + nameScore * 0.4 };
+  });
+
+  let top = scored.filter(p => p.score > 0).sort((a, b) => b.score - a.score).slice(0, topK);
+  if (!top.length) top = passages.slice(0, topK); // general question — show the openings
+
+  const lines = top.map(r => `— from "${r.title}" (passage ${r.index + 1}):\n${r.text.trim()}`);
+  return `[DOCUMENTS]\nThe user is indicating they want you to answer with documents. `
+    + `Here is what was returned from that lookup process — the passages most relevant `
+    + `to their question, pulled mechanically from the uploaded files. Treat them as `
+    + `source material: quote or paraphrase as needed, and say plainly if they do not `
+    + `cover the question.\n\n${lines.join("\n\n")}\n[/DOCUMENTS]`;
+}
+
 /* The first pass — mechanical NER, no model. Mints SIG entities the instant
    text arrives: an impression with a centroid but no provenance, weighted
    low until a walk reaches it. Records a mention per (entity, passage) and,
