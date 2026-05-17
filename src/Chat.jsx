@@ -11,7 +11,8 @@ import {
 import {
   READ_SYSTEM, READ_CASUAL, INGEST_SYSTEM, EXTRACT_SYSTEM, MUTATE_SYSTEM,
   INTERVALS, splitPassages, classifyPassage, attachChromeContext, gateClassify,
-  signal, retrieve, firstPass, lookupDocuments, formatRetrieved, buildStatus, buildPosition, buildRegister,
+  signal, retrieve, firstPass, lookupDocuments, formatRetrieved, buildStatus, buildPosition,
+  buildReadingDigest, buildRegister,
   collectSpans, dossierHashOf, logUserMessage, logModelResponse, logPassage,
   buildExtractPrompt, buildMutatePrompt, buildHypothesisPrompt, buildSkimPrompt,
   getHypothesisSystemPrompt, HYPOTHESIS_SKIM,
@@ -89,6 +90,7 @@ const Icon = ({ name, size = 14 }) => {
     case "doc":     return <svg viewBox="0 0 24 24" {...s}><path d="M14 3v5h5M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8Z" /></svg>;
     case "x":       return <svg viewBox="0 0 24 24" {...s}><path d="M18 6 6 18M6 6l12 12" /></svg>;
     case "eye":     return <svg viewBox="0 0 24 24" {...s}><path d="M2 12s4-7 10-7 10 7 10 7-4 7-10 7-10-7-10-7Z" /><circle cx="12" cy="12" r="3" /></svg>;
+    case "check":   return <svg viewBox="0 0 24 24" {...s} stroke="#fff"><path d="M20 6 9 17l-5-5" /></svg>;
     default: return null;
   }
 };
@@ -531,7 +533,7 @@ function IconBtn({ onClick, active, disabled, title, icon }) {
 }
 
 /* ── Composer ── */
-function Composer({ value, setValue, model, groups, setModel, onSend, onStop, busy, isReply, quantize, setQuantize, mode, askWithDocs, setAskWithDocs, docCount }) {
+function Composer({ value, setValue, model, groups, setModel, onSend, onStop, busy, isReply, quantize, setQuantize, mode, askWithDocs, setAskWithDocs, docCount, onPickDocs }) {
   const ref = useRef(null);
   useEffect(() => {
     if (ref.current) {
@@ -593,6 +595,23 @@ function Composer({ value, setValue, model, groups, setModel, onSend, onStop, bu
               <span style={{ width: 6, height: 6, borderRadius: 99,
                 background: askWithDocs ? C.green : C.dim, flexShrink: 0 }} />
               Ask with documents
+            </button>
+          )}
+          {mode === "memory" && onPickDocs && (
+            <button
+              onClick={onPickDocs}
+              title="Choose which documents this chat reasons over, or add a new one."
+              style={{
+                display: "flex", alignItems: "center", gap: 6, padding: "5px 9px",
+                background: C.s2, border: `1px solid ${C.border}`, borderRadius: 7,
+                cursor: "pointer", fontFamily: mono, fontSize: 11, color: C.dim,
+              }}>
+              <Icon name="doc" size={12} />
+              Documents
+              {docCount > 0 && (
+                <span style={{ background: C.accent, color: "#fff", borderRadius: 99,
+                  padding: "0 5px", fontSize: 9.5, fontWeight: 700 }}>{docCount}</span>
+              )}
             </button>
           )}
           <div style={{ flex: 1 }} />
@@ -1092,6 +1111,148 @@ function LibraryModal({ open, onClose, library, activeConvo, canIngest,
   );
 }
 
+/* ── Document picker — a quick modal launched from the composer to choose
+   which library documents this chat reasons over, and to add a new one
+   without leaving the conversation. ── */
+function DocPickerModal({ open, onClose, library, activeConvo, onToggleDoc,
+                          onIngest, ingestRunning, canIngest }) {
+  const [text, setText] = useState("");
+  const [title, setTitle] = useState("");
+  const [source, setSource] = useState("");
+  const [adding, setAdding] = useState(false);
+  const fileRef = useRef(null);
+  if (!open) return null;
+
+  const attached = new Set(activeConvo?.docs || []);
+  const loadFile = (e) => {
+    const f = e.target.files?.[0];
+    if (!f) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      setText(String(reader.result || ""));
+      setSource(f.name);
+      if (!title) setTitle(f.name.replace(/\.[^.]+$/, ""));
+    };
+    reader.readAsText(f);
+    e.target.value = "";
+  };
+  const add = () => {
+    if (!text.trim() || ingestRunning || !canIngest) return;
+    onIngest(text, title.trim(), source);
+    setText(""); setTitle(""); setSource(""); setAdding(false);
+  };
+
+  return (
+    <div onClick={() => onClose()} style={{
+      position: "fixed", inset: 0, background: "rgba(0,0,0,.62)", zIndex: 55,
+      display: "flex", alignItems: "center", justifyContent: "center", padding: 24,
+    }}>
+      <div onClick={e => e.stopPropagation()} style={{
+        width: "min(560px, 100%)", maxHeight: "86vh", display: "flex", flexDirection: "column",
+        background: C.s1, border: `1px solid ${C.border}`, borderRadius: 14,
+        boxShadow: "0 20px 56px rgba(0,0,0,.55)",
+      }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "14px 18px",
+          borderBottom: `1px solid ${C.border}` }}>
+          <Icon name="doc" size={15} />
+          <div style={{ fontSize: 13.5, fontWeight: 700, flex: 1 }}>Chat with documents</div>
+          <button onClick={onClose} style={{ background: "transparent",
+            border: "none", color: C.dim, cursor: "pointer", display: "flex" }}>
+            <Icon name="x" size={16} />
+          </button>
+        </div>
+        <div style={{ padding: "14px 18px", overflowY: "auto" }}>
+          <div style={{ fontSize: 11.5, color: C.dim, lineHeight: 1.6, marginBottom: 10 }}>
+            {activeConvo
+              ? "Pick the documents this chat should reason over. An opted-in document is searched by embedding and projected into every prompt."
+              : "Start a chat first, then opt documents in to it."}
+          </div>
+          {library.length === 0 ? (
+            <div style={{ fontSize: 11.5, color: C.dim, padding: "14px 0", textAlign: "center" }}>
+              No documents yet — add one below.
+            </div>
+          ) : library.map(doc => {
+            const on = attached.has(doc.id);
+            const trace = Array.isArray(doc.trace) ? doc.trace : [];
+            const done = trace.filter(t => ["done", "error", "chrome"].includes(t.status)).length;
+            const total = trace.length || doc.passages || 0;
+            return (
+              <button key={doc.id} onClick={() => activeConvo && onToggleDoc(doc.id)}
+                disabled={!activeConvo}
+                style={{ width: "100%", display: "flex", alignItems: "center", gap: 10,
+                  textAlign: "left", marginBottom: 6, padding: "9px 11px", background: C.bg,
+                  border: `1px solid ${on ? C.accent + "66" : C.border}`, borderRadius: 8,
+                  cursor: activeConvo ? "pointer" : "default" }}>
+                <span style={{ width: 16, height: 16, borderRadius: 5, flexShrink: 0,
+                  display: "flex", alignItems: "center", justifyContent: "center",
+                  background: on ? C.accent : "transparent",
+                  border: `1px solid ${on ? C.accent : C.border}` }}>
+                  {on && <Icon name="check" size={11} />}
+                </span>
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{ fontSize: 12, fontWeight: 600, whiteSpace: "nowrap",
+                    overflow: "hidden", textOverflow: "ellipsis" }}>{doc.title}</div>
+                  <div style={{ fontSize: 10, fontFamily: mono, color: C.dim }}>
+                    {total ? `${done}/${total} passages read` : "not read yet"}
+                  </div>
+                </div>
+                <span style={{ fontSize: 10, fontFamily: mono, fontWeight: 600,
+                  color: on ? C.accent : C.dim }}>{on ? "in chat" : "opt in"}</span>
+              </button>
+            );
+          })}
+
+          {adding ? (
+            <div style={{ marginTop: 10, padding: "11px", background: C.bg,
+              border: `1px solid ${C.border}`, borderRadius: 8 }}>
+              <input value={title} onChange={e => setTitle(e.target.value)}
+                placeholder="Document title (optional)" disabled={ingestRunning}
+                style={{ width: "100%", padding: "7px 10px", marginBottom: 7, background: C.s1,
+                  color: C.text, border: `1px solid ${C.border}`, borderRadius: 6, fontSize: 12,
+                  fontFamily: mono, boxSizing: "border-box", outline: "none" }} />
+              <textarea value={text} onChange={e => setText(e.target.value)}
+                placeholder="Paste text to read…" disabled={ingestRunning}
+                style={{ width: "100%", minHeight: 90, maxHeight: 180, resize: "vertical",
+                  padding: "9px 11px", background: C.s1, color: C.text,
+                  border: `1px solid ${C.border}`, borderRadius: 7, fontSize: 12,
+                  fontFamily: mono, boxSizing: "border-box", outline: "none" }} />
+              <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 8 }}>
+                <input ref={fileRef} type="file" accept=".txt,.md,.markdown,.csv,.json,text/*"
+                  onChange={loadFile} style={{ display: "none" }} />
+                <button onClick={() => fileRef.current?.click()} disabled={ingestRunning}
+                  style={pillBtn(false)}>Upload file</button>
+                <span style={{ fontSize: 10.5, fontFamily: mono, color: C.dim }}>
+                  {text.length} chars
+                </span>
+                <div style={{ flex: 1 }} />
+                <button onClick={() => { setAdding(false); setText(""); setTitle(""); }}
+                  style={pillBtn(false)}>Cancel</button>
+                <button onClick={add} disabled={!text.trim() || !canIngest || ingestRunning}
+                  style={{ ...pillBtn(true),
+                    opacity: (!text.trim() || !canIngest || ingestRunning) ? 0.5 : 1 }}>
+                  Read &amp; opt in
+                </button>
+              </div>
+              {!canIngest && (
+                <div style={{ fontSize: 10.5, color: C.orange, marginTop: 6 }}>
+                  No model available — pull one from Settings → Models first.
+                </div>
+              )}
+            </div>
+          ) : (
+            <button onClick={() => setAdding(true)} style={{
+              width: "100%", marginTop: 6, padding: "9px", background: "transparent",
+              border: `1px dashed ${C.border}`, borderRadius: 8, cursor: "pointer",
+              color: C.accent, fontFamily: mono, fontSize: 11.5, fontWeight: 600 }}>
+              + Add a document
+            </button>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 /* ── Given-Log row — one recorded message, long imports collapsed ── */
 function LogRow({ entry }) {
   const [open, setOpen] = useState(false);
@@ -1174,6 +1335,7 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
   const [wrongModelFor, setWrongModelFor] = useState(null);
   const [library, setLibrary] = useState(loadLibrary);
   const [libOpen, setLibOpen] = useState(false);
+  const [docPickerOpen, setDocPickerOpen] = useState(false);
   const [logOpen, setLogOpen] = useState(false);
   const [ingestRunning, setIngestRunning] = useState(false);
   const [ingestTrace, setIngestTrace] = useState([]);
@@ -1306,7 +1468,9 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
       };
     }
     const dossier = formatRetrieved(results);
-    const parts = [READ_SYSTEM, buildStatus(), dossier, buildPosition(convo?.lastTurn)].filter(Boolean);
+    const digest = buildReadingDigest(text);
+    const parts = [READ_SYSTEM, buildStatus(), digest, dossier, buildPosition(convo?.lastTurn)]
+      .filter(Boolean);
     return {
       content: parts.join("\n\n"),
       used: results.length,
@@ -1965,18 +2129,52 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
       `${passages.length} passages · +${learned} facts`);
   };
 
+  /* Embedding access for an opted-in document. A document's passage vectors
+     live in the scope it was first read into; a chat that opts it in from
+     elsewhere starts with none. Run the mechanical first pass over the
+     document's text in this chat's scope, so the Reach and "ask with
+     documents" can both search it by embedding. A no-op once embedded here. */
+  const ensureDocEmbedded = async (convoId, doc) => {
+    if (!dbReady || !convoId || !doc?.id || !doc.text) return;
+    store.setScope(convoId);
+    const have = store.documents.get(doc.id)
+      || store.vectors.dumpUnwalked().some(r => r.documentId === doc.id);
+    if (have) return;
+    const passages = splitPassages(doc.text);
+    store.setScope(convoId);
+    store.documents.register(doc.id, doc.title || "document", passages.length);
+    for (let i = 0; i < passages.length; i++) {
+      try {
+        const g = logPassage(passages[i], doc.id, i, { title: doc.title });
+        store.setScope(convoId);
+        store.given.write(g);
+        await firstPass(passages[i], { documentId: doc.id, passageIdx: i, givenId: g.id });
+      } catch { /* a passage that fails the scan is still chattable */ }
+    }
+    store.setScope(convoId);
+    bumpDb();
+    logEvent("ok", "lookup", `Embedded "${doc.title || "document"}" for this chat`,
+      `${passages.length} passages`);
+  };
+
   /* Opt the active chat in or out of a library document. */
   const toggleDoc = (docId) => {
     if (!activeId) return;
+    let optingIn = false;
     setConvos(prev => prev.map(c => {
       if (c.id !== activeId) return c;
       const has = (c.docs || []).includes(docId);
+      optingIn = !has;
       return {
         ...c, mode: "memory", updatedAt: Date.now(),
         docs: has ? c.docs.filter(d => d !== docId) : [...(c.docs || []), docId],
       };
     }));
     if (mode !== "memory") setMode("memory");
+    if (optingIn) {
+      const doc = library.find(d => d.id === docId);
+      if (doc) ensureDocEmbedded(activeId, doc); // background — embed for the Reach
+    }
   };
 
   /* Drop a document from the library and from every chat that used it. */
@@ -2082,12 +2280,18 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
     // "Ask with documents": an embedding-based pull of the most relevant
     // passages from this chat's opted-in library documents — but only from
     // documents not yet fully read; once read, the [CTX] graph carries them.
-    let docBlock = "";
+    let docBlock = "", docSpans = [];
     if (askWithDocs) {
       const docs = attachedDocs(existing);
-      docBlock = await lookupDocuments(text, docs);
+      // Make sure every opted-in document is embedded in this chat's scope,
+      // so the pull can search it by embedding regardless of where it was read.
+      for (const d of docs) await ensureDocEmbedded(convoId, d);
+      store.setScope(convoId);
+      const lk = await lookupDocuments(text, docs);
+      docBlock = lk.text;
+      docSpans = lk.spans;
       logEvent(docBlock ? "info" : "warn", "lookup",
-        docBlock ? `Ask with documents — injected passages from ${docs.length} file(s)`
+        docBlock ? `Ask with documents — ${docSpans.length} passage(s) from ${docs.length} file(s)`
                  : "Ask with documents on, but no document text to pull from");
     }
 
@@ -2101,7 +2305,8 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
         { role: "system", content: docBlock ? `${sys.content}\n\n${docBlock}` : sys.content },
         { role: "user", content: text },
       ];
-      memCtx = { sig, results: sys.results, dossierHash: sys.dossierHash, spans: sys.spans };
+      memCtx = { sig, results: sys.results, dossierHash: sys.dossierHash,
+        spans: [...(sys.spans || []), ...docSpans] };
       memBadge = { used: sys.used };
       logEvent("info", "memory",
         sys.used ? `Recalled ${sys.used} fact${sys.used === 1 ? "" : "s"} for this turn`
@@ -2418,6 +2623,7 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
           quantize={quantize} setQuantize={setQuantize}
           mode={mode}
           askWithDocs={askWithDocs} setAskWithDocs={setAskWithDocs} docCount={docCount}
+          onPickDocs={() => setDocPickerOpen(true)}
         />
       </main>
       <LibraryModal
@@ -2427,6 +2633,11 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
         onIngest={runIngest} onStopIngest={() => { ingestAbortRef.current = true; }}
         onToggleDoc={toggleDoc} onRemoveDoc={removeDoc}
         modelNames={modelNames} roleConfig={roleConfig} onSetRoleModel={setRoleModel}
+      />
+      <DocPickerModal
+        open={docPickerOpen} onClose={() => setDocPickerOpen(false)}
+        library={library} activeConvo={active} canIngest={modelNames.length > 0}
+        ingestRunning={ingestRunning} onIngest={runIngest} onToggleDoc={toggleDoc}
       />
       <GivenLogModal
         open={logOpen} onClose={() => setLogOpen(false)}

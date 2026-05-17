@@ -45,6 +45,12 @@ to match it:
     document not yet read closely — flag the answer as a first impression.
 When you are not working from a confident, grounded answer, say so plainly.
 
+[READING] is your running understanding of the documents being read — the
+synthesis formed so far, with how much of each document has been read. When
+the user asks what a document is about or what you have learned, answer from
+[READING]: give its understanding and the key threads, and state how much
+has been read. Do not just list raw passages back.
+
 When the user asks what the material says or what you have, give a summary
 of the key points — not just "yes" or a one-liner.
 
@@ -443,6 +449,19 @@ export function resolveFollowUpReferences(message, position) {
   return null;
 }
 
+/* Zoom — how far out is this question pitched? A "what is this about" /
+   "what have you learned" / "summarise" question is zoomed OUT: it wants the
+   running understanding (document and section hypotheses), not a single
+   entity. A question naming a specific entity is zoomed IN. The default,
+   when a question names nothing in particular, is also zoomed out. */
+const ZOOM_OUT_RE = /\b(?:what(?:'s| is| are| have you)|tell me|give me|summar(?:y|ise|ize)|overview|gist|main (?:point|idea)|overall|so far|about (?:this|the)|the (?:document|article|doc|text|piece|story))\b/i;
+
+export function isZoomedOut(message) {
+  const m = String(message || "");
+  if (ZOOM_OUT_RE.test(m)) return true;
+  return signal(m).ner.names.length === 0;
+}
+
 /* ═══ The Signal — mechanical NER + keywords (SIG: candidates only) ═══ */
 
 const COMMON_CAPS = new Set([
@@ -618,20 +637,24 @@ function scorePassagesByKeyword(query, passages) {
    backing the composer's "ask with documents" trigger.
 
    Standard embedding similarity: the query is embedded once, then scored by
-   cosine against each document's precomputed passage vectors (written during
-   the first pass) — no per-query re-embedding, so the pull is fast. A
-   document is only pulled here until it has been fully read; once its walk
-   completes the graph projection ([CTX] entities) carries it instead, so a
-   read document is skipped. Each passage is tagged with the document's
-   reading confidence — [skim] (not yet read) or [partial] (walk in progress)
-   — so the model can state how provisional its answer is. Documents with no
-   stored vectors fall back to keyword overlap. Identical passage text is
-   deduplicated. */
+   cosine against each document's precomputed passage vectors (written into
+   this chat's scope by the first pass — see ensureDocEmbedded) — no
+   per-query re-embedding, so the pull is fast. A document is only pulled
+   here until it has been fully read; once its walk completes the graph
+   projection ([CTX] entities) carries it instead, so a read document is
+   skipped. Each passage is tagged with the document's reading confidence —
+   [skim] (not yet read) or [partial] (walk in progress) — so the model can
+   state how provisional its answer is. Documents with no stored vectors
+   fall back to keyword overlap. Identical passage text is deduplicated.
+
+   Returns { text, spans }: the [DOCS] block for the prompt, and one source
+   span per pulled passage so the chunk it came from stays auditable. */
 export async function lookupDocuments(query, docs, { topK = 6 } = {}) {
-  const callerScope = store.getScope();
+  const myScope = store.getScope();
   let queryVec = null;
   try { queryVec = await store.embed(query || ""); } catch { /* embeddings optional */ }
-  store.setScope(callerScope);
+  store.setScope(myScope);
+  const allUnwalked = store.vectors.dumpUnwalked();
 
   const scored = [];
   for (const doc of docs || []) {
@@ -639,23 +662,19 @@ export async function lookupDocuments(query, docs, { topK = 6 } = {}) {
     if (!text) continue;
     const docPassages = splitPassages(text);
 
-    // Walk progress lives under the scope the document was ingested into.
-    let walked = 0, total = docPassages.length, vecRows = [];
-    if (doc.scope) {
-      store.setScope(doc.scope);
-      const d = store.documents.get(doc.id);
-      if (d) { walked = d.walked || 0; total = d.total || total; }
-      vecRows = store.vectors.dumpUnwalked().filter(r => r.documentId === doc.id);
-      store.setScope(callerScope);
-    }
+    const reg = store.documents.get(doc.id);
+    const walked = reg?.walked || 0;
+    const total = reg?.total || docPassages.length;
     // Fully read — the [CTX] graph projection carries it with confidence.
     if (total > 0 && walked >= total) continue;
     const confidence = walked > 0 ? "partial" : "skim";
 
+    const vecRows = allUnwalked.filter(r => r.documentId === doc.id);
     if (queryVec && vecRows.length) {
       for (const r of vecRows) {
         scored.push({
-          text: r.text, index: r.passageIdx ?? 0, confidence,
+          docId: doc.id, docTitle: doc.title, text: r.text,
+          index: r.passageIdx ?? 0, confidence,
           score: store.cosineSim(queryVec, r.vec),
         });
       }
@@ -663,11 +682,11 @@ export async function lookupDocuments(query, docs, { topK = 6 } = {}) {
       // No stored vectors — keyword fallback over the raw passages.
       for (const s of scorePassagesByKeyword(query,
         docPassages.map((p, i) => ({ text: p, index: i })))) {
-        scored.push({ ...s, confidence });
+        scored.push({ docId: doc.id, docTitle: doc.title, ...s, confidence });
       }
     }
   }
-  if (!scored.length) return "";
+  if (!scored.length) return { text: "", spans: [] };
 
   const seen = new Set();
   const dedup = (rows) => rows.filter(r => {
@@ -681,7 +700,13 @@ export async function lookupDocuments(query, docs, { topK = 6 } = {}) {
   if (!top.length) top = dedup(scored).slice(0, topK); // general question — openings
 
   const lines = top.map((r, i) => `${i + 1}: [${r.confidence}] "${r.text.trim()}"`);
-  return `[DOCS]\n${lines.join("\n")}\n[/DOCS]`;
+  const spans = top.map(r => ({
+    entity: r.docTitle || r.docId,
+    kind: "passage",
+    text: r.text.length > 220 ? r.text.slice(0, 220) + "…" : r.text,
+    source: `${r.docTitle || "document"} · passage ${r.index + 1} [${r.confidence}]`,
+  }));
+  return { text: lines.length ? `[DOCS]\n${lines.join("\n")}\n[/DOCS]` : "", spans };
 }
 
 /* The first pass — mechanical NER, no model. Mints SIG entities the instant
@@ -880,6 +905,47 @@ export function collectSpans(results) {
     }
   }
   return spans;
+}
+
+/* ═══ The Reading Digest — projected running understanding ═══
+
+   The walk produces a hierarchy of hypotheses as it reads: group (every few
+   passages), section (every dozen), document (the whole). They are the
+   system's own synthesis — exactly what a "what have you learned / what is
+   this about" question wants — but the Reach only retrieves entities and raw
+   passages, so they were never shown to the model.
+
+   This projects them at the zoom the question calls for. The document
+   hypothesis is the headline. A zoomed-out question gets the section
+   hypotheses (broad coverage of what has been read); a zoomed-in one gets
+   the finer group hypotheses. Every group/section hypothesis is written for
+   a completed passage range, so the set already covers exactly what the
+   reading cursor has reached. */
+export function buildReadingDigest(query = "") {
+  const docHyps = store.hypotheses.getByLevel("document");
+  const sectionHyps = store.hypotheses.getByLevel("section");
+  const groupHyps = store.hypotheses.getByLevel("group");
+  if (!docHyps.length && !sectionHyps.length && !groupHyps.length) return "";
+
+  const lines = [];
+  const docs = store.documents.all();
+  for (const d of docs) {
+    const total = d.total || 0, walked = d.walked || 0;
+    if (!total) continue;
+    const pct = Math.round((walked / total) * 100);
+    lines.push(walked >= total
+      ? `${d.title || "document"} — fully read (${total} passages)`
+      : `${d.title || "document"} — ${pct}% read (${walked}/${total} passages)`);
+  }
+  for (const h of docHyps) lines.push(`understanding so far: "${h.text}"`);
+
+  const detail = isZoomedOut(query)
+    ? (sectionHyps.length ? sectionHyps : groupHyps)
+    : (groupHyps.length ? groupHyps : sectionHyps);
+  const label = (sectionHyps.length && isZoomedOut(query)) ? "section" : "part";
+  detail.slice(0, 10).forEach((h, i) => lines.push(`  ${label} ${i + 1}: "${h.text}"`));
+
+  return lines.length ? `[READING]\n${lines.join("\n")}\n[/READING]` : "";
 }
 
 /* ═══ The Position Marker ═══ */

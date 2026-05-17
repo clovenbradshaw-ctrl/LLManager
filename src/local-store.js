@@ -529,6 +529,9 @@ export const documents = {
   get(id) {
     return db.selectObject("SELECT * FROM documents WHERE scope=? AND id=?", [scope, id]);
   },
+  all() {
+    return db.selectObjects("SELECT * FROM documents WHERE scope=? ORDER BY created_at", [scope]);
+  },
 };
 
 /* ── Reading state, for the [STATUS] block ── */
