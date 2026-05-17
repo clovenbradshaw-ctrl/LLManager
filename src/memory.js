@@ -54,6 +54,34 @@ Use REC when an earlier site was created under a clumsy name or a clause.
 Ignore only navigation chrome, byline boilerplate, and ads.
 Return [] only if the passage is entirely boilerplate.`;
 
+/* JSON schema for Ollama's `format` parameter — constrained decoding for the
+   walk. With this in hand the model cannot emit malformed JSON, so even a
+   small model is structurally reliable; `parseWalk` still validates each
+   operation's required fields by `op`. Property names mirror the WALK_SYSTEM
+   operation shapes; only `op` is required since the rest vary per operation. */
+export const WALK_FORMAT = {
+  type: "array",
+  items: {
+    type: "object",
+    properties: {
+      op: { type: "string", enum: ["SIG", "DEF", "CON", "REC"] },
+      id: { type: "string" },
+      canonical: { type: "string" },
+      kind: {
+        type: "string",
+        enum: ["person", "org", "place", "role", "policy", "event", "concept", "document", "thing"],
+      },
+      hypothesis: { type: "string" },
+      from: { type: "string" },
+      to: { type: "string" },
+      relation: { type: "string" },
+      evidence: { type: "string" },
+      alias: { type: "string" },
+    },
+    required: ["op"],
+  },
+};
+
 /* ── Splitting text for the walk ── */
 
 /* Split text into sentences. Overlong runs (no punctuation) are hard-split;

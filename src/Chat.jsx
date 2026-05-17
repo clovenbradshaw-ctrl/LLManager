@@ -9,12 +9,13 @@ import {
   processImplicitSignals, runREC, shouldRunREC,
 } from "./router.js";
 import {
-  MEMORY_SYSTEM, WALK_SYSTEM,
+  MEMORY_SYSTEM, WALK_SYSTEM, WALK_FORMAT,
   emptyMemory, cloneMemory, memoryStats, mergeMemory, splitSentences, batchSentences,
   signal, reach, buildDossier, buildPosition, buildLibrary, buildRoster,
   parseWalk, applyWalk,
 } from "./memory.js";
-import { loadLibrary, saveLibrary, docStats } from "./library.js";
+import { loadLibrary, saveLibrary, docStats, loadIngestJob, saveIngestJob, clearIngestJob } from "./library.js";
+import { ROLES, loadRoleConfig, saveRoleConfig, resolveRoleModel } from "./roles.js";
 
 const mono = `'SF Mono','Menlo','Consolas',monospace`;
 const sans = `-apple-system,system-ui,sans-serif`;
@@ -624,7 +625,8 @@ function ChunkTrace({ chunk }) {
 
 /* ── Library & reading modal ── */
 function LibraryModal({ open, onClose, library, activeConvo, canIngest,
-                        ingestRunning, ingestTrace, onIngest, onToggleDoc, onRemoveDoc }) {
+                        ingestRunning, ingestTrace, onIngest, onToggleDoc, onRemoveDoc,
+                        modelNames = [], roleConfig = {}, onSetRoleModel }) {
   const [text, setText] = useState("");
   const [title, setTitle] = useState("");
   const [source, setSource] = useState("");
@@ -659,7 +661,7 @@ function LibraryModal({ open, onClose, library, activeConvo, canIngest,
   });
 
   return (
-    <div onClick={() => !ingestRunning && onClose()} style={{
+    <div onClick={() => onClose()} style={{
       position: "fixed", inset: 0, background: "rgba(0,0,0,.62)", zIndex: 50,
       display: "flex", alignItems: "center", justifyContent: "center", padding: 24,
     }}>
@@ -672,8 +674,13 @@ function LibraryModal({ open, onClose, library, activeConvo, canIngest,
           borderBottom: `1px solid ${C.border}` }}>
           <Icon name="book" size={15} />
           <div style={{ fontSize: 13.5, fontWeight: 700, flex: 1 }}>Library &amp; Reading</div>
-          <button onClick={onClose} disabled={ingestRunning} style={{ background: "transparent",
-            border: "none", color: C.dim, cursor: ingestRunning ? "default" : "pointer", display: "flex" }}>
+          {ingestRunning && (
+            <span style={{ fontSize: 10.5, fontFamily: mono, color: C.accent }}>
+              reading in background — safe to close
+            </span>
+          )}
+          <button onClick={onClose} style={{ background: "transparent",
+            border: "none", color: C.dim, cursor: "pointer", display: "flex" }}>
             <Icon name="x" size={16} />
           </button>
         </div>
@@ -718,6 +725,37 @@ function LibraryModal({ open, onClose, library, activeConvo, canIngest,
               No model available — pull one from Settings → Models first.
             </div>
           )}
+
+          {/* ── Memory models — which model does each background graph role ── */}
+          <div style={{ fontSize: 12, fontWeight: 700, margin: "18px 0 4px" }}>Memory models</div>
+          <div style={{ fontSize: 11.5, color: C.dim, lineHeight: 1.6, marginBottom: 10 }}>
+            Reading text into the graph is background work, separate from the
+            conversation. Each role picks its own model — leave a role on Auto
+            to use the best installed match. The walk runs with constrained
+            decoding, so even a small fast model stays structurally valid.
+          </div>
+          {Object.values(ROLES).map(role => {
+            const auto = resolveRoleModel(role.id, modelNames, "", { ...roleConfig, [role.id]: null });
+            return (
+              <div key={role.id} style={{ display: "flex", alignItems: "center", gap: 10,
+                padding: "8px 11px", marginBottom: 6, background: C.bg,
+                border: `1px solid ${C.border}`, borderRadius: 8 }}>
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{ fontSize: 12, fontWeight: 600 }}>{role.label}</div>
+                  <div style={{ fontSize: 10, color: C.dim, lineHeight: 1.5 }}>{role.desc}</div>
+                </div>
+                <select
+                  value={roleConfig[role.id] && modelNames.includes(roleConfig[role.id]) ? roleConfig[role.id] : ""}
+                  onChange={e => onSetRoleModel?.(role.id, e.target.value)}
+                  style={{ padding: "5px 8px", background: C.s2, color: C.text,
+                    border: `1px solid ${C.border}`, borderRadius: 6, fontSize: 11,
+                    fontFamily: mono, outline: "none", maxWidth: 200 }}>
+                  <option value="">Auto{auto ? ` · ${auto}` : ""}</option>
+                  {modelNames.map(n => <option key={n} value={n}>{n}</option>)}
+                </select>
+              </div>
+            );
+          })}
 
           {ingestTrace.length > 0 && (
             <div style={{ marginTop: 14 }}>
@@ -797,6 +835,7 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
   const [libOpen, setLibOpen] = useState(false);
   const [ingestRunning, setIngestRunning] = useState(false);
   const [ingestTrace, setIngestTrace] = useState([]);
+  const [roleConfig, setRoleConfig] = useState(loadRoleConfig);
   const abortRef = useRef(null);
   const scrollRef = useRef(null);
 
@@ -998,8 +1037,12 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
     return { content: answer, reasoning, usage };
   };
 
-  /* Non-streaming chat call — used for the background memory Extract step. */
-  const chatOnce = async (model, apiMessages) => {
+  /* Non-streaming chat call — used for the background memory walk steps.
+     `opts.format` passes a JSON schema to Ollama for constrained decoding, so
+     the walk output is structurally guaranteed. WebLLM has no equivalent here,
+     so for browser models the schema is skipped and parseWalk recovers the
+     array from free-form output. */
+  const chatOnce = async (model, apiMessages, opts = {}) => {
     if (isBrowserModel(model)) {
       const engine = await getBrowserEngine(model);
       const reply = await engine.chat.completions.create({
@@ -1007,10 +1050,12 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
       });
       return reply.choices?.[0]?.message?.content || "";
     }
+    const body = { model, messages: apiMessages, stream: false, options: { temperature: 0 } };
+    if (opts.format) body.format = opts.format;
     const r = await fetch(`${ollamaUrl}/api/chat`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ model, messages: apiMessages, stream: false, options: { temperature: 0 } }),
+      body: JSON.stringify(body),
     });
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
     const j = await r.json();
@@ -1080,10 +1125,11 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
     let ops = [];
     try {
       const convo = convos.find(c => c.id === convoId);
-      const out = await chatOnce(model, [
+      const extractModel = resolveRoleModel("extract", modelNames, model, roleConfig);
+      const out = await chatOnce(extractModel, [
         { role: "system", content: WALK_SYSTEM },
         { role: "user", content: `${buildRoster(convo?.memory)}\n\nPASSAGE:\nUser: ${userMessage.slice(0, 4000)}\nAssistant: ${response.slice(0, 4000)}` },
-      ]);
+      ], { format: WALK_FORMAT });
       ops = parseWalk(out);
     } catch { /* fail silently — the turn already succeeded */ }
 
@@ -1102,15 +1148,76 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
     patchMsg(convoId, msgId, m => ({ mem: { ...(m.mem || {}), learned } }));
   };
 
+  /* Run (or resume) a persisted ingest job: walk each remaining passage into a
+     document graph. The job — its trace, partial graph and next index — is
+     saved after every passage, so a reload or crash resumes from where it
+     stopped rather than starting over. The walk uses constrained decoding so
+     the per-passage output is structurally valid. */
+  const runIngestJob = async (job) => {
+    setIngestRunning(true);
+    // A passage left mid-read by a crash never had its ops applied — re-read it.
+    const trace = job.trace.map(t => t.status === "reading" ? { ...t, status: "pending" } : { ...t });
+    const docMem = job.docMem || { entities: {}, edges: {}, defs: {} };
+    const sync = () => setIngestTrace(trace.map(t => ({ ...t })));
+    sync();
+    try {
+      for (let i = job.nextIndex || 0; i < job.passages.length; i++) {
+        trace[i].status = "reading"; sync();
+        try {
+          const out = await chatOnce(job.model, [
+            { role: "system", content: WALK_SYSTEM },
+            { role: "user", content: `${buildRoster(docMem)}\n\nPASSAGE:\n${job.passages[i]}` },
+          ], { format: WALK_FORMAT });
+          const ops = parseWalk(out);
+          trace[i].applied = applyWalk(docMem, ops);
+          trace[i].rawOutput = out;
+          trace[i].ops = ops;
+          trace[i].status = "done";
+        } catch (e) {
+          trace[i].status = "error";
+          trace[i].rawOutput = String(e?.message || e);
+        }
+        // Persist only after the graph and index agree: docMem now reflects
+        // passages [0, i], so resume continues at i + 1.
+        saveIngestJob({ ...job, trace, docMem, nextIndex: i + 1 });
+        sync();
+      }
+
+      const learned = trace.reduce((n, t) => n + (t.applied || 0), 0);
+      const doc = {
+        id: job.docId,
+        title: job.title || job.source || (job.text.slice(0, 40) + (job.text.length > 40 ? "…" : "")),
+        source: job.source || "pasted text",
+        addedAt: new Date().toISOString(),
+        chars: job.text.length, passages: job.passages.length, learned,
+        text: job.text,
+        memory: docMem,
+        trace: trace.map(t => ({
+          index: t.index, chars: t.chars, status: t.status, applied: t.applied,
+          signal: { names: t.signal.ner.names, dates: t.signal.ner.dates, keywords: t.signal.keywords },
+          ops: t.ops, rawOutput: t.rawOutput,
+        })),
+      };
+      setLibrary(prev => prev.some(d => d.id === doc.id) ? prev : [doc, ...prev]);
+      setConvos(prev => prev.map(c => c.id === job.convoId
+        ? { ...c, docs: [...new Set([...(c.docs || []), job.docId])], updatedAt: Date.now() } : c));
+    } finally {
+      clearIngestJob();
+      setIngestRunning(false);
+    }
+  };
+
   /* Read a block of text into a library document with a stateful walk: split
      it into sentences, group them into passages, and read each passage with
      the roster of sites already found in hand — so the model resolves and
      enriches sites instead of duplicating them. The document is added to the
-     library and opted in to the current chat. The per-passage trace is live. */
+     library and opted in to the current chat. Reading runs in the background:
+     the Library modal can be closed and the job survives a reload. */
   const runIngest = async (rawText, title, source) => {
     const text = (rawText || "").trim();
     if (!text || ingestRunning) return;
-    const model = composerModel === AUTO_MODEL ? modelNames[0] : composerModel;
+    const fallback = composerModel === AUTO_MODEL ? modelNames[0] : composerModel;
+    const model = resolveRoleModel("ingest", modelNames, fallback, roleConfig);
     if (!model) return;
 
     // A document needs a Memory-mode chat to belong to — make or adopt one.
@@ -1120,7 +1227,7 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
       convoId = "c" + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
       setConvos(prev => [{
         id: convoId, title: title || ("Library · " + text.slice(0, 32)),
-        model, updatedAt: Date.now(), messages: [], mode: "memory",
+        model: fallback || model, updatedAt: Date.now(), messages: [], mode: "memory",
         memory: emptyMemory(), docs: [],
       }, ...prev]);
       setActiveId(convoId);
@@ -1133,53 +1240,47 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
 
     const docId = "d" + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
     const passages = batchSentences(splitSentences(text));
-    const trace = passages.map((c, i) => ({
-      index: i, chars: c.length, text: c, signal: signal(c),
-      status: "pending", rawOutput: "", ops: [], applied: 0,
-    }));
-    const sync = () => setIngestTrace(trace.map(t => ({ ...t })));
-    setIngestRunning(true);
-    sync();
-
-    const docMem = { entities: {}, edges: {}, defs: {} };
-    for (let i = 0; i < passages.length; i++) {
-      trace[i].status = "reading"; sync();
-      try {
-        const out = await chatOnce(model, [
-          { role: "system", content: WALK_SYSTEM },
-          { role: "user", content: `${buildRoster(docMem)}\n\nPASSAGE:\n${passages[i]}` },
-        ]);
-        const ops = parseWalk(out);
-        trace[i].applied = applyWalk(docMem, ops);
-        trace[i].rawOutput = out;
-        trace[i].ops = ops;
-        trace[i].status = "done";
-      } catch (e) {
-        trace[i].status = "error";
-        trace[i].rawOutput = String(e?.message || e);
-      }
-      sync();
-    }
-
-    const learned = trace.reduce((n, t) => n + (t.applied || 0), 0);
-    const doc = {
-      id: docId,
-      title: title || source || (text.slice(0, 40) + (text.length > 40 ? "…" : "")),
-      source: source || "pasted text",
-      addedAt: new Date().toISOString(),
-      chars: text.length, passages: passages.length, learned,
-      text,
-      memory: docMem,
-      trace: trace.map(t => ({
-        index: t.index, chars: t.chars, status: t.status, applied: t.applied,
-        signal: { names: t.signal.ner.names, dates: t.signal.ner.dates, keywords: t.signal.keywords },
-        ops: t.ops, rawOutput: t.rawOutput,
+    const job = {
+      id: "j" + Date.now().toString(36),
+      convoId, docId, model,
+      title: title || "", source: source || "",
+      text, passages,
+      trace: passages.map((c, i) => ({
+        index: i, chars: c.length, text: c, signal: signal(c),
+        status: "pending", rawOutput: "", ops: [], applied: 0,
       })),
+      docMem: { entities: {}, edges: {}, defs: {} },
+      nextIndex: 0,
+      createdAt: Date.now(),
     };
-    setLibrary(prev => [doc, ...prev]);
-    setConvos(prev => prev.map(c => c.id === convoId
-      ? { ...c, docs: [...(c.docs || []), docId], updatedAt: Date.now() } : c));
-    setIngestRunning(false);
+    saveIngestJob(job);
+    await runIngestJob(job);
+  };
+
+  /* Resume an ingest job left unfinished by a reload or crash. Runs once, and
+     for an Ollama-backed job waits until Ollama is reachable so the first
+     passage does not just fail. */
+  const ingestResumed = useRef(false);
+  useEffect(() => {
+    if (ingestResumed.current || ingestRunning) return;
+    const job = loadIngestJob();
+    if (!job) return;
+    if ((job.nextIndex || 0) >= job.passages.length) { clearIngestJob(); return; }
+    const browser = providerOf[job.model] === "browser";
+    if (!browser && !ollamaUp) return; // wait for the next render once Ollama is up
+    ingestResumed.current = true;
+    runIngestJob(job);
+  }, [ollamaUp, providerOf, ingestRunning]);
+
+  /* Set (or clear, with an empty value) the model override for a memory role. */
+  const setRoleModel = (role, model) => {
+    setRoleConfig(prev => {
+      const next = { ...prev };
+      if (model) next[role] = model;
+      else delete next[role];
+      saveRoleConfig(next);
+      return next;
+    });
   };
 
   /* Opt the active chat in or out of a library document. */
@@ -1446,8 +1547,9 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
               <Icon name="memory" size={11} /> {memStats.entities} remembered{docCount ? ` · ${docCount} doc${docCount === 1 ? "" : "s"}` : ""}
             </span>
           )}
-          <HeaderBtn icon="book" label="Library" onClick={() => setLibOpen(true)}
-            badge={library.length || undefined} />
+          <HeaderBtn icon="book" label={ingestRunning ? "Reading…" : "Library"}
+            onClick={() => setLibOpen(true)}
+            badge={ingestRunning ? "•••" : (library.length || undefined)} />
           {active && <HeaderBtn icon="download" label="Export" onClick={() => exportConvo(active)} />}
           {headerModel && (
             <span style={{ display: "flex", alignItems: "center", gap: 6, padding: "5px 10px", background: C.s1, border: `1px solid ${C.border}`, borderRadius: 7, fontFamily: mono, fontSize: 11.5, flexShrink: 0 }}>
@@ -1522,6 +1624,7 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
         library={library} activeConvo={active} canIngest={modelNames.length > 0}
         ingestRunning={ingestRunning} ingestTrace={ingestTrace}
         onIngest={runIngest} onToggleDoc={toggleDoc} onRemoveDoc={removeDoc}
+        modelNames={modelNames} roleConfig={roleConfig} onSetRoleModel={setRoleModel}
       />
     </div>
   );
