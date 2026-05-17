@@ -9,14 +9,14 @@ import {
   processImplicitSignals, runREC, shouldRunREC,
 } from "./router.js";
 import {
-  MEMORY_SYSTEM, INGEST_SYSTEM, EXTRACT_SYSTEM, MUTATE_SYSTEM,
-  emptyMemory, cloneMemory, memoryStats, mergeMemory, splitSentences, batchSentences,
-  signal, reach, buildDossier, buildPosition, buildLibrary, buildRoster,
-  collectSpans, dossierHashOf, makeGiven, appendGiven,
-  WALK_SCHEMA, MUTATE_SCHEMA,
-  parseWalk, applyWalk,
-  detectMutationTriggers, buildMutateUser, parseMutate, makeMutation, applyMutation,
+  READ_SYSTEM, READ_CASUAL, INGEST_SYSTEM, EXTRACT_SYSTEM, MUTATE_SYSTEM,
+  Graph, mergeGraphs, splitSentences, batchSentences,
+  signal, reach, buildDossier, buildPosition, buildRegister,
+  collectSpans, dossierHashOf, logUserMessage, logModelResponse, logPassage,
+  buildExtractPrompt, buildMutatePrompt, parseEvents, applyEvents,
+  detectMutationTriggers, userCorrectionTrigger, parseMutate, applyMutation,
 } from "./memory.js";
+import { EVENT_SCHEMA, MUTATE_SCHEMA } from "./model-router.js";
 import { loadLibrary, saveLibrary, docStats } from "./library.js";
 
 const mono = `'SF Mono','Menlo','Consolas',monospace`;
@@ -27,7 +27,7 @@ const C = {
   green: "#30a46c", red: "#e5484d", orange: "#f76b15",
 };
 
-const LS_KEY = "llmanager.chats.v2";
+const LS_KEY = "llmanager.chats.v3";
 const QUANT_KEY = "llmanager.quantize.v1";
 const MODE_KEY = "llmanager.chatmode.v1";
 const MEM_MODEL_KEY = "llmanager.memorymodel.v1";
@@ -600,16 +600,17 @@ function ChunkTrace({ chunk }) {
   const stColor = chunk.status === "done" ? C.green
     : chunk.status === "error" ? C.red
     : chunk.status === "reading" ? C.orange : C.dim;
-  const ner = chunk.signal?.ner || { names: [], dates: [], numbers: [] };
+  const ner = chunk.signal?.ner || chunk.signal || { names: [], dates: [], numbers: [] };
   const kws = chunk.signal?.keywords || [];
   const label = chunk.status === "done" ? `+${chunk.applied} ops`
     : chunk.status === "reading" ? "reading…"
     : chunk.status === "error" ? "error" : "queued";
   const opLine = (e) => {
-    if (e.op === "SIG") return `+ site ${e.canonical || e.id} (${e.kind || "thing"})`;
-    if (e.op === "DEF") return `~ revise ${e.id || e.canonical}`;
-    if (e.op === "CON") return `→ ${e.from} —${e.relation || e.type || "related to"}→ ${e.to}`;
-    if (e.op === "REC") return `⟳ rename ${e.id} → "${e.canonical}"`;
+    if (e.op === "INS") return `+ entity ${e.entity} (${e.terrain || "Entity"})`;
+    if (e.op === "DEF") return `= ${e.entity} · ${e.field}: "${e.value}"`;
+    if (e.op === "CON") return `→ ${e.from} —${e.type || "related to"}→ ${e.to}`;
+    if (e.op === "EVA") return `⊙ ${e.entity} · ${e.claim} [${e.status || "holds"}]`;
+    if (e.op === "AMBIG") return `? ambiguous "${e.name}" ≈ ${e.candidate || "?"}`;
     return JSON.stringify(e);
   };
   return (
@@ -888,30 +889,35 @@ export default function Chat({ ollamaUrl, installed, ollamaUp, provider = "ollam
     .map(id => library.find(d => d.id === id))
     .filter(Boolean);
 
-  /* Project a chat's own memory together with every opted-in library
-     document into a single graph (entities/edges/defs only). */
-  const combinedMemory = (convo) =>
-    mergeMemory(convo?.memory, ...attachedDocs(convo).map(d => d.memory));
+  /* A fresh Graph over a deep copy of a chat's stored graph store. */
+  const loadGraph = (store) =>
+    new Graph(store ? JSON.parse(JSON.stringify(store)) : undefined);
 
-  /* The memory-mode system prompt: instructions + recalled context +
-     library overview + position marker. Empty sections are dropped so the
-     prompt stays as small as the chat allows. */
+  /* Project a chat's own graph together with every opted-in library
+     document into one read-only Graph. */
+  const combinedGraph = (convo) =>
+    mergeGraphs(
+      convo?.graph ? new Graph(convo.graph) : null,
+      ...attachedDocs(convo).map(d => (d.graph ? new Graph(d.graph) : null)),
+    );
+
+  /* The READ system prompt: v3 instructions + projected [CTX] + [POS].
+     Documents now live in the graph, so there is no separate library block. */
   const memorySystemPrompt = (convo, sig) => {
-    const projected = combinedMemory(convo);
-    const entities = reach(sig, projected);
-    const dossier = buildDossier(entities, projected);
+    const projected = combinedGraph(convo);
+    const ranked = reach(sig, projected);
+    const dossier = buildDossier(ranked, projected);
     const parts = [
-      MEMORY_SYSTEM,
+      READ_SYSTEM,
       dossier,
-      buildLibrary(attachedDocs(convo)),
-      buildPosition((convo?.memory || emptyMemory()).lastTurn),
+      buildPosition(convo?.graph?.lastTurn),
     ].filter(Boolean);
     return {
       content: parts.join("\n\n"),
-      used: entities.length,
-      entities,
+      used: ranked.length,
+      ranked,
       dossierHash: dossierHashOf(dossier),
-      spans: collectSpans(entities, projected),
+      spans: collectSpans(ranked, projected),
     };
   };
 
@@ -921,7 +927,7 @@ export default function Chat({ ollamaUrl, installed, ollamaUp, provider = "ollam
     setMode(m);
     if (activeId) {
       setConvos(prev => prev.map(c => c.id === activeId
-        ? { ...c, mode: m, memory: m === "memory" ? (c.memory || emptyMemory()) : c.memory }
+        ? { ...c, mode: m, graph: m === "memory" ? (c.graph || new Graph().toJSON()) : c.graph }
         : c));
     }
   };
@@ -955,7 +961,7 @@ export default function Chat({ ollamaUrl, installed, ollamaUp, provider = "ollam
       id: newId, title: trimmed + " (fork)",
       model: active.model, updatedAt: Date.now(), messages,
       mode: active.mode || "regular",
-      memory: active.memory ? cloneMemory(active.memory) : undefined,
+      graph: active.graph ? JSON.parse(JSON.stringify(active.graph)) : undefined,
     }, ...prev]);
     setActiveId(newId);
     setMode(active.mode || "regular");
@@ -1117,72 +1123,91 @@ export default function Chat({ ollamaUrl, installed, ollamaUp, provider = "ollam
   };
 
   /* The MUTATE call — background, fired only when a mechanical trigger flags
-     an ambiguity. Produces exactly one action; FORK/MERGE/CORRECT/RECLASSIFY
-     land as a pending mutation needing user consent (auto-commit tier PROMPT),
-     NONE is logged silently. `snapshot` is the post-Extract graph. */
-  const runMutate = async (convoId, msgId, trigger, model, snapshot) => {
-    let mut = null;
+     an ambiguity. Produces exactly one action. FORK/MERGE/CORRECT/RECLASSIFY
+     land as a pending commit needing user consent (auto-commit tier PROMPT);
+     NONE is applied and logged silently. `snapshotStore` is the post-Extract
+     graph store the trigger was raised against. */
+  const runMutate = async (convoId, msgId, trigger, model, snapshotStore) => {
+    let parsed = null;
     try {
+      const g = new Graph(snapshotStore);
       const out = await chatOnce(model, [
         { role: "system", content: MUTATE_SYSTEM },
-        { role: "user", content: buildMutateUser(snapshot || emptyMemory(), trigger) },
+        { role: "user", content: buildMutatePrompt(trigger, g) },
       ], MUTATE_SCHEMA);
-      const parsed = parseMutate(out);
-      if (parsed) mut = makeMutation(parsed, { trigger, msgId });
+      parsed = parseMutate(out);
     } catch { /* fail silently — the turn already succeeded */ }
-    if (!mut) return;
+    if (!parsed) return;
+
+    if (parsed.action === "NONE") {
+      setConvos(prev => prev.map(c => {
+        if (c.id !== convoId) return c;
+        const g = loadGraph(c.graph);
+        applyMutation(parsed, g, trigger.type);
+        return { ...c, graph: g.toJSON() };
+      }));
+      return;
+    }
+    const commit = {
+      id: "m_" + Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
+      action: parsed.action, reason: parsed.reason,
+      trigger: trigger.type, triggerDetail: trigger.span || trigger.context || "",
+      msgId, status: "pending", mutateAction: parsed,
+    };
     setConvos(prev => prev.map(c => {
       if (c.id !== convoId) return c;
-      const memory = cloneMemory(c.memory);
-      memory.mutations.push(mut);
-      return { ...c, memory };
+      const g = loadGraph(c.graph);
+      g.addPending(commit);
+      return { ...c, graph: g.toJSON() };
     }));
   };
 
   /* The EXTRACT call — background, reads a completed turn into the chat's
-     graph. The exchange is labelled with its Given-Log ids; both messages are
-     appended to the Given-Log. After applying, mechanical triggers are checked
-     and a MUTATE call is fired for each ambiguity found. */
+     graph as INS/CON/DEF/EVA events. The exchange is labelled with its
+     Given-Log ids; both messages are appended to the Given-Log. After
+     applying, mechanical triggers are checked and a MUTATE call fires for
+     each ambiguity found. */
   const runExtract = async (convoId, msgId, userGiven, modelGiven, model, memCtx) => {
-    let ops = [];
+    let events = [];
     try {
       const convo = convos.find(c => c.id === convoId);
+      const g0 = loadGraph(convo?.graph);
       const out = await chatOnce(model, [
         { role: "system", content: EXTRACT_SYSTEM },
-        { role: "user", content: `${buildRoster(convo?.memory)}\n\nEXCHANGE:\n`
-          + `User [${userGiven.id}]: "${userGiven.text.slice(0, 4000)}"\n`
-          + `Model [${modelGiven.id}]: "${modelGiven.text.slice(0, 4000)}"` },
-      ], WALK_SCHEMA);
-      ops = parseWalk(out);
+        { role: "user", content: buildExtractPrompt(userGiven.text, modelGiven.text, userGiven.id, modelGiven.id, g0) },
+      ], EVENT_SCHEMA);
+      events = parseEvents(out);
     } catch { /* fail silently — the turn already succeeded */ }
 
-    let learned = 0, triggers = [], snapshot = null;
+    let learned = 0, triggers = [], snapshotStore = null;
     setConvos(prev => prev.map(c => {
       if (c.id !== convoId) return c;
-      const memory = cloneMemory(c.memory);
-      memory.givenLog.push({ ...userGiven }, { ...modelGiven });
-      const res = applyWalk(memory, ops, { source: userGiven.id });
+      const g = loadGraph(c.graph);
+      g.appendGiven(userGiven);
+      g.appendGiven(modelGiven);
+      const prevEntities = g.store.lastTurn?.entities || [];
+      const res = applyEvents(g, events, { source: userGiven.id });
       learned = res.applied;
-      memory.lastTurn = {
-        entities: (memCtx.entities || []).map(e => e.canonical),
+      g.store.lastTurn = {
+        entities: (memCtx.ranked || []).map(r => r.entity.id),
         topic: (memCtx.sig?.keywords || []).slice(0, 3).join(" "),
         userMessage: userGiven.text.slice(0, 100),
       };
-      triggers = detectMutationTriggers({
-        memory, userMessage: userGiven.text, modelResponse: modelGiven.text, ambigs: res.ambigs,
-      });
-      snapshot = memory;
-      return { ...c, memory };
+      triggers = detectMutationTriggers(modelGiven.text, events, memCtx.sig, g);
+      const corr = userCorrectionTrigger(userGiven.text, g, prevEntities);
+      if (corr) triggers.push(corr);
+      snapshotStore = g.toJSON();
+      return { ...c, graph: snapshotStore };
     }));
     patchMsg(convoId, msgId, m => ({ mem: { ...(m.mem || {}), learned } }));
-    for (const t of triggers) runMutate(convoId, msgId, t, model, snapshot);
+    for (const t of triggers) runMutate(convoId, msgId, t, model, snapshotStore);
   };
 
-  /* Read a block of text into a library document with a stateful walk: split
-     it into sentences, group them into passages, and read each passage with
-     the roster of sites already found in hand — so the model resolves and
-     enriches sites instead of duplicating them. The document is added to the
-     library and opted in to the current chat. The per-passage trace is live. */
+  /* Read a block of text into a library document. The text is split into
+     passages and each is read by the INGEST call into the document's graph
+     as INS/CON/DEF/EVA events, with the register of known entities in hand
+     so the model resolves rather than duplicates. AMBIG ops fire a MUTATE
+     call. The document is added to the library and opted in to the chat. */
   const runIngest = async (rawText, title, source) => {
     const text = (rawText || "").trim();
     if (!text || ingestRunning) return;
@@ -1197,13 +1222,13 @@ export default function Chat({ ollamaUrl, installed, ollamaUp, provider = "ollam
       setConvos(prev => [{
         id: convoId, title: title || ("Library · " + text.slice(0, 32)),
         model, updatedAt: Date.now(), messages: [], mode: "memory",
-        memory: emptyMemory(), docs: [],
+        graph: new Graph().toJSON(), docs: [],
       }, ...prev]);
       setActiveId(convoId);
       setMode("memory");
     } else if (cur.mode !== "memory") {
       setConvos(prev => prev.map(c => c.id === convoId
-        ? { ...c, mode: "memory", memory: c.memory || emptyMemory() } : c));
+        ? { ...c, mode: "memory", graph: c.graph || new Graph().toJSON() } : c));
       setMode("memory");
     }
 
@@ -1217,25 +1242,24 @@ export default function Chat({ ollamaUrl, installed, ollamaUp, provider = "ollam
     setIngestRunning(true);
     sync();
 
-    const docMem = emptyMemory();
-    const docGiven = appendGiven(docMem, makeGiven({
-      agent: "system:ingest", text: title || source || "pasted text",
-    }));
+    const docGraph = new Graph();
+    docGraph.registerDocument(docId, title || source || "document", passages.length);
     const allAmbigs = [];
     for (let i = 0; i < passages.length; i++) {
       trace[i].status = "reading"; sync();
       try {
+        const passageGiven = docGraph.appendGiven(logPassage(passages[i], docId, i, { title }));
         const out = await chatOnce(model, [
           { role: "system", content: INGEST_SYSTEM },
-          { role: "user", content: `${buildRoster(docMem)}\n\nPASSAGE:\n${passages[i]}` },
-        ], WALK_SCHEMA);
-        const ops = parseWalk(out);
-        const res = applyWalk(docMem, ops, { source: docGiven.id });
+          { role: "user", content: `${buildRegister(docGraph)}\n\nPASSAGE:\n${passages[i]}` },
+        ], EVENT_SCHEMA);
+        const events = parseEvents(out);
+        const res = applyEvents(docGraph, events, { source: passageGiven.id, passageIndex: i });
         trace[i].applied = res.applied;
         trace[i].ambigs = res.ambigs;
         allAmbigs.push(...res.ambigs);
-        trace[i].rawOutput = out;
-        trace[i].ops = ops;
+        trace[i].rawOutput = typeof out === "string" ? out : JSON.stringify(out);
+        trace[i].ops = events;
         trace[i].status = "done";
       } catch (e) {
         trace[i].status = "error";
@@ -1245,23 +1269,27 @@ export default function Chat({ ollamaUrl, installed, ollamaUp, provider = "ollam
     }
 
     // Each AMBIG the ingest emitted fires a MUTATE call for a clean decision.
-    const docMutations = [];
+    const docCommits = [];
     for (const a of allAmbigs) {
-      const trigger = { kind: "ambig", target: a.candidate, name: a.name, detail: a.span || a.name };
+      const trigger = { type: "ingest_ambig", name: a.name, candidateHash: a.candidateHash, span: a.span };
       try {
         const out = await chatOnce(model, [
           { role: "system", content: MUTATE_SYSTEM },
-          { role: "user", content: buildMutateUser(docMem, trigger) },
+          { role: "user", content: buildMutatePrompt(trigger, docGraph) },
         ], MUTATE_SCHEMA);
         const parsed = parseMutate(out);
-        if (parsed) {
-          const mut = makeMutation(parsed, { trigger });
-          mut.docId = docId;
-          docMutations.push(mut);
+        if (parsed && parsed.action !== "NONE") {
+          docCommits.push({
+            id: "m_" + Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
+            action: parsed.action, reason: parsed.reason,
+            trigger: trigger.type, triggerDetail: trigger.span || trigger.name || "",
+            msgId: null, docId, status: "pending", mutateAction: parsed,
+          });
+        } else if (parsed) {
+          applyMutation(parsed, docGraph, trigger.type);
         }
       } catch { /* fail silently — the document was still read */ }
     }
-    docMem.mutations.push(...docMutations);
 
     const learned = trace.reduce((n, t) => n + (t.applied || 0), 0);
     const doc = {
@@ -1271,7 +1299,7 @@ export default function Chat({ ollamaUrl, installed, ollamaUp, provider = "ollam
       addedAt: new Date().toISOString(),
       chars: text.length, passages: passages.length, learned,
       text,
-      memory: docMem,
+      graph: docGraph.toJSON(),
       trace: trace.map(t => ({
         index: t.index, chars: t.chars, status: t.status, applied: t.applied,
         signal: { names: t.signal.ner.names, dates: t.signal.ner.dates, keywords: t.signal.keywords },
@@ -1279,12 +1307,11 @@ export default function Chat({ ollamaUrl, installed, ollamaUp, provider = "ollam
       })),
     };
     setLibrary(prev => [doc, ...prev]);
-    const pendingDocMuts = docMutations.filter(m => m.status === "pending");
     setConvos(prev => prev.map(c => {
       if (c.id !== convoId) return c;
-      const memory = cloneMemory(c.memory);
-      memory.mutations.push(...pendingDocMuts);
-      return { ...c, docs: [...(c.docs || []), docId], memory, updatedAt: Date.now() };
+      const g = loadGraph(c.graph);
+      for (const commit of docCommits) g.addPending(commit);
+      return { ...c, docs: [...(c.docs || []), docId], graph: g.toJSON(), updatedAt: Date.now() };
     }));
     setIngestRunning(false);
   };
@@ -1296,7 +1323,7 @@ export default function Chat({ ollamaUrl, installed, ollamaUp, provider = "ollam
       if (c.id !== activeId) return c;
       const has = (c.docs || []).includes(docId);
       return {
-        ...c, mode: "memory", memory: c.memory || emptyMemory(), updatedAt: Date.now(),
+        ...c, mode: "memory", graph: c.graph || new Graph().toJSON(), updatedAt: Date.now(),
         docs: has ? c.docs.filter(d => d !== docId) : [...(c.docs || []), docId],
       };
     }));
@@ -1328,11 +1355,11 @@ export default function Chat({ ollamaUrl, installed, ollamaUp, provider = "ollam
         dossierHash: m.dossierHash || undefined,
         spans: m.spans || undefined,
       })),
-      memory: c.memory || undefined,
+      graph: c.graph || undefined,
       library: attached.map(d => ({
         id: d.id, title: d.title, source: d.source, addedAt: d.addedAt,
         chars: d.chars, passages: d.passages, learned: d.learned,
-        text: d.text, memory: d.memory, readTrace: d.trace,
+        text: d.text, graph: d.graph, readTrace: d.trace,
       })),
     };
     const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
@@ -1388,7 +1415,7 @@ export default function Chat({ ollamaUrl, installed, ollamaUp, provider = "ollam
       setConvos(prev => [{
         id: convoId, title: text.slice(0, 48) + (text.length > 48 ? "…" : ""),
         model: chosenModel, updatedAt: Date.now(), messages: [],
-        mode, memory: mode === "memory" ? emptyMemory() : undefined,
+        mode, graph: mode === "memory" ? new Graph().toJSON() : undefined,
       }, ...prev]);
       setActiveId(convoId);
     }
@@ -1405,7 +1432,7 @@ export default function Chat({ ollamaUrl, installed, ollamaUp, provider = "ollam
         { role: "system", content: sys.content },
         { role: "user", content: text },
       ];
-      memCtx = { sig, entities: sys.entities, dossierHash: sys.dossierHash, spans: sys.spans };
+      memCtx = { sig, ranked: sys.ranked, dossierHash: sys.dossierHash, spans: sys.spans };
       memBadge = { used: sys.used };
     } else {
       const apiHistory = quantize ? quantizeHistory(history) : history;
@@ -1436,11 +1463,9 @@ export default function Chat({ ollamaUrl, installed, ollamaUp, provider = "ollam
     // Both messages are recorded in the Given-Log with content hashes; the
     // model entry carries the dossier projection that produced it.
     if (mode === "memory" && memCtx && finalContent) {
-      const userGiven = makeGiven({ agent: "user", text });
-      const modelGiven = makeGiven({
-        agent: "model:" + chosenModel, text: finalContent,
-        dossierHash: memCtx.dossierHash, spans: memCtx.spans,
-      });
+      const turn = (existing?.messages.filter(m => m.role === "assistant").length || 0) + 1;
+      const userGiven = logUserMessage(text, memCtx.sig, convoId, turn);
+      const modelGiven = logModelResponse(finalContent, chosenModel, memCtx.dossierHash, convoId, turn);
       patchMsg(convoId, aId, { givenId: modelGiven.id });
       runExtract(convoId, aId, userGiven, modelGiven, backgroundModel(chosenModel), memCtx);
     }
@@ -1499,6 +1524,8 @@ export default function Chat({ ollamaUrl, installed, ollamaUp, provider = "ollam
         { role: "user", content: promptText },
       ];
       memBadge = { used: sys.used };
+      oldMsg.dossierHash = sys.dossierHash;
+      oldMsg.spans = sys.spans;
     } else {
       apiMessages = quantize ? quantizeHistory(history) : history;
     }
@@ -1506,6 +1533,8 @@ export default function Chat({ ollamaUrl, installed, ollamaUp, provider = "ollam
     patchMsg(active.id, msgId, {
       model: useModel, content: "", reasoning: undefined, streaming: true, error: false,
       elapsed: undefined, tokens: undefined, routing: newRouting, mem: memBadge, prompt: apiMessages,
+      dossierHash: active.mode === "memory" ? oldMsg.dossierHash : undefined,
+      spans: active.mode === "memory" ? oldMsg.spans : undefined,
     });
     await runTurn(active.id, msgId, useModel, apiMessages, { candidates, routingId: routing?.id });
     setBusy(false);
@@ -1523,28 +1552,27 @@ export default function Chat({ ollamaUrl, installed, ollamaUp, provider = "ollam
     maybeREC();
   };
 
-  /* Accept or dismiss a pending MUTATE action. Accepting applies it to the
-     graph it belongs to — the chat's own memory, or a library document's
-     graph when the mutation came from ingest. */
+  /* Accept or dismiss a pending MUTATE commit. Accepting applies the action
+     to the graph it belongs to — the chat's own graph, or a library
+     document's graph when the commit came from ingest. */
   const resolveMutation = (mutId, accept) => {
     if (!active) return;
-    const mut = (active.memory?.mutations || []).find(m => m.id === mutId);
+    const mut = (active.graph?.pending || []).find(m => m.id === mutId);
     if (!mut) return;
     if (accept && mut.docId) {
       setLibrary(prev => prev.map(d => {
         if (d.id !== mut.docId) return d;
-        const memory = cloneMemory(d.memory);
-        applyMutation(memory, mut);
-        return { ...d, memory };
+        const g = loadGraph(d.graph);
+        applyMutation(mut.mutateAction, g, mut.trigger);
+        return { ...d, graph: g.toJSON() };
       }));
     }
     setConvos(prev => prev.map(c => {
       if (c.id !== active.id) return c;
-      const memory = cloneMemory(c.memory);
-      if (accept && !mut.docId) applyMutation(memory, mut);
-      memory.mutations = memory.mutations.map(m =>
-        m.id === mutId ? { ...m, status: accept ? "accepted" : "dismissed" } : m);
-      return { ...c, memory };
+      const g = loadGraph(c.graph);
+      if (accept && !mut.docId) applyMutation(mut.mutateAction, g, mut.trigger);
+      g.resolvePending(mutId, accept ? "accepted" : "dismissed");
+      return { ...c, graph: g.toJSON() };
     }));
   };
 
@@ -1567,12 +1595,12 @@ export default function Chat({ ollamaUrl, installed, ollamaUp, provider = "ollam
 
   const offline = ollamaUp === false || ollamaUp === "cors";
 
-  const memStats = mode === "memory" ? memoryStats(combinedMemory(active)) : null;
+  const memStats = mode === "memory" ? combinedGraph(active).stats() : null;
   const docCount = active?.docs?.length || 0;
 
-  /* Pending MUTATE actions awaiting consent. Those tied to a message render
+  /* Pending MUTATE commits awaiting consent. Those tied to a message render
      inline beneath it; the rest (e.g. from ingest) render after the thread. */
-  const pendingMuts = (active?.memory?.mutations || []).filter(m => m.status === "pending");
+  const pendingMuts = (active?.graph?.pending || []).filter(m => (m.status || "pending") === "pending");
   const orphanMuts = pendingMuts.filter(m => !m.msgId || !messages.some(x => x.id === m.msgId));
 
   return (

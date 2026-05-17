@@ -161,9 +161,10 @@ export class Graph {
       .find(d => d.entity === entityId && d.field === field && !d.retired) || null;
   }
   writeDef(entityId, field, value, opts = {}) {
-    // Supersede any prior live DEF on the same field.
+    // Supersede any prior live DEF on the same field, unless told to keep it
+    // (a conflicting fact stays live so the dossier can surface ⚠).
     const prior = this.getDef(entityId, field);
-    if (prior) prior.retired = true;
+    if (prior && opts.supersede !== false) prior.retired = true;
     const d = {
       id: localId("d_"), entity: entityId, field: String(field), value: String(value),
       source: opts.source || null, span: opts.span || null,

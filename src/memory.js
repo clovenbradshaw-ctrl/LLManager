@@ -1,213 +1,234 @@
-/* Per-chat memory — a graph-backed "Experience Engine".
+/* v3 prompts, builders and graph operations.
 
-   In Memory mode a chat does not send its growing conversation history to
-   the model. Everything is in the graph instead:
+   Memory mode runs on the situated graph (see graph.js). A chat does not
+   send its growing history to the model; every turn is projected into a
+   fixed-size prompt and read back into the graph.
 
-   - The Given-Log is an append-only record of every message. User messages
-     and model responses each get a content hash (g_xxxxxxxx) and an `agent`
-     field ("user", "model:<name>", "system:ingest"). A model response also
-     records the dossier projection that produced it (dossierHash) and the
-     evidence spans that projection was built from — so you can always ask
-     "what did the model see, and where did it come from?".
+   Three model calls per knowledge-bearing turn:
+     READ    — user-facing, answers from the projected [CTX]
+     EXTRACT — background, reads the exchange into the graph as INS/CON/DEF/EVA
+     MUTATE  — background, fires only when a mechanical trigger flags an
+               ambiguity; produces one FORK/MERGE/CORRECT/RECLASSIFY/NONE
 
-   - Entities are content-addressed: an id is e_<hash> of the canonical name,
-     and a short state version (e_3a7f21b4@8f2c) tracks how the entity has
-     evolved. DEFs and edges carry a `source` pointing at the Given-Log entry
-     that produced them.
+   SIG is mechanical only — the NER/keyword scan that produces retrieval
+   candidates before the graph is touched. It is never stored. INS creates
+   permanent identity; kind is carried as a revisable DEF; EVA records
+   judgments; REC is reserved for MUTATE. */
 
-   - Three model calls run per turn: READ (user-facing), EXTRACT (background
-     event extraction) and MUTATE (background, triggered only on ambiguity).
-     MUTATE produces exactly one action — FORK, MERGE, CORRECT, RECLASSIFY or
-     NONE — and its triggers are mechanical (zero tokens). */
+import { Graph, mintGivenId } from "./graph.js";
 
-export const MEMORY_SYSTEM = `You are a helpful assistant with long-term memory.
-The [CONTEXT] block holds sites (people, organisations, places, etc.) recalled
-from this chat, each with a short description.
-The [LIBRARY] block contains the full text of documents read into this chat —
-treat them as source material you have already read and can quote directly.
-The [POSITION] block notes what was discussed on the previous turn.
-Use them to answer accurately and stay consistent. If they do not cover
-something, answer normally from your own knowledge — never claim you have no
-memory or that you cannot see a document. Keep responses concise unless asked
-for detail.`;
-
-/* The Ingest walk — read one passage of a document into the graph, with the
-   current roster of sites in hand. May emit AMBIG when unsure of a match. */
-export const INGEST_SYSTEM = `You convert text into a knowledge graph, passage by passage.
-You are given the KNOWN SITES already in the graph and one PASSAGE.
-Render the PASSAGE completely: parse every clause, not just the notable ones.
-The operations you return, taken together, must reconstruct what it says.
-
-A "site" is one entity — a person, organisation, place, role, policy, event,
-or concept. Never make a site out of a whole sentence or clause. Canonical
-names are short.
-
-Resolve against KNOWN SITES: each is listed as e_<hash>@<state> with its name.
-If the passage clearly refers to an existing site, reuse its e_<hash> id.
-If you are UNSURE whether a name matches an existing site, do NOT guess —
-emit an AMBIG op naming the closest candidate. Only create a site for
-something genuinely new.
-
-Return ONLY a JSON array of operations:
-  {"op":"SIG","name":"<short name>","kind":"person|org|place|role|policy|event|concept|document|thing","hypothesis":"<1-2 sentences on what this site is>"}
-  {"op":"DEF","id":"<e_hash or new name>","hypothesis":"<the site's full description, revised to fold in what this passage adds>"}
-  {"op":"CON","from":"<e_hash or name>","to":"<e_hash or name>","relation":"<the predicate, a few words>","evidence":"<the clause this came from>"}
-  {"op":"REC","id":"<e_hash>","canonical":"<corrected short name>","alias":"<the clumsy or wrong name to fold in>"}
-  {"op":"AMBIG","name":"<the name in the passage>","candidate":"<e_hash of the closest existing site>","span":"<the clause it appeared in>"}
-
-How to render a clause: its subject and object become sites (SIG if new), the
-predicate becomes a CON between them with the clause as evidence. Descriptive
-or attributive clauses become DEF revisions of a site's hypothesis. Resolve
-pronouns to their site.
-
-Use e_<hash> ids for known sites; use a short canonical name for new ones
-(the system assigns the hash). Ignore navigation chrome, bylines and ads.
-Return [] only if the passage is entirely boilerplate.`;
-
-/* The Extract — read a completed conversation turn into the graph. The
-   exchange is labelled with its Given-Log ids; every DEF must carry the
-   `source` Given-Log entry that produced it. */
-export const EXTRACT_SYSTEM = `You extract new knowledge from one conversation exchange into a knowledge graph.
-You are given the KNOWN SITES already in the graph and one EXCHANGE. The
-exchange is labelled with Given-Log ids: User [g_xxxxxxxx] and Model [g_xxxxxxxx].
-
-Return only what the exchange newly establishes — do not restate the roster.
-
-Return ONLY a JSON array of operations:
-  {"op":"SIG","name":"<short name>","kind":"person|org|place|role|policy|event|concept|document|thing","hypothesis":"<1-2 sentences on what this site is>"}
-  {"op":"DEF","id":"<e_hash or name>","field":"<attribute>","value":"<the fact>","source":"<g_id this came from>"}
-  {"op":"CON","from":"<e_hash or name>","to":"<e_hash or name>","relation":"<the predicate>","evidence":"<the clause>","source":"<g_id this came from>"}
-
-For KNOWN SITES (listed as e_<hash>@<state>) reference them by their e_<hash>
-id. For genuinely new sites, give a short canonical name — the system assigns
-the hash on creation. Every DEF must carry a "source" field set to the
-Given-Log id (g_xxxxxxxx) of the message it came from.
-Return [] if the exchange establishes nothing new.`;
-
-/* The Mutate — invoked only when a mechanical trigger flags an ambiguity.
-   Produces exactly one action with a reason. */
-export const MUTATE_SYSTEM = `You resolve one ambiguity in a knowledge graph. You are given the detail of
-one or two sites and the reason this was flagged. Decide the single best action.
-
-Return ONLY one JSON object, exactly one of:
-  {"action":"MERGE","target":"<e_hash to keep>","other":"<e_hash to fold in>","reason":"<why>"}
-  {"action":"FORK","name":"<the ambiguous name>","from":"<e_hash it was confused with>","kind":"<kind>","reason":"<why>"}
-  {"action":"CORRECT","target":"<e_hash>","canonical":"<corrected name>","reason":"<why>"}
-  {"action":"RECLASSIFY","target":"<e_hash>","kind":"<corrected kind>","reason":"<why>"}
-  {"action":"NONE","reason":"<why no change is needed>"}
-
-MERGE when two sites are the same entity. FORK when one name has been conflated
-with a different entity and needs its own site. CORRECT when a site's canonical
-name is wrong. RECLASSIFY when a site's kind is wrong. NONE when the graph is
-already correct. Keep the reason to one sentence.`;
-
-/* ── Structured-output schemas ──
-
-   Ollama's `format` parameter constrains generation to a JSON schema via
-   constrained decoding: the model can only emit token sequences that keep
-   the output schema-valid. Passing these kills malformed JSON and markdown
-   fences for the EXTRACT, INGEST and MUTATE calls — the structure is
-   guaranteed, only the content quality depends on the model. */
-
-/* The walk op list — INGEST and EXTRACT. A superset of all op fields; only
-   `op` is required, the model fills what each op needs. */
-export const WALK_SCHEMA = {
-  type: "array",
-  items: {
-    type: "object",
-    properties: {
-      op: { type: "string", enum: ["SIG", "DEF", "CON", "REC", "AMBIG"] },
-      id: { type: "string" },
-      name: { type: "string" },
-      canonical: { type: "string" },
-      kind: { type: "string" },
-      hypothesis: { type: "string" },
-      from: { type: "string" },
-      to: { type: "string" },
-      relation: { type: "string" },
-      evidence: { type: "string" },
-      field: { type: "string" },
-      value: { type: "string" },
-      source: { type: "string" },
-      alias: { type: "string" },
-      candidate: { type: "string" },
-      span: { type: "string" },
-    },
-    required: ["op"],
-  },
+export const INTERVALS = {
+  ENTITY_HYPOTHESIS: 1,
+  GROUP_HYPOTHESIS: 4,
+  SECTION_HYPOTHESIS: 12,
+  DOCUMENT_HYPOTHESIS: Infinity,
+  SESSION_HYPOTHESIS: Infinity,
+  CORPUS_HYPOTHESIS: 5,
 };
 
-/* One MUTATE action. */
-export const MUTATE_SCHEMA = {
-  type: "object",
-  properties: {
-    action: { type: "string", enum: ["FORK", "MERGE", "CORRECT", "RECLASSIFY", "NONE"] },
-    target: { type: "string" },
-    other: { type: "string" },
-    name: { type: "string" },
-    from: { type: "string" },
-    canonical: { type: "string" },
-    kind: { type: "string" },
-    reason: { type: "string" },
-  },
-  required: ["action", "reason"],
-};
+/* ═══ Prompts: READ (user-facing) ═══ */
 
-/* ── Content hashing — sync, for content-addressed ids ── */
+export const READ_SYSTEM = `You are an interpreter reading a situated knowledge graph.
+Entity IDs are content hashes (e_xxxxxxxx). State versions (@xxxx) track changes.
+Your responses and the user's messages are both recorded in the graph.
 
-function fnv(str) {
-  let h = 0x811c9dc5;
-  const s = String(str || "");
-  for (let i = 0; i < s.length; i++) {
-    h ^= s.charCodeAt(i);
-    h = (h + ((h << 1) + (h << 4) + (h << 7) + (h << 8) + (h << 24))) >>> 0;
-  }
-  return h >>> 0;
-}
-/* A second, differently-seeded pass so 8 hex digits carry real entropy. */
-function hash8(str) {
-  const a = fnv(str).toString(16).padStart(8, "0");
-  const b = fnv("" + str).toString(16).padStart(8, "0");
-  return (a + b).slice(0, 8);
-}
-function hash4(str) {
-  return fnv(str).toString(16).padStart(8, "0").slice(0, 4);
-}
+Answer using ONLY the [CTX] block. Say "I don't have that" if insufficient.
+Do NOT use outside knowledge.
 
-const slug = (s) => String(s || "").trim().toLowerCase().replace(/\s+/g, " ");
+If an entity reference is ambiguous — a name that could refer to more than one
+thing in the graph — say so plainly. Example: "This 'Hardy' may not be the same
+as e_3a7f21b4 (Tom Hardy the actor)." The system will handle the resolution.
 
-/* Content-addressed id for an entity, from its canonical name. */
-export const entityHash = (canonical) => "e_" + hash8(slug(canonical));
+Reading [CTX]:
+  E: hash@state | terrain | edges
+  ~: canonical name, aka aliases
+  h: current hypothesis
+  →←: connection (type) target_hash
+  =: field = value
+  @: "verbatim source span"
+  ⚠: unresolved conflict
 
-/* Short state version for an entity — recomputed on every meaningful change
-   so the dossier and register can show e_3a7f21b4@8f2c. */
-export const stateOf = (e) =>
-  hash4([e.canonical, e.kind, e.hypothesis, (e.aliases || []).join("|")].join(""));
+Reading [POS]:
+  prev: entity hashes from last turn
+  topic: what we were discussing
+  last: user's previous message`;
 
-const restate = (e) => { e.state = stateOf(e); return e; };
+export const READ_CASUAL = `You are a helpful assistant. Be concise and natural.
+Your messages are recorded in a knowledge graph.`;
 
-/* ── The Given-Log — append-only record of every message ── */
+/* ═══ Prompt: EXTRACT (background) ═══ */
 
-/* Build a Given-Log entry. `agent` is "user", "model:<name>" or
-   "system:ingest". Model entries may carry the dossierHash + spans they were
-   produced from. */
-export function makeGiven({ agent, text, turn = null, dossierHash = null, spans = null }) {
-  const ts = Date.now();
-  const id = "g_" + hash8([agent, text, ts, Math.random()].join(""));
+export const EXTRACT_SYSTEM = `Extract new knowledge from this exchange as a JSON array.
+Both the user's message and the model's response are Given-Log entries (IDs provided).
+Return [] if nothing new. ONLY valid JSON, no markdown.
+
+Event types:
+{"op":"INS","entity":"<canonical>","terrain":"<T>"}
+{"op":"CON","from":"<hash>","to":"<hash>","type":"<verb>"}
+{"op":"DEF","entity":"<hash>","field":"<attr>","value":"<val>","source":"<given_id>"}
+{"op":"EVA","entity":"<hash>","claim":"<field=value>","status":"holds|fails|contested","source":"<given_id>"}
+
+Rules:
+- Reference existing entities by their hash (from the register).
+- For NEW entities, use "entity" with the canonical name. The system assigns the hash.
+- INS creates identity + terrain only. Attributes go in DEF.
+- The entity's kind (person, organization, place...) is a DEF: field "kind".
+- "source" on DEF/EVA = the Given-Log ID of the message that produced this knowledge.
+- A DEF is a fact. An EVA is a judgment (does a claim hold, fail, or is contested?).
+- Skip greetings, filler, restatements of existing context.
+- Entity names: lowercase-hyphenated for new canonical names.
+
+Terrains: Entity, Network, Paradigm, Void, Kind, Field, Link, Atmosphere, Lens`;
+
+/* ═══ Prompt: MUTATE (background, on ambiguity) ═══ */
+
+export const MUTATE_SYSTEM = `You are resolving a graph ambiguity. Examine the evidence and
+produce exactly ONE action as JSON. ONLY valid JSON, no markdown.
+
+Actions:
+
+FORK — one entity is actually two:
+{"action":"FORK","source":"<hash>","new_canonical":"<name>","reason":"<why>",
+ "reassign":[{"def_id":"<id>","reason":"<why this DEF belongs to the new entity>"}]}
+
+MERGE — two entities are actually one:
+{"action":"MERGE","keep":"<hash>","absorb":"<hash>","reason":"<why>",
+ "new_aliases":["<alias1>"]}
+
+CORRECT — a DEF is wrong:
+{"action":"CORRECT","entity":"<hash>","field":"<field>",
+ "old_value":"<wrong>","new_value":"<right>","reason":"<why>","source":"<given_id>"}
+
+RECLASSIFY — terrain assignment is wrong:
+{"action":"RECLASSIFY","entity":"<hash>","old_terrain":"<T>","new_terrain":"<T>","reason":"<why>"}
+
+NONE — no action needed:
+{"action":"NONE","reason":"<why the ambiguity is not real>"}
+
+Always include "reason". The action is logged and must be auditable.`;
+
+/* ═══ Prompt: INGEST (document walk, per passage) ═══ */
+
+export const INGEST_SYSTEM = `Extract entities and claims from this passage as a JSON array.
+Return [] if nothing extractable. ONLY valid JSON, no markdown.
+
+Entity hashes from the register are e_xxxxxxxx. Reference them for known entities.
+For NEW entities use canonical name; the system assigns the hash.
+
+Event types:
+{"op":"INS","entity":"<canonical>","terrain":"<T>"}
+{"op":"CON","from":"<hash_or_name>","to":"<hash_or_name>","type":"<verb>"}
+{"op":"DEF","entity":"<hash_or_name>","field":"<attr>","value":"<val>","span":"<exact words>"}
+{"op":"EVA","entity":"<hash_or_name>","claim":"<claim>","status":"holds|fails|contested","span":"<exact words>"}
+
+Example — "Smith, who left Boeing in 2019, now advises the Pentagon on drone policy."
+Register has: e_a1b2c3d4 (Boeing) | Network
+[
+{"op":"INS","entity":"smith","terrain":"Entity"},
+{"op":"DEF","entity":"smith","field":"kind","value":"person","span":"Smith"},
+{"op":"DEF","entity":"smith","field":"former_employer","value":"Boeing, left 2019","span":"left Boeing in 2019"},
+{"op":"CON","from":"smith","to":"e_a1b2c3d4","type":"former_employee"},
+{"op":"DEF","entity":"smith","field":"advisory_role","value":"drone policy","span":"advises the Pentagon on drone policy"}
+]
+
+Rules:
+- Do NOT re-INS entities from the register. Reference them by hash.
+- "span" = EXACT words from the passage.
+- INS only mints identity + terrain. All attributes go in DEF, including kind.
+- Extract ALL entities, connections, claims. Multiple events per passage is normal.
+- Rhetoric IS data. Author judgments are EVA events.
+- If a name might refer to an existing entity but you are uncertain, flag it:
+  {"op":"AMBIG","name":"<name>","candidate":"<hash>","span":"<exact words>"}
+  The system will trigger a MUTATE call to resolve it.
+
+Terrains: Entity, Network, Paradigm, Void, Kind, Field, Link, Atmosphere, Lens`;
+
+/* ═══ Prompts: Hypothesis (one per level, strict nesting) ═══ */
+
+export const HYPOTHESIS_ENTITY = `Write a one-sentence hypothesis for what this entity is about.
+Under 150 characters. Specific enough that future evidence could revise it.
+Your prior hypotheses and their triggers are shown below.
+Build on the trajectory of understanding. Do not restart from scratch.
+Write ONLY the sentence.`;
+
+export const HYPOTHESIS_GROUP = `Write a one-sentence hypothesis for what this passage group is about.
+You see ONLY entity hypotheses — not their underlying facts.
+Under 150 characters. Capture the thread connecting them.
+Prior group hypotheses show how the document is developing.
+Write ONLY the sentence.`;
+
+export const HYPOTHESIS_SECTION = `Write a one-sentence hypothesis for what this section is about.
+You see ONLY group hypotheses — not entity detail.
+Under 150 characters. Capture the argument or narrative arc.
+Prior section hypotheses show the document's shape so far.
+Write ONLY the sentence.`;
+
+export const HYPOTHESIS_DOCUMENT = `Write a one-sentence hypothesis for what this document is about.
+You see ONLY section hypotheses — not group or entity detail.
+Under 200 characters. Capture the central finding or argument.
+Prior document hypotheses in this corpus situate this document.
+Write ONLY the sentence.`;
+
+export const HYPOTHESIS_SESSION = `Write a one-sentence hypothesis for what this conversation was about.
+Focus on the investigative thread: what was asked, discovered, shifted.
+Under 200 characters.
+Write ONLY the sentence.`;
+
+export const HYPOTHESIS_CORPUS = `Write a one-sentence hypothesis for what this body of work is about.
+You see ONLY document and session hypotheses.
+Under 200 characters. Capture the overarching inquiry.
+Write ONLY the sentence.`;
+
+/* ═══ Prompts: Write mode ═══ */
+
+export const WRITE_OUTLINE = `Create a document outline from the material below.
+Return a JSON array:
+[{"section":1,"topic":"...","entities":["<hash>"],"move":"INS|CON|DEF|EVA"}]
+
+"move" = rhetorical operation:
+  INS = introduce something new to the reader
+  CON = reveal a connection between known things
+  DEF = establish and support a claim
+  EVA = assess whether a claim holds
+
+Order: introduce before connect, connect before claim, claim before evaluate.
+Return ONLY the JSON array.`;
+
+export const WRITE_SECTION = `Write this section using ONLY the [CTX] block.
+Ground every claim in context. Do not editorialize beyond evidence.
+2-4 paragraphs.
+[READER] shows entities already introduced. Do not re-introduce them.`;
+
+/* ═══ Given-Log builders ═══ */
+
+export function logUserMessage(text, signalOut, sessionId, turnNumber) {
   return {
-    id, agent, text: String(text || ""), ts, turn,
-    dossierHash: dossierHash || null,
-    spans: spans || null,
+    id: mintGivenId("user", text, Date.now()),
+    type: "eo.given", agent: "user", mode: "conversation",
+    text, ner: signalOut?.ner || null,
+    session: sessionId, turn: turnNumber, timestamp: Date.now(),
   };
 }
 
-export function appendGiven(memory, entry) {
-  memory.givenLog = memory.givenLog || [];
-  memory.givenLog.push(entry);
-  return entry;
+export function logModelResponse(text, model, dossierHash, sessionId, turnNumber) {
+  return {
+    id: mintGivenId("model", text, Date.now()),
+    type: "eo.given", agent: `model:${model}`, mode: "response",
+    text, dossierHash: dossierHash || null,
+    session: sessionId, turn: turnNumber, timestamp: Date.now(),
+  };
 }
 
-/* ── Splitting text for the walk ── */
+export function logPassage(text, documentId, passageIndex, source) {
+  return {
+    id: mintGivenId("document", text, Date.now()),
+    type: "eo.given", agent: "system:walker", mode: "document",
+    text, source: source || null,
+    documentId, passageIndex, timestamp: Date.now(),
+  };
+}
+
+/* ═══ Splitting text for the walk ═══ */
 
 export function splitSentences(text, maxLen = 1200) {
   const clean = String(text || "").replace(/\s+/g, " ").trim();
@@ -244,67 +265,7 @@ export function batchSentences(sentences, maxChars = 1400, maxCount = 5) {
   return batches;
 }
 
-/* ── Empty / clone / merge helpers ── */
-export const emptyMemory = () => ({
-  schema: "graph-2",
-  givenLog: [],
-  entities: {},
-  edges: {},
-  defs: {},
-  mutations: [],
-  lastTurn: null,
-});
-
-export const cloneMemory = (m) => {
-  if (!m) return emptyMemory();
-  const entities = {};
-  for (const [k, e] of Object.entries(m.entities || {})) {
-    entities[k] = { ...e, aliases: [...(e.aliases || [])] };
-  }
-  const edges = {};
-  for (const [k, g] of Object.entries(m.edges || {})) edges[k] = { ...g };
-  const defs = {};
-  for (const [k, d] of Object.entries(m.defs || {})) defs[k] = { ...d };
-  return {
-    schema: "graph-2",
-    givenLog: (m.givenLog || []).map(g => ({ ...g })),
-    entities, edges, defs,
-    mutations: (m.mutations || []).map(x => ({ ...x })),
-    lastTurn: m.lastTurn ? { ...m.lastTurn } : null,
-  };
-};
-
-export const memoryStats = (m) => ({
-  entities: m ? Object.keys(m.entities || {}).length : 0,
-  edges: m ? Object.keys(m.edges || {}).length : 0,
-  defs: m ? Object.keys(m.defs || {}).length : 0,
-  given: m ? (m.givenLog || []).length : 0,
-  pending: m ? (m.mutations || []).filter(x => x.status === "pending").length : 0,
-});
-
-/* Merge several graphs into one — a chat's own memory plus any opted-in
-   library documents — before projecting the dossier. */
-export function mergeMemory(...memories) {
-  const out = { entities: {}, edges: {}, defs: {}, givenLog: [] };
-  for (const m of memories) {
-    if (!m) continue;
-    for (const [id, e] of Object.entries(m.entities || {})) {
-      if (!out.entities[id]) {
-        out.entities[id] = { ...e, aliases: [...(e.aliases || [])] };
-      } else {
-        const o = out.entities[id];
-        o.mentions = (o.mentions || 0) + (e.mentions || 0);
-        if ((e.hypothesis || "").length > (o.hypothesis || "").length) o.hypothesis = e.hypothesis;
-      }
-    }
-    Object.assign(out.edges, m.edges || {});
-    Object.assign(out.defs, m.defs || {});
-    out.givenLog.push(...(m.givenLog || []));
-  }
-  return out;
-}
-
-/* ── The Signal: mechanical NER + keywords ── */
+/* ═══ The Signal — mechanical NER + keywords (SIG: candidates only) ═══ */
 
 const COMMON_CAPS = new Set([
   "the", "a", "an", "i", "i'm", "i've", "it", "this", "that", "these", "those",
@@ -313,38 +274,32 @@ const COMMON_CAPS = new Set([
   "hi", "hello", "hey", "ok", "okay", "please", "thanks", "thank", "also",
   "but", "and", "or", "so", "if", "my", "your", "you", "we", "they", "he", "she",
 ]);
-
 const STOPS = new Set(["what", "how", "why", "when", "where", "who", "is", "was",
   "are", "the", "a", "an", "in", "on", "at", "to", "for", "of", "and", "or", "but",
   "did", "do", "does", "has", "have", "had", "been", "be", "this", "that", "it",
   "with", "from", "about", "into", "not", "no", "yes", "can", "could", "would",
   "should", "will", "just", "also", "very", "much", "more", "some", "any", "all"]);
-
 const DATE_RE = /\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\b|\b(?:mon|tue|wed|thu|fri|sat|sun)[a-z]*day\b|\b(?:today|tomorrow|yesterday|tonight)\b|\b(?:19|20)\d{2}\b/gi;
-
 const TITLE_RE = /\b(?:mr|mrs|ms|dr|prof|professor|president|senator|governor|mayor|sir|lord|lady|king|queen|gen|general|capt|captain|rev)\.?$/i;
 const PLACE_PREP = new Set(["in", "at", "to", "from", "near", "into", "across", "through", "toward", "towards"]);
 const ORG_SUFFIX = /\b(?:inc|corp|ltd|llc|co|company|agency|department|ministry|bureau|institute|university|college|bank|group|association|committee|commission|council)\b\.?$/i;
 
-/* Guess an entity kind for an NER name from its surrounding words. Returns
-   "person" | "place" | "org" | null. Mechanical, zero tokens. */
 function guessKind(message, name, index) {
   const before = message.slice(Math.max(0, index - 24), index).trim();
   const prevWord = (before.match(/(\S+)\s*$/) || [, ""])[1];
   if (TITLE_RE.test(prevWord)) return "person";
   if (PLACE_PREP.has(prevWord.toLowerCase())) return "place";
-  if (ORG_SUFFIX.test(name)) return "org";
+  if (ORG_SUFFIX.test(name)) return "organization";
   return null;
 }
 
 function extractNER(message) {
-  const seen = new Map(); // name → guessed kind
+  const seen = new Map();
   const re = /\b[A-Z][a-zA-Z]+(?:\s+(?:of|the|and|de|van|von)\s+)?(?:\s*[A-Z][a-zA-Z]+)*\b/g;
   let m;
   while ((m = re.exec(message))) {
     const name = m[0].trim().replace(/\s+/g, " ");
-    if (name.length < 2) continue;
-    if (COMMON_CAPS.has(name.toLowerCase())) continue;
+    if (name.length < 2 || COMMON_CAPS.has(name.toLowerCase())) continue;
     if (!seen.has(name)) seen.set(name, guessKind(message, name, m.index));
   }
   return {
@@ -357,470 +312,430 @@ function extractNER(message) {
 
 export function extractKeywords(message) {
   return message.toLowerCase().replace(/[?!.,;:'"]/g, "")
-    .split(/\s+/)
-    .filter(w => w.length > 2 && !STOPS.has(w));
+    .split(/\s+/).filter(w => w.length > 2 && !STOPS.has(w));
 }
 
 export function signal(message) {
   return { ner: extractNER(message), keywords: extractKeywords(message) };
 }
 
-/* ── Resolving a textual reference to an entity ── */
+const slug = (s) => String(s || "").trim().toLowerCase().replace(/\s+/g, " ");
 
-/* Find an existing entity by e_<hash> id, canonical name, or alias. */
-function findEntity(memory, ref) {
-  const sites = memory.entities || {};
-  if (!ref) return null;
-  if (/^e_[0-9a-f]{8}$/i.test(ref) && sites[ref]) return sites[ref];
-  const want = slug(ref);
-  for (const e of Object.values(sites)) {
-    if (slug(e.canonical) === want) return e;
-    if ((e.aliases || []).some(a => slug(a) === want)) return e;
-  }
-  // a hash without state suffix that does not exist, or stripped @state
-  const bare = String(ref).split("@")[0];
-  if (sites[bare]) return sites[bare];
-  return null;
-}
+/* ═══ The Reach — rank graph entities against the signal ═══ */
 
-/* ── The Roster: the sites already in the graph, handed to the walk ── */
-export function buildRoster(memory, cap = 80) {
-  const sites = Object.values(memory?.entities || {});
-  if (!sites.length) return "KNOWN SITES: (none yet — this is the first passage)";
-  const top = [...sites].sort((a, b) => (b.mentions || 0) - (a.mentions || 0)).slice(0, cap);
-  const lines = top.map(s => {
-    const h = (s.hypothesis || "").replace(/\s+/g, " ").trim();
-    const snip = h.length > 140 ? h.slice(0, 140) + "…" : h;
-    return `- ${s.id}@${s.state || stateOf(s)} "${s.canonical}" (${s.kind || "thing"})${snip ? ": " + snip : ""}`;
-  });
-  return "KNOWN SITES:\n" + lines.join("\n");
-}
-
-/* ── The Reach: search the graph using Signal output ── */
-export function reach(sig, memory) {
-  const entities = memory?.entities || {};
-  const edges = memory?.edges || {};
+export function reach(sig, graph) {
   const cand = new Map();
   const add = (id, score) => cand.set(id, (cand.get(id) || 0) + score);
-
   for (const name of sig.ner.names) {
     const q = slug(name);
-    for (const e of Object.values(entities)) {
+    for (const e of graph.allEntities()) {
       const c = slug(e.canonical);
       if (c.includes(q) || q.includes(c)) add(e.id, 3);
       else if ((e.aliases || []).some(a => slug(a).includes(q) || q.includes(slug(a)))) add(e.id, 2);
     }
   }
   for (const kw of sig.keywords) {
-    for (const e of Object.values(entities)) {
+    for (const e of graph.allEntities()) {
       if (slug(e.canonical).includes(kw) || (e.hypothesis || "").toLowerCase().includes(kw)) add(e.id, 1);
     }
   }
-
-  // 2-hop expansion along links
   for (const id of [...cand.keys()]) {
-    for (const edge of Object.values(edges)) {
-      if (edge.from === id && !cand.has(edge.to)) add(edge.to, 1);
-      if (edge.to === id && !cand.has(edge.from)) add(edge.from, 1);
+    for (const edge of graph.getEdges(id)) {
+      const other = edge.from === id ? edge.to : edge.from;
+      if (!cand.has(other)) add(other, 1);
     }
   }
-
   return [...cand.entries()]
     .sort((a, b) => b[1] - a[1])
     .slice(0, 6)
-    .map(([id]) => entities[id])
-    .filter(Boolean);
+    .map(([id, score]) => ({ entity: graph.getEntity(id), tier: score >= 3 ? 1 : score >= 1 ? 2 : 3 }))
+    .filter(r => r.entity);
 }
 
-/* ── The Dossier: format the reached sites into a compact context block ── */
-export function buildDossier(sites, memory) {
-  if (!sites.length) {
-    return "[CONTEXT]\n(nothing recalled yet)\n[/CONTEXT]";
+/* ═══ The Dossier — projected [CTX] block ═══ */
+
+export function buildDossier(rankedEntities, graph, maxTokens = 350) {
+  let budget = maxTokens;
+  const blocks = [];
+  for (const { entity, tier } of rankedEntities) {
+    if (!entity) continue;
+    const stateHash = graph.stateHash(entity.id);
+    const edges = graph.getEdges(entity.id);
+    const defs = graph.getDefs(entity.id);
+    const conflicts = graph.getConflicts(entity.id);
+    const aliases = entity.aliases?.length ? entity.aliases.join(", ") : null;
+
+    if (tier === 1 && budget >= 65) {
+      let b = `E: ${entity.id}@${stateHash} | ${entity.terrain} | ${edges.length}`;
+      b += `\n  ~ ${entity.canonical}${aliases ? ", aka " + aliases : ""}`;
+      b += `\n  h: ${(entity.hypothesis || "?").slice(0, 130)}`;
+      for (const edge of edges.slice(0, 3)) {
+        const dir = edge.from === entity.id ? "→" : "←";
+        const target = edge.from === entity.id ? edge.to : edge.from;
+        b += `\n  ${dir} ${target} (${edge.type})`;
+      }
+      let spanDone = false;
+      for (const def of defs.slice(0, 3)) {
+        b += `\n  = ${def.field}: "${def.value}"`;
+        if (def.span && !spanDone) { b += ` @"${def.span.slice(0, 50)}"`; spanDone = true; }
+      }
+      for (const c of conflicts.slice(0, 1)) {
+        b += `\n  ⚠ ${c.field}: "${c.existing}" vs "${c.incoming}"`;
+      }
+      blocks.push(b); budget -= 65;
+    } else if (tier === 2 && budget >= 35) {
+      let b = `E: ${entity.id}@${stateHash} | ${entity.terrain}`;
+      b += `\n  ~ ${entity.canonical}`;
+      b += `\n  h: ${(entity.hypothesis || "?").slice(0, 130)}`;
+      for (const def of defs.slice(0, 2)) b += `\n  = ${def.field}: "${def.value}"`;
+      blocks.push(b); budget -= 35;
+    } else if (budget >= 15) {
+      blocks.push(`E: ${entity.id}@${stateHash} | ${entity.terrain}\n  ~ ${entity.canonical}\n  h: ${(entity.hypothesis || "?").slice(0, 100)}`);
+      budget -= 15;
+    } else break;
   }
-  const edges = Object.values(memory?.edges || {});
-  const defs = Object.values(memory?.defs || {});
-  const block = sites.map(s => {
-    const lines = [`${s.canonical} [${s.id}@${s.state || stateOf(s)}] (${s.kind || "thing"})`];
-    if (s.hypothesis) lines.push("  " + s.hypothesis.replace(/\s+/g, " ").trim());
-    for (const d of defs.filter(d => d.entity === s.id && d.value)) {
-      lines.push(`  ${d.field}: ${d.value}`);
-    }
-    for (const edge of edges.filter(g => g.from === s.id)) {
-      const to = memory.entities[edge.to];
-      lines.push(`  ${edge.relation || edge.type} → ${to ? to.canonical : edge.to}`);
-    }
-    return lines.join("\n");
-  }).join("\n");
-  return `[CONTEXT]\n${block}\n[/CONTEXT]`;
+  return blocks.length
+    ? `[CTX]\n${blocks.join("\n\n")}\n[/CTX]`
+    : "[CTX]\n(no matching entities)\n[/CTX]";
 }
 
-/* The Spans: the underlying evidence the dossier was projected from, gathered
-   mechanically. Each span is a clause (or fact) plus the Given-Log id it came
-   from — so a model response can be traced back past the hypotheses to source. */
-export function collectSpans(sites, memory) {
-  const edges = Object.values(memory?.edges || {});
-  const defs = Object.values(memory?.defs || {});
-  const ids = new Set(sites.map(s => s.id));
+/* The dossier hash — identifies the projection that produced a response. */
+export function dossierHashOf(dossier) {
+  let h = 0x811c9dc5;
+  const s = String(dossier || "");
+  for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = (h * 0x01000193) >>> 0; }
+  return "d_" + h.toString(16).padStart(8, "0");
+}
+
+/* Source spans behind the projected dossier — DEF spans and edge sources. */
+export function collectSpans(rankedEntities, graph) {
   const spans = [];
-  for (const d of defs) {
-    if (ids.has(d.entity) && d.value) {
-      spans.push({ entity: d.entity, kind: "def", text: `${d.field}: ${d.value}`, source: d.source || null });
+  for (const { entity } of rankedEntities) {
+    if (!entity) continue;
+    for (const d of graph.getDefs(entity.id)) {
+      spans.push({ entity: entity.id, kind: "def", text: `${d.field}: ${d.value}`, source: d.source || d.span || null });
     }
-  }
-  for (const e of edges) {
-    if ((ids.has(e.from) || ids.has(e.to)) && e.evidence) {
-      spans.push({ entity: e.from, kind: "edge", text: e.evidence, source: e.source || null });
+    for (const v of graph.getEvals(entity.id)) {
+      spans.push({ entity: entity.id, kind: "eva", text: `${v.claim} [${v.status}]`, source: v.source || null });
     }
   }
   return spans;
 }
 
-/* The dossier hash — a content hash of the projected context block, recorded
-   on the model's Given-Log entry so the projection that produced a response
-   is identifiable later. */
-export const dossierHashOf = (dossier) => "d_" + hash8(dossier || "");
+/* ═══ The Position Marker ═══ */
 
-/* ── The Position Marker: one-turn memory, overwrites every turn ── */
 export function buildPosition(lastTurn) {
   if (!lastTurn) return "";
-  return `[POSITION]
-Last sites: ${(lastTurn.entities || []).join(", ") || "none"}
-Topic: ${lastTurn.topic || "none"}
-Last user message: "${lastTurn.userMessage || ""}"
-[/POSITION]`;
+  return `[POS]
+prev: ${(lastTurn.entities || []).slice(0, 5).join(", ")}
+topic: ${lastTurn.topic || "none"}
+last: "${(lastTurn.userMessage || "").slice(0, 80)}"
+[/POS]`;
 }
 
-/* ── The Library card: the actual text of every document read into a chat ── */
-export function buildLibrary(docs, perDocCap = 8000) {
-  if (!docs || !docs.length) return "";
-  const out = [
-    "[LIBRARY]",
-    "Full text of the documents read into this chat. Treat them as source",
-    "material you have already read and may quote or summarise directly.",
-  ];
-  for (const d of docs) {
-    const text = String(d.text || "").trim();
-    const body = text.length > perDocCap
-      ? text.slice(0, perDocCap) + " …[truncated]"
-      : text;
-    out.push("");
-    out.push(`Document: "${d.title}"`);
-    out.push(body || "(no readable text was extracted from this document)");
-  }
-  out.push("[/LIBRARY]");
-  return out.join("\n");
+/* ═══ The Register — known entities, so EXTRACT does not re-INS ═══ */
+
+export function buildRegister(graph, cap = 20) {
+  const entities = graph.allEntities()
+    .sort((a, b) => (b.mentions || 0) - (a.mentions || 0)).slice(0, cap);
+  if (!entities.length) return "Entity register: (empty — first pass)";
+  return "Entity register:\n" + entities.map(e =>
+    `${e.id}@${graph.stateHash(e.id)} | ${e.canonical}${e.aliases?.length ? " | aka: " + e.aliases.join(", ") : ""} | ${e.terrain}`
+  ).join("\n");
 }
 
-/* ── The Walk: parse and apply the model's operation list ── */
-export function parseWalk(text) {
-  if (!text) return [];
-  let raw = text.replace(/```json/gi, "").replace(/```/g, "").trim();
-  const start = raw.indexOf("[");
-  const end = raw.lastIndexOf("]");
-  if (start !== -1 && end !== -1) raw = raw.slice(start, end + 1);
-  let parsed;
-  try { parsed = JSON.parse(raw); } catch { return []; }
-  if (!Array.isArray(parsed)) return [];
-  return parsed.filter(e => {
-    if (!e || typeof e !== "object") return false;
-    if (e.op === "SIG") return !!(e.name || e.canonical || e.id);
-    if (e.op === "DEF") return !!(e.id || e.canonical || e.name) && !!(e.hypothesis || e.value);
-    if (e.op === "CON") return !!e.from && !!e.to;
-    if (e.op === "REC") return !!e.id && !!e.canonical;
-    if (e.op === "AMBIG") return !!e.name;
-    return false;
-  });
+export function buildReaderCursor(introduced) {
+  if (introduced.length <= 10) return `[READER]\nIntroduced: ${introduced.join(", ")}\n[/READER]`;
+  return `[READER]\n${introduced.length} entities introduced. Recent: ${introduced.slice(-5).join(", ")}\n[/READER]`;
 }
 
-/* Fold the site `fromId` into `intoId`: move its links and defs, keep the
-   richer hypothesis, then drop it. */
-function mergeSite(memory, fromId, intoId) {
-  const src = memory.entities[fromId], dst = memory.entities[intoId];
-  if (!src || !dst || fromId === intoId) return;
-  dst.mentions = (dst.mentions || 0) + (src.mentions || 0);
-  if ((src.hypothesis || "").length > (dst.hypothesis || "").length) dst.hypothesis = src.hypothesis;
-  dst.aliases = dst.aliases || [];
-  if (src.canonical && !dst.aliases.includes(src.canonical)) dst.aliases.push(src.canonical);
-  for (const a of src.aliases || []) if (!dst.aliases.includes(a)) dst.aliases.push(a);
-  for (const [k, edge] of Object.entries(memory.edges)) {
-    const from = edge.from === fromId ? intoId : edge.from;
-    const to = edge.to === fromId ? intoId : edge.to;
-    if (from !== edge.from || to !== edge.to) {
-      delete memory.edges[k];
-      if (from !== to) {
-        memory.edges[`${from}::${edge.relation || edge.type}::${to}`] = { ...edge, from, to };
-      }
+/* ═══ EXTRACT / MUTATE prompt builders ═══ */
+
+export function buildExtractPrompt(userMessage, modelResponse, userGivenId, modelGivenId, graph) {
+  return `${buildRegister(graph)}
+
+EXCHANGE:
+User [${userGivenId}]: "${String(userMessage).slice(0, 4000)}"
+Model [${modelGivenId}]: "${String(modelResponse).slice(0, 4000)}"`;
+}
+
+export function buildMutatePrompt(trigger, graph) {
+  const { name, candidateHash, span, context } = trigger;
+  let prompt = `Ambiguous reference: "${name || "(unnamed)"}"`;
+  if (span) prompt += `\nSource span: "${span}"`;
+  if (context) prompt += `\nContext: "${context}"`;
+  const candidate = candidateHash ? graph.getEntity(candidateHash) : null;
+  if (candidate) {
+    prompt += `\n\nExisting entity that might match:`;
+    prompt += `\n  ${candidate.id}@${graph.stateHash(candidate.id)}`;
+    prompt += `\n  canonical: ${candidate.canonical}`;
+    prompt += `\n  terrain: ${candidate.terrain}`;
+    prompt += `\n  h: ${candidate.hypothesis || "?"}`;
+    for (const d of graph.getDefs(candidate.id).slice(0, 6)) {
+      prompt += `\n  [${d.id}] = ${d.field}: "${d.value}"`;
+    }
+    for (const c of graph.getConflicts(candidate.id)) {
+      prompt += `\n  ⚠ ${c.field}: "${c.existing}" vs "${c.incoming}"`;
     }
   }
-  for (const [k, d] of Object.entries(memory.defs || {})) {
-    if (d.entity === fromId) {
-      delete memory.defs[k];
-      memory.defs[`${intoId}::${d.field}`] = { ...d, entity: intoId };
-    }
-  }
-  delete memory.entities[fromId];
-  restate(dst);
+  prompt += `\n\nIs "${name || "this"}" the same entity as ${candidateHash || "an existing one"}, or different? Decide one action.`;
+  return prompt;
 }
 
-/* Apply parsed walk operations to a graph (mutates `memory`). `opts.source`
-   is the default Given-Log id to attribute new DEFs/edges to. Returns the
-   count of operations applied and any AMBIG ops the model emitted. */
-export function applyWalk(memory, ops, opts = {}) {
+/* ═══ Hypothesis prompt builders (strict nesting) ═══ */
+
+export function getHypothesisSystemPrompt(level) {
+  return {
+    entity: HYPOTHESIS_ENTITY, group: HYPOTHESIS_GROUP, section: HYPOTHESIS_SECTION,
+    document: HYPOTHESIS_DOCUMENT, session: HYPOTHESIS_SESSION, corpus: HYPOTHESIS_CORPUS,
+  }[level] || HYPOTHESIS_ENTITY;
+}
+
+function getChildInputs(level, id, graph) {
+  switch (level) {
+    case "entity": {
+      const e = graph.getEntity(id);
+      if (!e) return [];
+      const defs = graph.getDefs(id), edges = graph.getEdges(id);
+      const lines = [`${id}@${graph.stateHash(id)} | ${e.canonical} | ${e.terrain}`];
+      if (defs.length) lines.push(`Facts: ${defs.map(d => `${d.field}="${d.value}"`).join(", ")}`);
+      if (edges.length) lines.push(`Connections: ${edges.map(x => `→${x.to} (${x.type})`).join(", ")}`);
+      return lines;
+    }
+    case "group":
+      return graph.getEntitiesInRange(id.start, id.end)
+        .map(e => `${e.id}@${graph.stateHash(e.id)} ${e.canonical}: "${e.hypothesis || "?"}"`);
+    case "section":
+      return graph.getPassageGroupDEFs(id.start, id.end)
+        .map((g, i) => `group ${i + 1} (p${g.start + 1}-${g.end + 1}): "${g.hypothesis}"`);
+    case "document":
+      return graph.getSectionDEFs(id.documentId)
+        .map((s, i) => `section ${i + 1}: "${s.hypothesis}"`);
+    case "session":
+      return [
+        ...graph.getSessionDocumentDEFs().map(d => `doc "${d.title}": "${d.hypothesis}"`),
+        ...graph.getSessionTopics().map(t => `topic: "${t}"`),
+      ];
+    case "corpus":
+      return [
+        ...graph.getRecentDocumentDEFs(10).map(d => `"${d.title}": "${d.hypothesis}"`),
+        ...graph.getRecentSessionDEFs(5).map(s => `session: "${s.hypothesis}"`),
+      ];
+    default: return [];
+  }
+}
+
+export function buildHypothesisPrompt(level, id, graph) {
+  const children = getChildInputs(level, id, graph);
+  const history = graph.getHypothesisHistory(level, id);
+  let prompt = children.join("\n");
+  if (history.length) {
+    prompt += "\n\nPrior hypotheses (oldest first):";
+    history.forEach((h, i) => {
+      prompt += `\n  rev ${i + 1} (${h.after}, ${h.inputCount} inputs): "${h.text}"`;
+    });
+  }
+  return prompt;
+}
+
+/* ═══ Apply EXTRACT / INGEST events to the graph ═══ */
+
+export function parseEvents(out) {
+  if (Array.isArray(out)) return out.filter(e => e && typeof e === "object" && e.op);
+  if (typeof out !== "string") return [];
+  let raw = out.replace(/```json/gi, "").replace(/```/g, "").trim();
+  const a = raw.indexOf("["), b = raw.lastIndexOf("]");
+  if (a !== -1 && b !== -1) raw = raw.slice(a, b + 1);
+  try {
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed.filter(e => e && typeof e === "object" && e.op) : [];
+  } catch { return []; }
+}
+
+/* Apply parsed events. Conflicting DEFs are written without retiring the
+   prior value, so the dossier surfaces ⚠ and the next turn can flag it.
+   Returns { applied, ambigs, conflicts }. */
+export function applyEvents(graph, events, opts = {}) {
+  const source = opts.source || null;
   let applied = 0;
-  const ambigs = [];
-  const sites = memory.entities;
-  memory.defs = memory.defs || {};
-  const defaultSource = opts.source || null;
-
-  /* Resolve a reference to an entity id, creating it if new. */
-  const ensure = (ref, canonical, kind) => {
-    const found = findEntity(memory, ref) || (canonical ? findEntity(memory, canonical) : null);
-    let site = found;
-    if (!site) {
-      const name = (canonical || (/^e_[0-9a-f]{8}$/i.test(ref) ? "" : ref) || "").trim();
-      if (!name) return null;
-      const id = entityHash(name);
-      if (sites[id]) {
-        site = sites[id];
-      } else {
-        site = sites[id] = {
-          id, state: "", canonical: name, kind: kind || "thing",
-          hypothesis: "", aliases: [], mentions: 0,
-          created: Date.now(), source: defaultSource,
-        };
-      }
-    }
-    site.mentions = (site.mentions || 0) + 1;
-    if (kind && kind !== "thing" && (!site.kind || site.kind === "thing")) site.kind = kind;
-    restate(site);
-    return site.id;
-  };
-
-  for (const e of ops) {
+  const ambigs = [], conflicts = [];
+  for (const e of events) {
     if (e.op === "AMBIG") {
-      ambigs.push({
-        name: String(e.name || "").trim(),
-        candidate: String(e.candidate || "").trim(),
-        span: String(e.span || "").trim(),
-      });
-    } else if (e.op === "SIG") {
-      const id = ensure(e.id || e.name || e.canonical, e.name || e.canonical, e.kind);
-      if (id) {
-        const h = String(e.hypothesis || "").trim();
-        if (h && h.length > (sites[id].hypothesis || "").length) sites[id].hypothesis = h;
-        restate(sites[id]);
-        applied++;
+      ambigs.push({ name: String(e.name || "").trim(), candidateHash: String(e.candidate || "").trim(), span: String(e.span || "").trim() });
+    } else if (e.op === "INS") {
+      const ent = graph.ensureEntity(e.entity, { canonical: e.entity, terrain: e.terrain });
+      if (ent && opts.passageIndex != null && !ent.passages.includes(opts.passageIndex)) {
+        ent.passages.push(opts.passageIndex);
       }
+      if (ent) applied++;
     } else if (e.op === "DEF") {
-      const id = ensure(e.id || e.name || e.canonical, e.name || e.canonical);
-      if (id) {
-        if (e.hypothesis) {
-          sites[id].hypothesis = String(e.hypothesis).trim();
-          restate(sites[id]);
-        }
-        if (e.field && e.value) {
-          memory.defs[`${id}::${slug(e.field)}`] = {
-            entity: id, field: String(e.field).trim(), value: String(e.value).trim(),
-            source: e.source || defaultSource, created: Date.now(),
-          };
-        }
+      const ent = graph.ensureEntity(e.entity, { canonical: e.entity });
+      if (ent && e.field && e.value != null) {
+        const prior = graph.getDef(ent.id, e.field);
+        const isConflict = prior && prior.value !== String(e.value) && e.field !== "kind";
+        if (isConflict) conflicts.push({ entity: ent.id, field: e.field, existing: prior.value, incoming: String(e.value) });
+        graph.writeDef(ent.id, e.field, e.value, { source: e.source || source, span: e.span || null, supersede: !isConflict });
         applied++;
       }
     } else if (e.op === "CON") {
-      const from = ensure(e.from);
-      const to = ensure(e.to);
-      const relation = String(e.relation || e.type || "related to").trim();
-      if (from && to && from !== to) {
-        memory.edges[`${from}::${relation}::${to}`] = {
-          from, to, relation, type: relation,
-          evidence: e.evidence ? String(e.evidence).trim() : undefined,
-          source: e.source || defaultSource,
-        };
+      const from = graph.ensureEntity(e.from, { canonical: e.from });
+      const to = graph.ensureEntity(e.to, { canonical: e.to });
+      if (from && to && from.id !== to.id) {
+        graph.addEdge(from.id, to.id, e.type || "related to", { source: e.source || source });
         applied++;
       }
-    } else if (e.op === "REC") {
-      const site = findEntity(memory, e.id);
-      if (site) {
-        const oldCanon = site.canonical;
-        site.canonical = String(e.canonical).trim();
-        site.aliases = site.aliases || [];
-        const aliasName = e.alias || oldCanon;
-        if (aliasName && !site.aliases.includes(aliasName)) site.aliases.push(aliasName);
-        const dup = aliasName ? findEntity(memory, aliasName) : null;
-        if (dup && dup.id !== site.id) mergeSite(memory, dup.id, site.id);
-        restate(site);
+    } else if (e.op === "EVA") {
+      const ent = graph.ensureEntity(e.entity, { canonical: e.entity });
+      if (ent && e.claim) {
+        graph.writeEval(ent.id, e.claim, e.status || "holds", { source: e.source || source, span: e.span || null });
         applied++;
       }
     }
   }
-  return { applied, ambigs };
+  return { applied, ambigs, conflicts };
 }
 
-/* ── MUTATE: triggers, prompt, parse, apply ── */
+/* ═══ MUTATE: triggers, parse, apply ═══ */
 
-const REF_UNCERTAIN_RE = [
-  /\b(?:may|might|could|possibly|perhaps|not necessarily|unsure)\b[^.?!]*?\b(e_[0-9a-f]{8})\b/i,
-  /\b(e_[0-9a-f]{8})\b[^.?!]*?\b(?:may not|might not|could be different|not the same|not necessarily)\b/i,
+const REF_UNCERTAIN = [
+  /\bmay not be (?:the same|identical)(?: as)? (e_[0-9a-f]{8})/i,
+  /\bmight be (?:a )?different (?:from |than )?(e_[0-9a-f]{8})/i,
+  /\bnot (?:the same|identical) (?:as |to )(e_[0-9a-f]{8})/i,
+  /\b(e_[0-9a-f]{8})\b[^.?!]*?\b(?:may not|might not|not the same)\b/i,
 ];
-const CORRECTION_RE = /\b(?:that(?:'s| is) not the same|different (?:person|place|thing|one|entity)|you(?:'re| are) (?:confusing|mixing)|not who i meant|i meant (?:a )?different|wrong (?:person|entity|one)|mixed (?:them|it) up)\b/i;
+const CORRECTION_RE = /\b(?:that(?:'s| is) not the same|those are the same|different (?:person|place|thing|one|entity)|you(?:'re| are) (?:confusing|mixing)|not who i meant|i meant (?:a )?different|wrong (?:person|entity|one)|mixed (?:them|it) up)\b/i;
 
-/* Detect ambiguities mechanically — zero tokens. Returns a list of triggers,
-   each of which fires one MUTATE call. */
-export function detectMutationTriggers({ memory, userMessage = "", modelResponse = "", ambigs = [] }) {
+/* Detect ambiguities mechanically — zero tokens. */
+export function detectMutationTriggers(modelResponse, extractEvents, sig, graph) {
   const triggers = [];
-
-  // Path 1: the model's response references an entity hash with uncertainty.
-  for (const re of REF_UNCERTAIN_RE) {
+  for (const re of REF_UNCERTAIN) {
     const m = re.exec(modelResponse || "");
-    if (m && memory.entities[m[1]]) {
-      triggers.push({ kind: "ref-uncertainty", target: m[1], detail: m[0].trim() });
+    if (m && graph.getEntity(m[1])) {
+      triggers.push({ type: "model_flagged", candidateHash: m[1], span: m[0].trim() });
     }
   }
-
-  // Path 2: the ingest walk emitted an AMBIG op.
-  for (const a of ambigs || []) {
-    triggers.push({ kind: "ambig", target: a.candidate, name: a.name, detail: a.span || a.name });
+  for (const evt of extractEvents || []) {
+    if (evt.op === "AMBIG") {
+      triggers.push({ type: "ingest_ambig", name: evt.name, candidateHash: evt.candidate, span: evt.span });
+    }
   }
-
-  // Path 3: NER tagged a name with a kind that conflicts with the matched
-  // entity's stored kind.
-  const sig = signal(userMessage || "");
-  for (const name of sig.ner.names) {
+  for (const name of sig?.ner?.names || []) {
     const guessed = sig.ner.typed[name];
     if (!guessed) continue;
-    const ent = findEntity(memory, name);
-    if (ent && ent.kind && ent.kind !== "thing" && ent.kind !== guessed) {
-      triggers.push({
-        kind: "type-mismatch", target: ent.id, name,
-        detail: `"${name}" reads as ${guessed} but ${ent.id} is recorded as ${ent.kind}`,
-      });
+    const matches = graph.searchEntities(name);
+    if (matches.length === 1) {
+      const kindDef = graph.getDef(matches[0].id, "kind");
+      if (kindDef && kindDef.value !== guessed) {
+        triggers.push({
+          type: "type_mismatch", name, candidateHash: matches[0].id,
+          context: `reads as ${guessed} but recorded kind is ${kindDef.value}`,
+        });
+      }
     }
   }
-
-  // Path 4: the user signalled a correction.
-  if (CORRECTION_RE.test(userMessage || "")) {
-    triggers.push({ kind: "correction", target: null, detail: userMessage.slice(0, 200) });
-  }
-
   return triggers;
 }
 
-/* Full detail of an entity, for the MUTATE prompt. */
-function entityDetail(memory, id) {
-  const e = memory.entities[id];
-  if (!e) return null;
-  const lines = [`${e.canonical} [${e.id}@${e.state || stateOf(e)}] (${e.kind || "thing"})`];
-  if (e.aliases?.length) lines.push(`  aliases: ${e.aliases.join(", ")}`);
-  if (e.hypothesis) lines.push(`  hypothesis: ${e.hypothesis}`);
-  for (const d of Object.values(memory.defs || {})) {
-    if (d.entity === id && d.value) lines.push(`  ${d.field}: ${d.value}`);
-  }
-  for (const g of Object.values(memory.edges || {})) {
-    if (g.from === id) {
-      const to = memory.entities[g.to];
-      lines.push(`  ${g.relation || g.type} → ${to ? to.canonical : g.to}`);
-    }
-  }
-  return lines.join("\n");
+export function userCorrectionTrigger(userMessage, graph, lastEntities = []) {
+  if (!CORRECTION_RE.test(userMessage || "")) return null;
+  const candidateHash = lastEntities.find(id => graph.getEntity(id)) || null;
+  return { type: "user_correction", candidateHash, context: String(userMessage).slice(0, 200) };
 }
 
-/* Build the MUTATE user message for one trigger. */
-export function buildMutateUser(memory, trigger) {
-  const parts = [`FLAGGED: ${trigger.detail}`, `REASON: ${trigger.kind}`];
-  const seen = new Set();
-  const addSite = (id) => {
-    if (!id || seen.has(id)) return;
-    const d = entityDetail(memory, id);
-    if (d) { parts.push("", "SITE:", d); seen.add(id); }
-  };
-  addSite(trigger.target);
-  if (trigger.name) {
-    const other = findEntity(memory, trigger.name);
-    if (other) addSite(other.id);
-    else parts.push("", `The name "${trigger.name}" is not yet its own site.`);
+export function parseMutate(out) {
+  let obj = out;
+  if (typeof out === "string") {
+    let raw = out.replace(/```json/gi, "").replace(/```/g, "").trim();
+    const a = raw.indexOf("{"), b = raw.lastIndexOf("}");
+    if (a !== -1 && b !== -1) raw = raw.slice(a, b + 1);
+    try { obj = JSON.parse(raw); } catch { return null; }
   }
-  if (trigger.kind === "type-mismatch" && trigger.name) {
-    parts.push("", `The user's message reads "${trigger.name}" as a different kind.`);
-  }
-  return parts.join("\n");
-}
-
-/* Parse a MUTATE response into a single action. */
-export function parseMutate(text) {
-  if (!text) return null;
-  let raw = text.replace(/```json/gi, "").replace(/```/g, "").trim();
-  const start = raw.indexOf("{");
-  const end = raw.lastIndexOf("}");
-  if (start !== -1 && end !== -1) raw = raw.slice(start, end + 1);
-  let obj;
-  try { obj = JSON.parse(raw); } catch { return null; }
   if (!obj || typeof obj !== "object") return null;
   const action = String(obj.action || "").toUpperCase();
   if (!["FORK", "MERGE", "CORRECT", "RECLASSIFY", "NONE"].includes(action)) return null;
-  return {
-    action,
-    target: obj.target ? String(obj.target).split("@")[0] : null,
-    other: obj.other ? String(obj.other).split("@")[0] : null,
-    name: obj.name ? String(obj.name).trim() : null,
-    from: obj.from ? String(obj.from).split("@")[0] : null,
-    canonical: obj.canonical ? String(obj.canonical).trim() : null,
-    kind: obj.kind ? String(obj.kind).trim() : null,
-    reason: String(obj.reason || "").trim(),
-  };
+  return { ...obj, action, reason: String(obj.reason || "").trim() };
 }
 
-/* Build a mutation record from a parsed action. The auto-commit tier for
-   MUTATE is PROMPT — every real action lands as `pending` and needs consent.
-   NONE is logged but never surfaced. */
-export function makeMutation(parsed, { trigger, msgId = null } = {}) {
-  return {
-    id: "m_" + hash8([parsed.action, parsed.reason, Date.now(), Math.random()].join("")),
-    action: parsed.action,
-    target: parsed.target,
-    other: parsed.other,
-    name: parsed.name,
-    from: parsed.from,
-    canonical: parsed.canonical,
-    kind: parsed.kind,
-    reason: parsed.reason,
-    trigger: trigger ? trigger.kind : null,
-    triggerDetail: trigger ? trigger.detail : null,
-    msgId,
-    ts: Date.now(),
-    status: parsed.action === "NONE" ? "noop" : "pending",
-  };
-}
-
-/* Apply an accepted mutation to the graph (mutates `memory`). */
-export function applyMutation(memory, mut) {
-  if (!mut) return false;
-  if (mut.action === "MERGE" && mut.target && mut.other) {
-    if (memory.entities[mut.target] && memory.entities[mut.other]) {
-      mergeSite(memory, mut.other, mut.target);
-      return true;
+/* Apply a MUTATE action to the graph. Logs the mutation as an event. */
+export function applyMutation(action, graph, triggerId) {
+  const event = { timestamp: Date.now(), triggeredBy: triggerId || null, action: action.action, reason: action.reason };
+  switch (action.action) {
+    case "FORK": {
+      const src = graph.getEntity(action.source);
+      if (src && action.new_canonical) {
+        const ne = graph.ensureEntity(action.new_canonical, { canonical: action.new_canonical, terrain: src.terrain });
+        ne.forkedFrom = action.source;
+        for (const r of action.reassign || []) graph.reassignDef(r.def_id, action.source, ne.id);
+        event.op = "SEG"; event.sourceEntity = action.source; event.newEntity = ne.id;
+      }
+      break;
     }
-  } else if (mut.action === "RECLASSIFY" && mut.target && mut.kind) {
-    const e = memory.entities[mut.target];
-    if (e) { e.kind = mut.kind; restate(e); return true; }
-  } else if (mut.action === "CORRECT" && mut.target && mut.canonical) {
-    const e = memory.entities[mut.target];
-    if (e) {
-      if (e.canonical && !e.aliases.includes(e.canonical)) e.aliases.push(e.canonical);
-      e.canonical = mut.canonical;
-      restate(e);
-      return true;
+    case "MERGE":
+      if (graph.getEntity(action.keep) && graph.getEntity(action.absorb)) {
+        graph.mergeEntities(action.keep, action.absorb);
+        for (const a of action.new_aliases || []) graph.addAlias(action.keep, a);
+        event.op = "CON"; event.type = "same_as"; event.keep = action.keep; event.absorb = action.absorb;
+      }
+      break;
+    case "CORRECT": {
+      const ent = graph.getEntity(action.entity);
+      if (ent && action.field) {
+        // Retire every live DEF on the field, then write the corrected one.
+        for (const d of graph.getDefs(action.entity)) if (d.field === action.field) d.retired = true;
+        graph.writeDef(action.entity, action.field, action.new_value, { source: action.source });
+        event.op = "DEF"; event.entity = action.entity; event.field = action.field;
+        event.oldValue = action.old_value; event.newValue = action.new_value;
+      }
+      break;
     }
-  } else if (mut.action === "FORK" && mut.name) {
-    // Give the conflated name its own distinct site.
-    let id = entityHash(mut.name);
-    if (memory.entities[id]) id = entityHash(mut.name + "·" + mut.id);
-    memory.entities[id] = {
-      id, state: "", canonical: mut.name, kind: mut.kind || "thing",
-      hypothesis: "", aliases: [], mentions: 1,
-      created: Date.now(), source: null, forkedFrom: mut.from || null,
-    };
-    restate(memory.entities[id]);
-    return true;
+    case "RECLASSIFY":
+      if (graph.getEntity(action.entity)) {
+        graph.updateTerrain(action.entity, action.new_terrain);
+        event.op = "SEG"; event.entity = action.entity;
+        event.oldTerrain = action.old_terrain; event.newTerrain = action.new_terrain;
+      }
+      break;
+    case "NONE":
+      event.op = "NUL";
+      break;
   }
-  return false;
+  graph.appendEvent(event);
+  return event;
 }
+
+/* ═══ Auto-commit tiers ═══
+
+   AUTO commits silently. PROMPT surfaces an inline consent pill. REQUIRE
+   blocks until the user acts. Forks, merges, reclassifications and
+   conflicting facts always need consent. */
+export function commitTier(event, graph) {
+  switch (event.op || event.action) {
+    case "CON": return event.type === "same_as" ? "PROMPT" : "AUTO";
+    case "SEG": return "PROMPT";
+    case "FORK": case "MERGE": case "RECLASSIFY": return "PROMPT";
+    case "DEF": case "CORRECT": {
+      if (event.entity && event.field) {
+        const existing = graph.getDef(event.entity, event.field);
+        if (existing && event.newValue != null && existing.value !== event.newValue) return "PROMPT";
+      }
+      return "AUTO";
+    }
+    case "INS": return "AUTO";
+    case "EVA": return event.status === "contested" ? "PROMPT" : "AUTO";
+    case "REC": return "REQUIRE";
+    default: return "AUTO";
+  }
+}
+
+/* ═══ Consolidation gate ═══ */
+export function shouldConsolidate(state) {
+  const elapsed = Date.now() - (state.lastConsolidation || 0);
+  if (elapsed < 24 * 60 * 60 * 1000) return false;
+  if ((state.sessionsSinceConsolidation || 0) < INTERVALS.CORPUS_HYPOTHESIS) return false;
+  if (state.consolidationLock) return false;
+  return true;
+}
+
+/* Re-export Graph helpers so Chat.jsx has one import surface. */
+export { Graph } from "./graph.js";
+export { mergeGraphs } from "./graph.js";
