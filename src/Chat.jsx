@@ -30,6 +30,7 @@ const C = {
 const LS_KEY = "llmanager.chats.v2";
 const QUANT_KEY = "llmanager.quantize.v1";
 const MODE_KEY = "llmanager.chatmode.v1";
+const MEM_MODEL_KEY = "llmanager.memorymodel.v1";
 
 /* Context quantization: cap the history so Ollama re-processes a smaller
    prompt. Keeps the most recent messages and truncates very long ones. */
@@ -489,7 +490,7 @@ function IconBtn({ onClick, active, disabled, title, icon }) {
 }
 
 /* ── Composer ── */
-function Composer({ value, setValue, model, models, setModel, onSend, onStop, busy, isReply, quantize, setQuantize, mode }) {
+function Composer({ value, setValue, model, models, setModel, onSend, onStop, busy, isReply, quantize, setQuantize, mode, memModel, memModels, setMemModel }) {
   const ref = useRef(null);
   useEffect(() => {
     if (ref.current) {
@@ -513,15 +514,28 @@ function Composer({ value, setValue, model, models, setModel, onSend, onStop, bu
         <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "6px 6px 4px" }}>
           <ModelPicker value={model} models={models} onChange={setModel} />
           {mode === "memory" ? (
-            <span
-              title="Memory mode is on — each turn sends a fixed-size prompt (system + recalled facts + position marker) instead of the conversation history."
-              style={{
-                display: "flex", alignItems: "center", gap: 7, padding: "5px 9px",
-                background: C.accent + "18", border: `1px solid ${C.accent}44`, borderRadius: 7,
-                fontFamily: mono, fontSize: 11, color: C.accent,
-              }}>
-              <Icon name="memory" size={12} /> Memory
-            </span>
+            <>
+              <span
+                title="Memory mode is on — each turn sends a fixed-size prompt (system + recalled facts + position marker) instead of the conversation history. The model above answers you (READ); the background model below runs EXTRACT, INGEST and MUTATE."
+                style={{
+                  display: "flex", alignItems: "center", gap: 7, padding: "5px 9px",
+                  background: C.accent + "18", border: `1px solid ${C.accent}44`, borderRadius: 7,
+                  fontFamily: mono, fontSize: 11, color: C.accent,
+                }}>
+                <Icon name="memory" size={12} /> Memory
+              </span>
+              {memModels.length > 0 && (
+                <span title="Background model — runs EXTRACT, INGEST and MUTATE. Defaults to the chat model above."
+                  style={{ display: "flex", alignItems: "center", gap: 6, fontFamily: mono, fontSize: 10.5, color: C.dim }}>
+                  bg
+                  <ModelPicker
+                    value={memModel || "(chat model)"}
+                    models={["(chat model)", ...memModels]}
+                    onChange={v => setMemModel(v === "(chat model)" ? "" : v)}
+                  />
+                </span>
+              )}
+            </>
           ) : (
             <button
               onClick={() => setQuantize(q => !q)}
@@ -811,6 +825,7 @@ export default function Chat({ ollamaUrl, installed, ollamaUp, provider = "ollam
   const [copied, setCopied] = useState(null);
   const [quantize, setQuantize] = useState(() => localStorage.getItem(QUANT_KEY) === "1");
   const [mode, setMode] = useState(() => localStorage.getItem(MODE_KEY) === "memory" ? "memory" : "regular");
+  const [memModel, setMemModel] = useState(() => localStorage.getItem(MEM_MODEL_KEY) || "");
   const [wrongModelFor, setWrongModelFor] = useState(null);
   const [library, setLibrary] = useState(loadLibrary);
   const [libOpen, setLibOpen] = useState(false);
@@ -852,6 +867,15 @@ export default function Chat({ ollamaUrl, installed, ollamaUp, provider = "ollam
   useEffect(() => {
     try { localStorage.setItem(MODE_KEY, mode); } catch { /* ignore */ }
   }, [mode]);
+
+  useEffect(() => {
+    try { localStorage.setItem(MEM_MODEL_KEY, memModel); } catch { /* ignore */ }
+  }, [memModel]);
+
+  /* The background model for EXTRACT/INGEST/MUTATE — the configured memory
+     model when set and installed, otherwise a fallback chat model. */
+  const backgroundModel = (fallback) =>
+    (memModel && modelNames.includes(memModel)) ? memModel : fallback;
 
   /* Persist the document library (debounced, same policy as chats). */
   useEffect(() => {
@@ -1162,7 +1186,7 @@ export default function Chat({ ollamaUrl, installed, ollamaUp, provider = "ollam
   const runIngest = async (rawText, title, source) => {
     const text = (rawText || "").trim();
     if (!text || ingestRunning) return;
-    const model = composerModel === AUTO_MODEL ? modelNames[0] : composerModel;
+    const model = backgroundModel(composerModel === AUTO_MODEL ? modelNames[0] : composerModel);
     if (!model) return;
 
     // A document needs a Memory-mode chat to belong to — make or adopt one.
@@ -1418,7 +1442,7 @@ export default function Chat({ ollamaUrl, installed, ollamaUp, provider = "ollam
         dossierHash: memCtx.dossierHash, spans: memCtx.spans,
       });
       patchMsg(convoId, aId, { givenId: modelGiven.id });
-      runExtract(convoId, aId, userGiven, modelGiven, chosenModel, memCtx);
+      runExtract(convoId, aId, userGiven, modelGiven, backgroundModel(chosenModel), memCtx);
     }
   };
 
@@ -1649,6 +1673,7 @@ export default function Chat({ ollamaUrl, installed, ollamaUp, provider = "ollam
           isReply={messages.length > 0}
           quantize={quantize} setQuantize={setQuantize}
           mode={mode}
+          memModel={memModel} memModels={modelNames} setMemModel={setMemModel}
         />
       </main>
       <LibraryModal
