@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import Markdown from "./Markdown.jsx";
+import { webGPUAvailable, listBrowserModels, getBrowserEngine, unloadBrowserEngine, loadedBrowserModel } from "./webllm.js";
 
 const MODEL_CATALOG = [
   { id: "gemma2:2b", params: "2B", vram: 1.5, speed: "fast", use: "Light tasks, quick responses" },
@@ -28,7 +29,10 @@ const C = {
 };
 
 const CHAT_STORE_KEY = "llm-manager-chat-threads";
+const PROVIDER_STORE_KEY = "llm-manager-provider";
 const MAX_SAVED_THREADS = 30;
+
+const fmtVram = mb => (mb ? (mb >= 1024 ? `${(mb / 1024).toFixed(1)} GB` : `${Math.round(mb)} MB`) : "—");
 
 const makeThread = (model = "") => {
   const now = Date.now();
@@ -89,14 +93,19 @@ const ActBtn = ({ onClick, disabled, color, children }) => (
   }}>{children}</button>
 );
 
-const ThinkingBar = ({ label }) => (
-  <div style={{ marginBottom: 12 }}>
-    <div style={{ fontSize: 11, fontFamily: mono, color: C.accent, marginBottom: 5 }}>{label}</div>
-    <div style={{ position: "relative", height: 5, background: C.s3, borderRadius: 3, overflow: "hidden" }}>
-      <div style={{ position: "absolute", top: 0, height: "100%", width: "45%", borderRadius: 3, background: C.accent, animation: "llm-indeterminate 1.1s ease-in-out infinite" }} />
+const ThinkingBar = ({ label, progress }) => {
+  const determinate = typeof progress === "number";
+  return (
+    <div style={{ marginBottom: 12 }}>
+      <div style={{ fontSize: 11, fontFamily: mono, color: C.accent, marginBottom: 5 }}>{label}</div>
+      <div style={{ position: "relative", height: 5, background: C.s3, borderRadius: 3, overflow: "hidden" }}>
+        {determinate
+          ? <div style={{ height: "100%", width: `${Math.round(Math.max(0, Math.min(1, progress)) * 100)}%`, borderRadius: 3, background: C.accent, transition: "width .2s" }} />
+          : <div style={{ position: "absolute", top: 0, height: "100%", width: "45%", borderRadius: 3, background: C.accent, animation: "llm-indeterminate 1.1s ease-in-out infinite" }} />}
+      </div>
     </div>
-  </div>
-);
+  );
+};
 
 const Box = ({ title, sub, children }) => (
   <div style={{ background: C.s1, border: `1px solid ${C.border}`, borderRadius: 10, padding: "14px 18px", marginBottom: 10 }}>
@@ -129,7 +138,11 @@ const ChatBubble = ({ message, copy, copied }) => {
             <pre style={{ fontFamily: sans, fontSize: 13, lineHeight: 1.6, whiteSpace: "pre-wrap", wordBreak: "break-word", color: C.red, margin: 0 }}>{message.content}</pre>
           ) : isAssistant ? (
             <>
-              {message.streaming && <ThinkingBar label={message.content ? "Generating…" : "Thinking…"} />}
+              {message.streaming && (
+                message.loadText != null
+                  ? <ThinkingBar label={`Loading model — ${message.loadText}`} progress={message.loadProgress} />
+                  : <ThinkingBar label={message.content ? "Generating…" : "Thinking…"} />
+              )}
               <Markdown text={message.content} />
               {message.streaming && (
                 <span style={{ display: "inline-block", width: 8, height: 15, marginLeft: 1, background: C.accent, verticalAlign: "text-bottom", animation: "llm-cursor-blink 1s step-start infinite" }} />
@@ -154,6 +167,14 @@ const ChatBubble = ({ message, copy, copied }) => {
 
 export default function App() {
   const [tab, setTab] = useState("status");
+  const [provider, setProvider] = useState(() => {
+    try { return localStorage.getItem(PROVIDER_STORE_KEY) === "browser" ? "browser" : "ollama"; }
+    catch { return "ollama"; }
+  });
+  const [browserModels, setBrowserModels] = useState([]);
+  const [browserModel, setBrowserModel] = useState("");
+  // { modelId, status: "loading" | "ready" | "error", progress, text, error }
+  const [browserEngine, setBrowserEngine] = useState(null);
   const [ollamaUrl, setOllamaUrl] = useState("http://localhost:11434");
   const [ollamaUp, setOllamaUp] = useState(null);
   const [ollamaVer, setOllamaVer] = useState("");
@@ -183,11 +204,29 @@ export default function App() {
   }, [activeThreadId, sortedThreads]);
 
   useEffect(() => {
+    try { localStorage.setItem(PROVIDER_STORE_KEY, provider); } catch { /* ignore */ }
+  }, [provider]);
+
+  // ── Browser model list (lazy) ──
+  useEffect(() => {
+    if (provider !== "browser" || browserModels.length || !webGPUAvailable()) return;
+    let cancelled = false;
+    listBrowserModels()
+      .then(list => {
+        if (cancelled) return;
+        setBrowserModels(list);
+        setBrowserModel(prev => prev || list[0]?.id || "");
+      })
+      .catch(() => { /* WebGPU panel surfaces the failure */ });
+    return () => { cancelled = true; };
+  }, [provider, browserModels.length]);
+
+  useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
   }, [activeThread?.messages, generating]);
 
   const startNewChat = () => {
-    const thread = makeThread(model);
+    const thread = makeThread(provider === "browser" ? browserModel : model);
     setThreads(prev => [thread, ...prev].slice(0, MAX_SAVED_THREADS));
     setActiveThreadId(thread.id);
     setPrompt("");
@@ -196,6 +235,32 @@ export default function App() {
   const updateThread = (threadId, updater) => {
     setThreads(prev => prev.map(t => t.id === threadId ? updater(t) : t));
   };
+
+  const activeModel = provider === "browser" ? browserModel : model;
+
+  // Load a browser model into the WebGPU engine, mirroring progress into state.
+  const ensureBrowserEngine = useCallback(async (id, onProgress) => {
+    if (loadedBrowserModel() === id) return getBrowserEngine(id);
+    setBrowserEngine({ modelId: id, status: "loading", progress: 0, text: "starting…" });
+    try {
+      const engine = await getBrowserEngine(id, report => {
+        setBrowserEngine(s => (s && s.modelId === id)
+          ? { ...s, progress: report.progress ?? s.progress, text: report.text || s.text }
+          : s);
+        onProgress && onProgress(report);
+      });
+      setBrowserEngine({ modelId: id, status: "ready", progress: 1, text: "loaded" });
+      return engine;
+    } catch (e) {
+      setBrowserEngine({ modelId: id, status: "error", error: e.message });
+      throw e;
+    }
+  }, []);
+
+  const unloadBrowserModel = useCallback(async () => {
+    await unloadBrowserEngine();
+    setBrowserEngine(null);
+  }, []);
 
   // ── Hardware ──
   useEffect(() => {
@@ -244,14 +309,15 @@ export default function App() {
   // ── Generate (streaming) ──
   const generate = async () => {
     const userText = prompt.trim();
-    if (!userText || !model || generating) return;
+    if (!userText || !activeModel || generating) return;
 
     const now = Date.now();
-    const thread = activeThread || makeThread(model);
+    const thread = activeThread || makeThread(activeModel);
     const threadId = thread.id;
     const userMessage = { id: `user-${now}`, role: "user", content: userText, createdAt: now };
-    const assistantMessage = { id: `assistant-${now}`, role: "assistant", content: "", createdAt: now + 1, streaming: true, model };
+    const assistantMessage = { id: `assistant-${now}`, role: "assistant", content: "", createdAt: now + 1, streaming: true, model: activeModel };
     const priorMessages = thread.messages.filter(m => !m.error && !m.streaming).map(({ role, content }) => ({ role, content }));
+    const messages = [...priorMessages, { role: "user", content: userText }];
 
     setGenerating(true);
     setPrompt("");
@@ -261,63 +327,82 @@ export default function App() {
       const nextThread = {
         ...thread,
         title: thread.messages.length ? thread.title : shortTitle(userText),
-        model,
+        model: activeModel,
         updatedAt: now,
         messages: [...thread.messages, userMessage, assistantMessage],
       };
       return (exists ? prev.map(t => t.id === threadId ? nextThread : t) : [nextThread, ...prev]).slice(0, MAX_SAVED_THREADS);
     });
 
+    const patchAssistant = patch => updateThread(threadId, t => ({
+      ...t,
+      updatedAt: Date.now(),
+      messages: t.messages.map(m => m.id === assistantMessage.id ? { ...m, ...patch } : m),
+    }));
+
     const t0 = Date.now();
     try {
-      const r = await fetch(`${ollamaUrl}/api/chat`, {
-        method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ model, messages: [...priorMessages, { role: "user", content: userText }], stream: true }),
-      });
-      if (!r.ok || !r.body) throw new Error(`HTTP ${r.status}`);
-      const reader = r.body.getReader();
-      const decoder = new TextDecoder();
-      let buf = "", full = "", usage = {};
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buf += decoder.decode(value, { stream: true });
-        const lines = buf.split("\n");
-        buf = lines.pop();
-        for (const line of lines) {
-          if (!line.trim()) continue;
-          let j;
-          try { j = JSON.parse(line); } catch { continue; }
-          if (j.error) throw new Error(j.error);
-          if (j.message?.content) {
-            full += j.message.content;
-            updateThread(threadId, t => ({
-              ...t,
-              updatedAt: Date.now(),
-              messages: t.messages.map(m => m.id === assistantMessage.id ? { ...m, content: full, streaming: true } : m),
-            }));
+      let full = "", usage = {};
+      if (provider === "browser") {
+        const engine = await ensureBrowserEngine(browserModel, report => {
+          patchAssistant({ loadProgress: report.progress, loadText: report.text || "downloading…" });
+        });
+        patchAssistant({ loadProgress: undefined, loadText: undefined });
+        const chunks = await engine.chat.completions.create({
+          messages, stream: true, stream_options: { include_usage: true },
+        });
+        for await (const chunk of chunks) {
+          const delta = chunk.choices?.[0]?.delta?.content || "";
+          if (delta) {
+            full += delta;
+            patchAssistant({ content: full, streaming: true });
           }
-          if (j.done) {
+          if (chunk.usage) {
             usage = {
-              prompt_tokens: j.prompt_eval_count,
-              completion_tokens: j.eval_count,
-              total_tokens: (j.prompt_eval_count || 0) + (j.eval_count || 0),
+              prompt_tokens: chunk.usage.prompt_tokens,
+              completion_tokens: chunk.usage.completion_tokens,
+              total_tokens: chunk.usage.total_tokens,
             };
+          }
+        }
+      } else {
+        const r = await fetch(`${ollamaUrl}/api/chat`, {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ model, messages, stream: true }),
+        });
+        if (!r.ok || !r.body) throw new Error(`HTTP ${r.status}`);
+        const reader = r.body.getReader();
+        const decoder = new TextDecoder();
+        let buf = "";
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buf += decoder.decode(value, { stream: true });
+          const lines = buf.split("\n");
+          buf = lines.pop();
+          for (const line of lines) {
+            if (!line.trim()) continue;
+            let j;
+            try { j = JSON.parse(line); } catch { continue; }
+            if (j.error) throw new Error(j.error);
+            if (j.message?.content) {
+              full += j.message.content;
+              patchAssistant({ content: full, streaming: true });
+            }
+            if (j.done) {
+              usage = {
+                prompt_tokens: j.prompt_eval_count,
+                completion_tokens: j.eval_count,
+                total_tokens: (j.prompt_eval_count || 0) + (j.eval_count || 0),
+              };
+            }
           }
         }
       }
       const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
-      updateThread(threadId, t => ({
-        ...t,
-        updatedAt: Date.now(),
-        messages: t.messages.map(m => m.id === assistantMessage.id ? { ...m, content: full, streaming: false, elapsed, usage } : m),
-      }));
+      patchAssistant({ content: full, streaming: false, elapsed, usage, loadProgress: undefined, loadText: undefined });
     } catch (e) {
-      updateThread(threadId, t => ({
-        ...t,
-        updatedAt: Date.now(),
-        messages: t.messages.map(m => m.id === assistantMessage.id ? { ...m, content: `Error: ${e.message}`, streaming: false, error: true } : m),
-      }));
+      patchAssistant({ content: `Error: ${e.message}`, streaming: false, error: true, loadProgress: undefined, loadText: undefined });
     }
     setGenerating(false);
   };
@@ -463,8 +548,18 @@ OLLAMA_ORIGINS="http://localhost:3000,https://myapp.com" ollama serve`;
         <div>
           <div style={{ fontSize: 18, fontWeight: 700 }}><span style={{ color: C.accent }}>◆</span> LLM Manager</div>
           <div style={{ fontSize: 11, fontFamily: mono, color: C.dim, marginTop: 2 }}>
-            {ollamaUp === true ? "🟢" : ollamaUp === false ? "🔴" : "⏳"} Ollama {ollamaUp ? `v${ollamaVer}` : "offline"} · {installed.length} models
+            {provider === "browser"
+              ? `${webGPUAvailable() ? "🟢" : "🔴"} In-browser · WebGPU ${webGPUAvailable() ? "ready" : "unavailable"}${browserEngine?.status === "ready" ? ` · ${browserEngine.modelId}` : ""}`
+              : `${ollamaUp === true ? "🟢" : ollamaUp === false ? "🔴" : "⏳"} Ollama ${ollamaUp ? `v${ollamaVer}` : "offline"} · ${installed.length} models`}
           </div>
+        </div>
+        <div style={{ display: "flex", border: `1px solid ${C.border}`, borderRadius: 8, overflow: "hidden" }}>
+          {[["ollama", "Ollama server"], ["browser", "In-browser"]].map(([p, label]) => (
+            <button key={p} onClick={() => setProvider(p)} style={{
+              padding: "7px 14px", fontSize: 11, fontWeight: 600, border: "none", cursor: "pointer",
+              background: provider === p ? C.accent : "transparent", color: provider === p ? "#fff" : C.dim,
+            }}>{label}</button>
+          ))}
         </div>
         <div style={{ display: "flex", gap: 6 }}>
           {["status", "run", "models", "connect"].map(t => (
@@ -493,6 +588,36 @@ OLLAMA_ORIGINS="http://localhost:3000,https://myapp.com" ollama serve`;
             </div>
           </Box>
 
+          {provider === "browser" && (
+            <Box title="In-Browser Runtime" sub="Models download once, cache in this browser, and run fully on-device via WebGPU — no server.">
+              {!webGPUAvailable() ? (
+                <div style={{ background: C.red + "12", border: `1px solid ${C.red}30`, borderRadius: 8, padding: "12px 16px", fontSize: 12, color: C.red, lineHeight: 1.6 }}>
+                  WebGPU is not available in this browser. In-browser models need a recent Chrome, Edge, or other Chromium-based browser with WebGPU enabled.
+                </div>
+              ) : (<>
+                <div style={{ fontFamily: mono, fontSize: 12, lineHeight: 2, color: C.dim }}>
+                  <div><span style={{ color: C.text, display: "inline-block", width: 70 }}>WebGPU</span><span style={{ color: C.green }}>available</span></div>
+                  <div><span style={{ color: C.text, display: "inline-block", width: 70 }}>GPU</span>{hw?.gpu || "—"}</div>
+                  <div><span style={{ color: C.text, display: "inline-block", width: 70 }}>Models</span>{browserModels.length || "loading…"}</div>
+                </div>
+                <div style={{ marginTop: 12, fontSize: 11, color: C.dim, marginBottom: 4 }}>Loaded model:</div>
+                {browserEngine?.status === "ready" ? (
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, padding: "6px 0", fontSize: 12, fontFamily: mono }}>
+                    <span style={{ color: C.green, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{browserEngine.modelId}</span>
+                    <ActBtn onClick={unloadBrowserModel} color={C.red}>unload</ActBtn>
+                  </div>
+                ) : browserEngine?.status === "loading" ? (
+                  <ThinkingBar label={`Loading ${browserEngine.modelId} — ${browserEngine.text || "…"}`} progress={browserEngine.progress} />
+                ) : browserEngine?.status === "error" ? (
+                  <div style={{ fontSize: 12, color: C.red }}>Error: {browserEngine.error}</div>
+                ) : (
+                  <div style={{ fontSize: 12, color: C.dim }}>None loaded — pick one in the Models tab or just start a chat in Run.</div>
+                )}
+              </>)}
+            </Box>
+          )}
+
+          {provider === "ollama" && (
           <Box title="Ollama">
             <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 12 }}>
               <input value={ollamaUrl} onChange={e => setOllamaUrl(e.target.value)} style={{ flex: 1, padding: "8px 12px", fontSize: 12, fontFamily: mono, background: C.bg, color: C.text, border: `1px solid ${C.border}`, borderRadius: 6 }} />
@@ -537,6 +662,7 @@ OLLAMA_ORIGINS="http://localhost:3000,https://myapp.com" ollama serve`;
               })}
             </>)}
           </Box>
+          )}
         </>)}
 
         {/* ═══ RUN ═══ */}
@@ -574,17 +700,26 @@ OLLAMA_ORIGINS="http://localhost:3000,https://myapp.com" ollama serve`;
 
             <main style={{ display: "flex", flexDirection: "column", minHeight: 0, background: C.bg }}>
               <div style={{ padding: "12px 18px", borderBottom: `1px solid ${C.border}`, display: "flex", gap: 10, alignItems: "center" }}>
-                <select value={model} onChange={e => setModel(e.target.value)} style={{ flex: 1, maxWidth: 420, padding: "8px 12px", fontSize: 12, fontFamily: mono, background: C.s1, color: C.text, border: `1px solid ${C.border}`, borderRadius: 8 }}>
-                  {installed.length === 0 && <option value="">no models installed</option>}
-                  {installed.map(m => <option key={m.name} value={m.name}>{m.name} ({fmtB(m.size)})</option>)}
-                </select>
+                {provider === "browser" ? (
+                  <select value={browserModel} onChange={e => setBrowserModel(e.target.value)} style={{ flex: 1, maxWidth: 420, padding: "8px 12px", fontSize: 12, fontFamily: mono, background: C.s1, color: C.text, border: `1px solid ${C.border}`, borderRadius: 8 }}>
+                    {browserModels.length === 0 && <option value="">loading model list…</option>}
+                    {browserModels.map(m => <option key={m.id} value={m.id}>{m.id} (~{fmtVram(m.vramMB)})</option>)}
+                  </select>
+                ) : (
+                  <select value={model} onChange={e => setModel(e.target.value)} style={{ flex: 1, maxWidth: 420, padding: "8px 12px", fontSize: 12, fontFamily: mono, background: C.s1, color: C.text, border: `1px solid ${C.border}`, borderRadius: 8 }}>
+                    {installed.length === 0 && <option value="">no models installed</option>}
+                    {installed.map(m => <option key={m.name} value={m.name}>{m.name} ({fmtB(m.size)})</option>)}
+                  </select>
+                )}
                 <div style={{ fontSize: 11, color: C.dim, fontFamily: mono, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
                   {activeThread ? activeThread.title : "New chat"}
                 </div>
               </div>
 
-              {ollamaUp === false ? (
+              {provider === "ollama" && ollamaUp === false ? (
                 <div style={{ margin: 20, fontSize: 12, color: C.red }}>Ollama not running — check the Status tab for setup.</div>
+              ) : provider === "browser" && !webGPUAvailable() ? (
+                <div style={{ margin: 20, fontSize: 12, color: C.red }}>WebGPU not available — in-browser models cannot run here. Switch to the Ollama provider or use a WebGPU-capable browser.</div>
               ) : (
                 <>
                   <div style={{ flex: 1, overflowY: "auto", padding: "22px 24px", minHeight: 0 }}>
@@ -616,10 +751,10 @@ OLLAMA_ORIGINS="http://localhost:3000,https://myapp.com" ollama serve`;
                         />
                         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10 }}>
                           <span style={{ fontSize: 10, color: C.dim, fontFamily: mono }}>{activeThread?.messages.length || 0} messages in thread</span>
-                          <button onClick={generate} disabled={generating || !model || !prompt.trim()} style={{
+                          <button onClick={generate} disabled={generating || !activeModel || !prompt.trim()} style={{
                             padding: "8px 18px", fontSize: 12, fontWeight: 700, borderRadius: 9, border: "none",
                             cursor: generating ? "wait" : "pointer", background: generating ? C.s2 : C.accent,
-                            color: generating ? C.dim : "#fff", opacity: (!model || !prompt.trim()) ? 0.4 : 1,
+                            color: generating ? C.dim : "#fff", opacity: (!activeModel || !prompt.trim()) ? 0.4 : 1,
                           }}>{generating ? "Generating…" : "Send"}</button>
                         </div>
                       </div>
@@ -632,7 +767,49 @@ OLLAMA_ORIGINS="http://localhost:3000,https://myapp.com" ollama serve`;
         )}
 
         {/* ═══ MODELS ═══ */}
-        {tab === "models" && (<>
+        {tab === "models" && provider === "browser" && (<>
+          <Box title="Browser Model Catalog" sub="Each model downloads once and is cached by the browser, then runs on-device via WebGPU.">
+            {!webGPUAvailable() ? (
+              <div style={{ fontSize: 12, color: C.red }}>WebGPU not available — in-browser models cannot run in this browser.</div>
+            ) : browserModels.length === 0 ? (
+              <div style={{ fontSize: 12, color: C.dim }}>Loading model list…</div>
+            ) : browserModels.map(m => {
+              const loaded = browserEngine?.status === "ready" && browserEngine.modelId === m.id;
+              const loading = browserEngine?.status === "loading" && browserEngine.modelId === m.id;
+              return (
+                <div key={m.id} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, padding: "10px 0", borderBottom: `1px solid ${C.s3}` }}>
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+                      <span style={{ fontSize: 12, fontFamily: mono, fontWeight: 600, overflow: "hidden", textOverflow: "ellipsis" }}>{m.id}</span>
+                      {loaded && <Pill color={C.green}>LOADED</Pill>}
+                      {m.lowResource && <Pill color={C.accent}>low-resource</Pill>}
+                    </div>
+                    <div style={{ fontSize: 11, color: C.dim, marginTop: 2 }}>~{fmtVram(m.vramMB)} VRAM</div>
+                  </div>
+                  {loading ? (
+                    <div style={{ width: 170, flexShrink: 0 }}>
+                      <div style={{ fontSize: 9, fontFamily: mono, color: C.dim, marginBottom: 3, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{browserEngine.text || "loading…"}</div>
+                      <div style={{ height: 5, background: C.s3, borderRadius: 3, overflow: "hidden" }}>
+                        <div style={{ height: "100%", width: `${Math.round((browserEngine.progress || 0) * 100)}%`, background: C.accent, transition: "width .2s" }} />
+                      </div>
+                    </div>
+                  ) : (
+                    <div style={{ display: "flex", gap: 6, flexShrink: 0 }}>
+                      <ActBtn onClick={() => setBrowserModel(m.id)} color={browserModel === m.id ? C.accent : undefined}>
+                        {browserModel === m.id ? "selected" : "select"}
+                      </ActBtn>
+                      <ActBtn onClick={() => ensureBrowserEngine(m.id).catch(() => {})} disabled={!!browserEngine && browserEngine.status === "loading"} color={C.accent}>
+                        {loaded ? "reload" : "load"}
+                      </ActBtn>
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </Box>
+        </>)}
+
+        {tab === "models" && provider === "ollama" && (<>
           <Box title="Model Catalog" sub={ramGB ? `~${ramGB} GB detected → ~${(ramGB * .75).toFixed(0)} GB usable for models` : "RAM not exposed by browser — check terminal"}>
             {!ramGB && <div style={{ marginBottom: 12 }}><CopyBlock copy={copy} copied={copied} id="ram" text='sysctl -n hw.memsize | awk "{print $1/1073741824\" GB\"}"' label="Check actual RAM" /></div>}
             {MODEL_CATALOG.map(m => {

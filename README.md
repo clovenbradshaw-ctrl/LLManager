@@ -1,15 +1,27 @@
 # LLM Manager
 
-A browser dashboard for a local [Ollama](https://ollama.com) instance — check
-hardware, browse a model catalog, run prompts, and grab copy-paste API snippets.
+A browser dashboard for running local LLMs — check hardware, browse a model
+catalog, run prompts, and grab copy-paste API snippets.
+
+## Providers
+
+Pick a runtime with the **Ollama server / In-browser** toggle in the header:
+
+- **Ollama server** — talks to a local [Ollama](https://ollama.com) instance
+  (`http://localhost:11434`). Manage, pull, load, and chat with installed models.
+- **In-browser** — runs models fully on-device via [WebLLM](https://github.com/mlc-ai/web-llm)
+  and WebGPU. No server, no install: a model is downloaded once, cached by the
+  browser, and executed locally on your GPU. Requires a WebGPU-capable browser
+  (recent Chrome or Edge).
 
 ## Live site
 
 Hosted on GitHub Pages at `https://<owner>.github.io/llmanager/`.
 
-The app talks to Ollama on your own machine (`http://localhost:11434`); nothing
-is sent to a server. Chrome, Edge, and Firefox allow an HTTPS page to reach
-`http://localhost`. Safari blocks it — run the app locally there instead.
+Nothing is sent to a remote server. The Ollama provider talks to Ollama on your
+own machine; the in-browser provider runs entirely in the page. Chrome, Edge,
+and Firefox allow an HTTPS page to reach `http://localhost`. Safari blocks it —
+run the app locally there instead.
 
 ## Local development
 
