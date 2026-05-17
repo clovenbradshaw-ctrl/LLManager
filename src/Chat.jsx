@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef, useMemo } from "react";
 import Markdown from "./Markdown.jsx";
+import { getBrowserEngine } from "./webllm.js";
 import {
   AUTO_MODEL, INTENTS,
   classifyIntent, routeModel, hashPrompt, uuid,
@@ -755,7 +756,8 @@ function LibraryModal({ open, onClose, library, activeConvo, canIngest,
 }
 
 /* ── Main chat ── */
-export default function Chat({ ollamaUrl, installed, ollamaUp }) {
+export default function Chat({ ollamaUrl, installed, ollamaUp, provider = "ollama" }) {
+  const isBrowser = provider === "browser";
   const [convos, setConvos] = useState(loadConvos);
   const [activeId, setActiveId] = useState(null);
   const [query, setQuery] = useState("");
@@ -896,6 +898,31 @@ export default function Chat({ ollamaUrl, installed, ollamaUp }) {
   /* Stream a chat completion from Ollama; calls onToken(answer, reasoning)
      with the full text so far. Reasoning output is kept separate. */
   const streamChat = async (model, apiMessages, onToken, signal) => {
+    if (isBrowser) {
+      const engine = await getBrowserEngine(model, report => {
+        const pct = Math.round((report.progress || 0) * 100);
+        onToken("", `Loading ${model} — ${report.text || `${pct}%`}`);
+      });
+      const chunks = await engine.chat.completions.create({
+        messages: apiMessages, stream: true, stream_options: { include_usage: true },
+      });
+      let raw = "", usage = {};
+      for await (const chunk of chunks) {
+        if (signal?.aborted) {
+          try { engine.interruptGenerate(); } catch { /* ignore */ }
+          throw Object.assign(new Error("aborted"), { name: "AbortError" });
+        }
+        const delta = chunk.choices?.[0]?.delta?.content || "";
+        if (delta) {
+          raw += delta;
+          const { reasoning, answer } = splitReasoning(raw, "");
+          onToken(answer, reasoning);
+        }
+        if (chunk.usage) usage = { tokens: chunk.usage.completion_tokens };
+      }
+      const { reasoning, answer } = splitReasoning(raw, "");
+      return { content: answer, reasoning, usage };
+    }
     const r = await fetch(`${ollamaUrl}/api/chat`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -933,6 +960,13 @@ export default function Chat({ ollamaUrl, installed, ollamaUp }) {
 
   /* Non-streaming chat call — used for the background memory Extract step. */
   const chatOnce = async (model, apiMessages) => {
+    if (isBrowser) {
+      const engine = await getBrowserEngine(model);
+      const reply = await engine.chat.completions.create({
+        messages: apiMessages, temperature: 0,
+      });
+      return reply.choices?.[0]?.message?.content || "";
+    }
     const r = await fetch(`${ollamaUrl}/api/chat`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -992,7 +1026,9 @@ export default function Chat({ ollamaUrl, installed, ollamaUp }) {
     }
     patchMsg(convoId, msgId, {
       streaming: false, error: true,
-      content: `Could not reach Ollama: ${lastErr?.message}\n\nMake sure Ollama is running and that this page's origin is allowed — see Settings → Connection.`,
+      content: isBrowser
+        ? `In-browser model failed: ${lastErr?.message}\n\nThe model may be too large for this device's WebGPU memory — try a smaller model from Settings → Models.`
+        : `Could not reach Ollama: ${lastErr?.message}\n\nMake sure Ollama is running and that this page's origin is allowed — see Settings → Connection.`,
     });
     abortRef.current = null;
     return null;
