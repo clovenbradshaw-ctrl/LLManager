@@ -206,13 +206,6 @@ export function cosineSim(a, b) {
   return d === 0 ? 0 : dot / d;
 }
 
-function meanVec(vectors) {
-  const m = new Float32Array(DIMS);
-  for (const v of vectors) for (let i = 0; i < DIMS; i++) m[i] += v[i];
-  for (let i = 0; i < DIMS; i++) m[i] /= vectors.length;
-  return m;
-}
-
 /* ── Given-Log ── */
 
 export const given = {
@@ -440,14 +433,55 @@ export const mutations = {
 /* ── Embeddings ── */
 
 export const vectors = {
+  /* A walked clause — embed it, fold it into the entity's centroid as a
+     running mean, then discard the vector. SIG is ephemeral: once INS has
+     created the anchor and DEF has attached the claims with spans, the
+     clause embedding that found the entity is scaffolding the graph
+     structure has replaced. The centroid is the compressed memory of every
+     context the entity appeared in; it absorbs each clause in real time and
+     never needs the individual vectors back. */
   async addClause(id, entityId, text) {
+    const vec = await embed(text);
+    if (!entityId) return vec;
+    const existing = db.selectObject(
+      "SELECT vector, clause_count FROM vec_centroids WHERE scope=? AND entity_id=?", [scope, entityId]);
+    if (existing) {
+      const old = toVec(existing.vector), n = existing.clause_count;
+      const updated = new Float32Array(DIMS);
+      for (let i = 0; i < DIMS; i++) updated[i] = (old[i] * n + vec[i]) / (n + 1);
+      db.exec({
+        sql: "UPDATE vec_centroids SET vector=?, clause_count=?, updated_at=? WHERE scope=? AND entity_id=?",
+        bind: [toBlob(updated), n + 1, Date.now(), scope, entityId],
+      });
+    } else {
+      db.exec({
+        sql: "INSERT INTO vec_centroids (scope,entity_id,vector,clause_count,updated_at) VALUES (?,?,?,?,?)",
+        bind: [scope, entityId, toBlob(vec), 1, Date.now()],
+      });
+    }
+    return vec;
+  },
+  /* A Given-Log clause — chat history or an unwalked document. No graph
+     structure yet, so SIG is all there is: keep the vector until the
+     material is walked, then prune it. */
+  async addGivenVector(id, text) {
     const vec = await embed(text);
     db.exec({
       sql: "INSERT OR REPLACE INTO vec_clauses (scope,id,entity_id,vector,created_at) VALUES (?,?,?,?,?)",
-      bind: [scope, id, entityId, toBlob(vec), Date.now()],
+      bind: [scope, id, null, toBlob(vec), Date.now()],
     });
-    if (entityId) await vectors.recomputeCentroid(entityId);
     return vec;
+  },
+  /* After a document walk completes, tear down any clause vectors for the
+     entities it walked — the centroid has absorbed them. */
+  pruneWalkedVectors(documentId) {
+    const walked = db.selectObjects(`
+      SELECT DISTINCT d.entity_id FROM defs d
+      JOIN given g ON d.source = g.id AND g.scope = d.scope
+      WHERE d.scope=? AND g.document_id=?`, [scope, documentId]);
+    for (const { entity_id } of walked) {
+      db.exec({ sql: "DELETE FROM vec_clauses WHERE scope=? AND entity_id=?", bind: [scope, entity_id] });
+    }
   },
   async updateHypothesisVec(entityId, hypothesisText) {
     const vec = await embed(hypothesisText);
@@ -456,15 +490,6 @@ export const vectors = {
       bind: [scope, entityId, toBlob(vec), Date.now()],
     });
     return vec;
-  },
-  async recomputeCentroid(entityId) {
-    const rows = db.selectObjects("SELECT vector FROM vec_clauses WHERE scope=? AND entity_id=?", [scope, entityId]);
-    if (!rows.length) return;
-    const centroid = meanVec(rows.map(r => toVec(r.vector)));
-    db.exec({
-      sql: "INSERT OR REPLACE INTO vec_centroids (scope,entity_id,vector,clause_count,updated_at) VALUES (?,?,?,?,?)",
-      bind: [scope, entityId, toBlob(centroid), rows.length, Date.now()],
-    });
   },
   async findSimilarEntities(queryText, topK = 5) {
     const qv = await embed(queryText);
@@ -616,13 +641,7 @@ export async function rebuildVectors() {
     if (d.span && d.span.length > 10) await vectors.addClause(d.id, d.entity_id, d.span);
   }
   for (const g of given.getAll()) {
-    if (g.text && g.text.length > 20) {
-      const vec = await embed(g.text.slice(0, 500));
-      db.exec({
-        sql: "INSERT OR REPLACE INTO vec_clauses (scope,id,entity_id,vector,created_at) VALUES (?,?,?,?,?)",
-        bind: [scope, g.id, null, toBlob(vec), Date.now()],
-      });
-    }
+    if (g.text && g.text.length > 20) await vectors.addGivenVector(g.id, g.text.slice(0, 500));
   }
   for (const e of entities.getAll()) {
     if (e.hypothesis) await vectors.updateHypothesisVec(e.id, e.hypothesis);
