@@ -10,7 +10,7 @@
    document's graph is merged into that chat's memory projection so the model
    can draw on it. The same document can be opted into any number of chats. */
 
-const LIB_KEY = "llmanager.library.v1";
+const LIB_KEY = "llmanager.library.v3";
 
 export const loadLibrary = () => {
   try {
@@ -67,7 +67,7 @@ export const clearIngestJob = () => {
 
 /* Quick count of what a document's graph holds, for UI badges. */
 export const docStats = (doc) => ({
-  entities: doc?.memory ? Object.keys(doc.memory.entities || {}).length : 0,
-  edges: doc?.memory ? Object.keys(doc.memory.edges || {}).length : 0,
-  defs: doc?.memory ? Object.keys(doc.memory.defs || {}).length : 0,
+  entities: doc?.graph ? Object.keys(doc.graph.entities || {}).length : 0,
+  edges: doc?.graph ? Object.keys(doc.graph.edges || {}).length : 0,
+  defs: doc?.graph ? Object.values(doc.graph.defs || {}).filter(d => !d.retired).length : 0,
 });

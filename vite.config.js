@@ -7,4 +7,8 @@ export default defineConfig({
   base: "./",
   plugins: [react()],
   build: { outDir: "docs" },
+  // sqlite-wasm and transformers.js ship their own WASM/worker assets and
+  // do not pre-bundle cleanly — let Vite serve them as-is.
+  optimizeDeps: { exclude: ["@sqlite.org/sqlite-wasm", "@xenova/transformers"] },
+  worker: { format: "es" },
 });

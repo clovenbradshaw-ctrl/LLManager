@@ -9,13 +9,16 @@ import {
   processImplicitSignals, runREC, shouldRunREC,
 } from "./router.js";
 import {
-  MEMORY_SYSTEM, WALK_SYSTEM, WALK_FORMAT,
-  emptyMemory, cloneMemory, memoryStats, mergeMemory, splitSentences, batchSentences,
-  signal, reach, buildDossier, buildPosition, buildLibrary, buildRoster,
-  parseWalk, applyWalk,
+  READ_SYSTEM, INGEST_SYSTEM, EXTRACT_SYSTEM, MUTATE_SYSTEM,
+  INTERVALS, splitSentences, batchSentences,
+  signal, retrieve, firstPass, formatRetrieved, buildStatus, buildPosition, buildRegister,
+  collectSpans, dossierHashOf, logUserMessage, logModelResponse, logPassage,
+  buildExtractPrompt, buildMutatePrompt, buildHypothesisPrompt, getHypothesisSystemPrompt,
+  parseEvents, detectMutationTriggers, userCorrectionTrigger, parseMutate, applyMutation, commitTier,
 } from "./memory.js";
-import { loadLibrary, saveLibrary, docStats, loadIngestJob, saveIngestJob, clearIngestJob } from "./library.js";
-import { ROLES, loadRoleConfig, saveRoleConfig, resolveRoleModel } from "./roles.js";
+import * as store from "./local-store.js";
+import { EVENT_SCHEMA, MUTATE_SCHEMA } from "./model-router.js";
+import { loadLibrary, saveLibrary, docStats } from "./library.js";
 
 const mono = `'SF Mono','Menlo','Consolas',monospace`;
 const sans = `-apple-system,system-ui,sans-serif`;
@@ -25,9 +28,10 @@ const C = {
   green: "#30a46c", red: "#e5484d", orange: "#f76b15",
 };
 
-const LS_KEY = "llmanager.chats.v1";
+const LS_KEY = "llmanager.chats.v3";
 const QUANT_KEY = "llmanager.quantize.v1";
 const MODE_KEY = "llmanager.chatmode.v1";
+const MEM_MODEL_KEY = "llmanager.memorymodel.v1";
 
 /* Context quantization: cap the history so Ollama re-processes a smaller
    prompt. Keeps the most recent messages and truncates very long ones. */
@@ -133,6 +137,30 @@ function MemoryPill({ mem }) {
       }}>
       <Icon name="memory" size={10} /> {txt}
     </span>
+  );
+}
+
+/* ── Mutation pill — a pending MUTATE action awaiting user consent ── */
+const MUT_LABEL = { FORK: "Fork", MERGE: "Merge", CORRECT: "Correct", RECLASSIFY: "Reclassify" };
+function MutationPill({ mut, onAccept, onDismiss }) {
+  const btn = (bg, color) => ({
+    fontSize: 10.5, fontFamily: mono, padding: "3px 10px", borderRadius: 6,
+    border: `1px solid ${color}55`, cursor: "pointer", background: bg, color, fontWeight: 600,
+  });
+  return (
+    <div title={`MUTATE — flagged by ${mut.trigger || "trigger"}${mut.triggerDetail ? ": " + mut.triggerDetail : ""}`}
+      style={{
+        display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap", margin: "6px 0 12px",
+        padding: "8px 11px", borderRadius: 9, background: C.orange + "12",
+        border: `1px solid ${C.orange}44`, fontSize: 11.5, fontFamily: mono,
+      }}>
+      <span style={{ fontWeight: 700, color: C.orange, textTransform: "uppercase", letterSpacing: 0.5 }}>
+        {MUT_LABEL[mut.action] || mut.action}
+      </span>
+      <span style={{ flex: 1, minWidth: 140, color: C.text, lineHeight: 1.5 }}>{mut.reason || "Graph change proposed."}</span>
+      <button onClick={onAccept} style={btn(C.green + "22", C.green)}>Accept</button>
+      <button onClick={onDismiss} style={btn("transparent", C.dim)}>Dismiss</button>
+    </div>
   );
 }
 
@@ -338,8 +366,10 @@ function Reasoning({ text, streaming }) {
   );
 }
 
-/* ── Prompt audit panel — the exact messages this reply was given ── */
-function PromptView({ prompt }) {
+/* ── Prompt audit panel — the exact messages this reply was given, plus the
+   underlying evidence spans the projected dossier was built from. The model
+   sees the distilled hypotheses; the spans expose where they came from. ── */
+function PromptView({ prompt, spans, dossierHash }) {
   const [open, setOpen] = useState(false);
   if (!prompt || !prompt.length) return null;
   const chars = prompt.reduce((n, m) => n + (m.content || "").length, 0);
@@ -352,7 +382,7 @@ function PromptView({ prompt }) {
       }}>
         <Icon name="eye" size={11} />
         {open ? "Hide prompt" : "View prompt sent"}
-        <span style={{ color: C.dim }}>· {prompt.length} msg · {chars} chars</span>
+        <span style={{ color: C.dim }}>· {prompt.length} msg · {chars} chars{spans?.length ? ` · ${spans.length} spans` : ""}</span>
       </button>
       {open && (
         <div style={{
@@ -360,13 +390,28 @@ function PromptView({ prompt }) {
           borderRadius: 8,
         }}>
           {prompt.map((m, i) => (
-            <div key={i} style={{ marginBottom: i < prompt.length - 1 ? 10 : 0 }}>
+            <div key={i} style={{ marginBottom: 10 }}>
               <div style={{ fontFamily: mono, fontSize: 9.5, fontWeight: 700, letterSpacing: 0.5,
                 textTransform: "uppercase", color: C.accent, marginBottom: 3 }}>{m.role}</div>
               <div style={{ fontFamily: mono, fontSize: 11.5, lineHeight: 1.6, color: C.dim,
                 whiteSpace: "pre-wrap", wordBreak: "break-word" }}>{m.content}</div>
             </div>
           ))}
+          {spans && spans.length > 0 && (
+            <div style={{ borderTop: `1px solid ${C.border}`, paddingTop: 8 }}>
+              <div style={{ fontFamily: mono, fontSize: 9.5, fontWeight: 700, letterSpacing: 0.5,
+                textTransform: "uppercase", color: C.accent, marginBottom: 5 }}>
+                Source spans{dossierHash ? ` · ${dossierHash}` : ""}
+              </div>
+              {spans.map((s, i) => (
+                <div key={i} style={{ fontFamily: mono, fontSize: 11, lineHeight: 1.55, color: C.dim,
+                  marginBottom: 4, whiteSpace: "pre-wrap", wordBreak: "break-word" }}>
+                  <span style={{ color: C.accent }}>{s.source || "—"}</span>
+                  {" "}<span style={{ color: C.dim, opacity: 0.7 }}>[{s.entity}]</span> {s.text}
+                </div>
+              ))}
+            </div>
+          )}
         </div>
       )}
     </div>
@@ -451,7 +496,7 @@ function MessageBubble({ msg, prevModel, onCopy, copied, onRerun, onFork, busy, 
         </div>
       )}
       {!msg.streaming && msg.prompt && (
-        <div style={{ paddingLeft: 13 }}><PromptView prompt={msg.prompt} /></div>
+        <div style={{ paddingLeft: 13 }}><PromptView prompt={msg.prompt} spans={msg.spans} dossierHash={msg.dossierHash} /></div>
       )}
     </div>
   );
@@ -470,7 +515,7 @@ function IconBtn({ onClick, active, disabled, title, icon }) {
 }
 
 /* ── Composer ── */
-function Composer({ value, setValue, model, groups, setModel, onSend, onStop, busy, isReply, quantize, setQuantize, mode }) {
+function Composer({ value, setValue, model, groups, setModel, onSend, onStop, busy, isReply, quantize, setQuantize, mode, memModel, memModels, setMemModel }) {
   const ref = useRef(null);
   useEffect(() => {
     if (ref.current) {
@@ -494,15 +539,33 @@ function Composer({ value, setValue, model, groups, setModel, onSend, onStop, bu
         <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "6px 6px 4px" }}>
           <ModelPicker value={model} groups={groups} onChange={setModel} />
           {mode === "memory" ? (
-            <span
-              title="Memory mode is on — each turn sends a fixed-size prompt (system + recalled facts + position marker) instead of the conversation history."
-              style={{
-                display: "flex", alignItems: "center", gap: 7, padding: "5px 9px",
-                background: C.accent + "18", border: `1px solid ${C.accent}44`, borderRadius: 7,
-                fontFamily: mono, fontSize: 11, color: C.accent,
-              }}>
-              <Icon name="memory" size={12} /> Memory
-            </span>
+            <>
+              <span
+                title="Memory mode is on — each turn sends a fixed-size prompt (system + recalled facts + position marker) instead of the conversation history. The model above answers you (READ); the background model below runs EXTRACT, INGEST and MUTATE."
+                style={{
+                  display: "flex", alignItems: "center", gap: 7, padding: "5px 9px",
+                  background: C.accent + "18", border: `1px solid ${C.accent}44`, borderRadius: 7,
+                  fontFamily: mono, fontSize: 11, color: C.accent,
+                }}>
+                <Icon name="memory" size={12} /> Memory
+              </span>
+              {memModels.length > 0 && (
+                <span title="Background model — runs EXTRACT, INGEST and MUTATE. Defaults to the chat model above."
+                  style={{ display: "flex", alignItems: "center", gap: 6, fontFamily: mono, fontSize: 10.5, color: C.dim }}>
+                  bg
+                  <select
+                    value={memModel}
+                    onChange={e => setMemModel(e.target.value)}
+                    style={{
+                      background: C.s2, color: C.text, border: `1px solid ${C.border}`,
+                      borderRadius: 7, fontFamily: mono, fontSize: 11, padding: "5px 7px", outline: "none",
+                    }}>
+                    <option value="">(chat model)</option>
+                    {memModels.map(m => <option key={m} value={m}>{m}</option>)}
+                  </select>
+                </span>
+              )}
+            </>
           ) : (
             <button
               onClick={() => setQuantize(q => !q)}
@@ -566,17 +629,20 @@ function ChunkTrace({ chunk }) {
   const [open, setOpen] = useState(false);
   const stColor = chunk.status === "done" ? C.green
     : chunk.status === "error" ? C.red
-    : chunk.status === "reading" ? C.orange : C.dim;
-  const ner = chunk.signal?.ner || { names: [], dates: [], numbers: [] };
+    : (chunk.status === "reading" || chunk.status === "scanning") ? C.orange : C.dim;
+  const ner = chunk.signal?.ner || chunk.signal || { names: [], dates: [], numbers: [] };
   const kws = chunk.signal?.keywords || [];
   const label = chunk.status === "done" ? `+${chunk.applied} ops`
     : chunk.status === "reading" ? "reading…"
-    : chunk.status === "error" ? "error" : "queued";
+    : chunk.status === "scanning" ? "scanning…"
+    : chunk.status === "error" ? "error"
+    : chunk.status === "stopped" ? "stopped" : "queued";
   const opLine = (e) => {
-    if (e.op === "SIG") return `+ site ${e.canonical || e.id} (${e.kind || "thing"})`;
-    if (e.op === "DEF") return `~ revise ${e.id || e.canonical}`;
-    if (e.op === "CON") return `→ ${e.from} —${e.relation || e.type || "related to"}→ ${e.to}`;
-    if (e.op === "REC") return `⟳ rename ${e.id} → "${e.canonical}"`;
+    if (e.op === "INS") return `+ entity ${e.entity} (${e.terrain || "Entity"})`;
+    if (e.op === "DEF") return `= ${e.entity} · ${e.field}: "${e.value}"`;
+    if (e.op === "CON") return `→ ${e.from} —${e.type || "related to"}→ ${e.to}`;
+    if (e.op === "EVA") return `⊙ ${e.entity} · ${e.claim} [${e.status || "holds"}]`;
+    if (e.op === "AMBIG") return `? ambiguous "${e.name}" ≈ ${e.candidate || "?"}`;
     return JSON.stringify(e);
   };
   return (
@@ -625,8 +691,7 @@ function ChunkTrace({ chunk }) {
 
 /* ── Library & reading modal ── */
 function LibraryModal({ open, onClose, library, activeConvo, canIngest,
-                        ingestRunning, ingestTrace, onIngest, onToggleDoc, onRemoveDoc,
-                        modelNames = [], roleConfig = {}, onSetRoleModel }) {
+                        ingestRunning, ingestTrace, onIngest, onStopIngest, onToggleDoc, onRemoveDoc }) {
   const [text, setText] = useState("");
   const [title, setTitle] = useState("");
   const [source, setSource] = useState("");
@@ -651,7 +716,7 @@ function LibraryModal({ open, onClose, library, activeConvo, canIngest,
     onIngest(text, title.trim(), source);
   };
 
-  const done = ingestTrace.filter(t => t.status !== "pending" && t.status !== "reading").length;
+  const done = ingestTrace.filter(t => ["done", "error", "stopped"].includes(t.status)).length;
   const learned = ingestTrace.reduce((n, t) => n + (t.applied || 0), 0);
   const attached = new Set(activeConvo?.docs || []);
   const btn = (active) => ({
@@ -675,9 +740,7 @@ function LibraryModal({ open, onClose, library, activeConvo, canIngest,
           <Icon name="book" size={15} />
           <div style={{ fontSize: 13.5, fontWeight: 700, flex: 1 }}>Library &amp; Reading</div>
           {ingestRunning && (
-            <span style={{ fontSize: 10.5, fontFamily: mono, color: C.accent }}>
-              reading in background — safe to close
-            </span>
+            <span style={{ fontSize: 11, fontFamily: mono, color: C.accent }}>reading in background — safe to close</span>
           )}
           <button onClick={onClose} style={{ background: "transparent",
             border: "none", color: C.dim, cursor: "pointer", display: "flex" }}>
@@ -715,10 +778,16 @@ function LibraryModal({ open, onClose, library, activeConvo, canIngest,
               {text.length} chars{source ? ` · ${source}` : ""}
             </span>
             <div style={{ flex: 1 }} />
-            <button onClick={ingest} disabled={ingestRunning || !text.trim() || !canIngest}
-              style={{ ...btn(true), opacity: (ingestRunning || !text.trim() || !canIngest) ? 0.5 : 1 }}>
-              {ingestRunning ? "Reading…" : "Read into memory"}
-            </button>
+            {ingestRunning ? (
+              <button onClick={onStopIngest} style={{ ...btn(false) }}>
+                Stop reading
+              </button>
+            ) : (
+              <button onClick={ingest} disabled={!text.trim() || !canIngest}
+                style={{ ...btn(true), opacity: (!text.trim() || !canIngest) ? 0.5 : 1 }}>
+                Read into memory
+              </button>
+            )}
           </div>
           {!canIngest && (
             <div style={{ fontSize: 10.5, color: C.orange, marginTop: 6 }}>
@@ -817,6 +886,71 @@ function LibraryModal({ open, onClose, library, activeConvo, canIngest,
   );
 }
 
+/* ── Given-Log row — one recorded message, long imports collapsed ── */
+function LogRow({ entry }) {
+  const [open, setOpen] = useState(false);
+  const text = entry.text || "";
+  const long = text.length > 240;
+  const body = (open || !long) ? text : text.slice(0, 240) + "…";
+  const agentColor = entry.agent === "user" ? C.accent
+    : (entry.agent || "").startsWith("model:") ? C.green : C.orange;
+  const agentLabel = entry.agent === "user" ? "you"
+    : (entry.agent || "").startsWith("model:") ? entry.agent.slice(6)
+    : entry.agent === "system:walker" ? "document" : (entry.agent || "?");
+  return (
+    <div style={{ borderBottom: `1px solid ${C.border}`, padding: "8px 2px" }}>
+      <div style={{ display: "flex", gap: 8, alignItems: "center", fontFamily: mono, fontSize: 10, marginBottom: 3 }}>
+        <span style={{ color: agentColor, fontWeight: 700 }}>{agentLabel}</span>
+        <span style={{ color: C.dim }}>{entry.mode}{entry.passage_idx != null ? ` · p${entry.passage_idx + 1}` : ""}</span>
+        <span style={{ flex: 1 }} />
+        <span style={{ color: C.dim }}>{entry.id}</span>
+      </div>
+      <div style={{ fontSize: 12, color: C.text, lineHeight: 1.5, whiteSpace: "pre-wrap", wordBreak: "break-word" }}>{body}</div>
+      {long && (
+        <button onClick={() => setOpen(o => !o)} style={{
+          marginTop: 3, background: "transparent", border: "none", color: C.accent,
+          fontFamily: mono, fontSize: 10, cursor: "pointer", padding: 0 }}>
+          {open ? "show less" : `show more (${text.length} chars)`}
+        </button>
+      )}
+    </div>
+  );
+}
+
+/* ── Given-Log modal — the append-only record of every message in a chat ── */
+function GivenLogModal({ open, onClose, entries }) {
+  if (!open) return null;
+  return (
+    <div onClick={onClose} style={{
+      position: "fixed", inset: 0, background: "rgba(0,0,0,.62)", zIndex: 50,
+      display: "flex", alignItems: "center", justifyContent: "center", padding: 24,
+    }}>
+      <div onClick={e => e.stopPropagation()} style={{
+        width: "min(680px, 100%)", maxHeight: "86vh", display: "flex", flexDirection: "column",
+        background: C.s1, border: `1px solid ${C.border}`, borderRadius: 14,
+        boxShadow: "0 20px 56px rgba(0,0,0,.55)",
+      }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "14px 18px",
+          borderBottom: `1px solid ${C.border}` }}>
+          <Icon name="memory" size={15} />
+          <div style={{ fontSize: 13.5, fontWeight: 700, flex: 1 }}>Given-Log · {entries.length} entries</div>
+          <button onClick={onClose} style={{ background: "transparent", border: "none",
+            color: C.dim, cursor: "pointer", display: "flex" }}>
+            <Icon name="x" size={16} />
+          </button>
+        </div>
+        <div style={{ flex: 1, overflowY: "auto", padding: "6px 18px 14px" }}>
+          {entries.length === 0
+            ? <div style={{ padding: "24px 0", fontSize: 12, color: C.dim, textAlign: "center" }}>
+                No log entries yet — chat or read a document in Memory mode.
+              </div>
+            : entries.map(e => <LogRow key={e.id} entry={e} />)}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 /* ── Main chat ── */
 export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [], ollamaUp }) {
   // Auto-routing and routing feedback operate on the Ollama roster only.
@@ -830,14 +964,28 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
   const [copied, setCopied] = useState(null);
   const [quantize, setQuantize] = useState(() => localStorage.getItem(QUANT_KEY) === "1");
   const [mode, setMode] = useState(() => localStorage.getItem(MODE_KEY) === "memory" ? "memory" : "regular");
+  const [memModel, setMemModel] = useState(() => localStorage.getItem(MEM_MODEL_KEY) || "");
   const [wrongModelFor, setWrongModelFor] = useState(null);
   const [library, setLibrary] = useState(loadLibrary);
   const [libOpen, setLibOpen] = useState(false);
+  const [logOpen, setLogOpen] = useState(false);
   const [ingestRunning, setIngestRunning] = useState(false);
   const [ingestTrace, setIngestTrace] = useState([]);
-  const [roleConfig, setRoleConfig] = useState(loadRoleConfig);
+  /* The graph lives in SQLite (local-store.js), scoped per chat. dbReady
+     gates memory operations; dbVersion bumps to re-render after a write. */
+  const [dbReady, setDbReady] = useState(false);
+  const [, setDbVersion] = useState(0);
+  const bumpDb = () => setDbVersion(v => v + 1);
   const abortRef = useRef(null);
+  const ingestAbortRef = useRef(false);
   const scrollRef = useRef(null);
+
+  /* Open the SQLite store once, on mount. */
+  useEffect(() => {
+    let live = true;
+    store.init().then(() => { if (live) setDbReady(true); }).catch(() => {});
+    return () => { live = false; };
+  }, []);
 
   const allModels = useMemo(() => [...ollamaModels, ...browserModels], [ollamaModels, browserModels]);
   const modelNames = useMemo(() => allModels.map(m => m.name), [allModels]);
@@ -888,6 +1036,15 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
     try { localStorage.setItem(MODE_KEY, mode); } catch { /* ignore */ }
   }, [mode]);
 
+  useEffect(() => {
+    try { localStorage.setItem(MEM_MODEL_KEY, memModel); } catch { /* ignore */ }
+  }, [memModel]);
+
+  /* The background model for EXTRACT/INGEST/MUTATE — the configured memory
+     model when set and installed, otherwise a fallback chat model. */
+  const backgroundModel = (fallback) =>
+    (memModel && modelNames.includes(memModel)) ? memModel : fallback;
+
   /* Persist the document library (debounced, same policy as chats). */
   useEffect(() => {
     const id = setTimeout(() => saveLibrary(library), 400);
@@ -899,34 +1056,30 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
     .map(id => library.find(d => d.id === id))
     .filter(Boolean);
 
-  /* Project a chat's own memory together with every opted-in library
-     document into a single graph (entities/edges/defs only). */
-  const combinedMemory = (convo) =>
-    mergeMemory(convo?.memory, ...attachedDocs(convo).map(d => d.memory));
-
-  /* The memory-mode system prompt: instructions + recalled context +
-     library overview + position marker. Empty sections are dropped so the
-     prompt stays as small as the chat allows. */
-  const memorySystemPrompt = (convo, sig) => {
-    const projected = combinedMemory(convo);
-    const entities = reach(sig, projected);
-    const parts = [
-      MEMORY_SYSTEM,
-      buildDossier(entities, projected),
-      buildLibrary(attachedDocs(convo)),
-      buildPosition((convo?.memory || emptyMemory()).lastTurn),
-    ].filter(Boolean);
-    return { content: parts.join("\n\n"), used: entities.length, entities };
+  /* The READ system prompt: v3 instructions + projected [CTX] + [POS].
+     The graph lives in SQLite under the chat's scope, including any
+     documents ingested into it — the embedding-backed Reach queries it
+     directly. Async because the Reach embeds the message first. */
+  const memorySystemPrompt = async (convo, sig, text) => {
+    store.setScope(convo.id);
+    const results = await retrieve(text);
+    store.setScope(convo.id);
+    const dossier = formatRetrieved(results);
+    const parts = [READ_SYSTEM, buildStatus(), dossier, buildPosition(convo?.lastTurn)].filter(Boolean);
+    return {
+      content: parts.join("\n\n"),
+      used: results.length,
+      results,
+      dossierHash: dossierHashOf(dossier),
+      spans: collectSpans(results),
+    };
   };
 
-  /* Switch the active chat's mode (or just the default for the next new chat).
-     Memory data is kept even when switching back to Regular. */
+  /* Switch the active chat's mode (or just the default for the next new chat). */
   const changeMode = (m) => {
     setMode(m);
     if (activeId) {
-      setConvos(prev => prev.map(c => c.id === activeId
-        ? { ...c, mode: m, memory: m === "memory" ? (c.memory || emptyMemory()) : c.memory }
-        : c));
+      setConvos(prev => prev.map(c => c.id === activeId ? { ...c, mode: m } : c));
     }
   };
 
@@ -942,6 +1095,7 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
 
   const deleteConvo = (id) => {
     setConvos(prev => prev.filter(c => c.id !== id));
+    if (dbReady) { try { store.dropScope(id); } catch { /* ignore */ } }
     if (id === activeId) setActiveId(null);
   };
 
@@ -955,11 +1109,13 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
     const baseTitle = active.title.replace(/ \(fork\)$/, "");
     const trimmed = baseTitle.length > 40 ? baseTitle.slice(0, 40) + "…" : baseTitle;
     const newId = "c" + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+    if (dbReady) { try { store.copyScope(active.id, newId); } catch { /* ignore */ } }
     setConvos(prev => [{
       id: newId, title: trimmed + " (fork)",
       model: active.model, updatedAt: Date.now(), messages,
       mode: active.mode || "regular",
-      memory: active.memory ? cloneMemory(active.memory) : undefined,
+      lastTurn: active.lastTurn ? { ...active.lastTurn } : undefined,
+      docs: [...(active.docs || [])],
     }, ...prev]);
     setActiveId(newId);
     setMode(active.mode || "regular");
@@ -1037,12 +1193,12 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
     return { content: answer, reasoning, usage };
   };
 
-  /* Non-streaming chat call — used for the background memory walk steps.
-     `opts.format` passes a JSON schema to Ollama for constrained decoding, so
-     the walk output is structurally guaranteed. WebLLM has no equivalent here,
-     so for browser models the schema is skipped and parseWalk recovers the
-     array from free-form output. */
-  const chatOnce = async (model, apiMessages, opts = {}) => {
+  /* Non-streaming chat call — used for the background memory calls. When a
+     `format` JSON schema is given, Ollama constrains generation to it via
+     constrained decoding, so the EXTRACT/INGEST/MUTATE output is guaranteed
+     well-formed JSON. (The in-browser runtime is left unconstrained — the
+     walk parser still tolerates fenced or noisy output.) */
+  const chatOnce = async (model, apiMessages, format) => {
     if (isBrowserModel(model)) {
       const engine = await getBrowserEngine(model);
       const reply = await engine.chat.completions.create({
@@ -1050,13 +1206,23 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
       });
       return reply.choices?.[0]?.message?.content || "";
     }
-    const body = { model, messages: apiMessages, stream: false, options: { temperature: 0 } };
-    if (opts.format) body.format = opts.format;
-    const r = await fetch(`${ollamaUrl}/api/chat`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    });
+    // A background call must never hang the walk: abort after 2 minutes.
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 120000);
+    let r;
+    try {
+      r = await fetch(`${ollamaUrl}/api/chat`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model, messages: apiMessages, stream: false, options: { temperature: 0 },
+          ...(format ? { format } : {}),
+        }),
+        signal: ctrl.signal,
+      });
+    } finally {
+      clearTimeout(timer);
+    }
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
     const j = await r.json();
     return j.message?.content || "";
@@ -1119,105 +1285,135 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
     return null;
   };
 
-  /* Background memory walk — read a completed turn into the chat's graph
-     against its current roster of sites, and refresh the position marker. */
-  const runMemoryExtract = async (convoId, msgId, userMessage, response, model, memCtx) => {
-    let ops = [];
+  /* Generate (or revise) a hypothesis at one level of the hierarchy. A
+     prose model call — strict nesting: each level sees only the level below
+     plus its own revision history. */
+  const runHypothesis = async (convoId, level, targetId, model) => {
     try {
-      const convo = convos.find(c => c.id === convoId);
-      const extractModel = resolveRoleModel("extract", modelNames, model, roleConfig);
-      const out = await chatOnce(extractModel, [
-        { role: "system", content: WALK_SYSTEM },
-        { role: "user", content: `${buildRoster(convo?.memory)}\n\nPASSAGE:\nUser: ${userMessage.slice(0, 4000)}\nAssistant: ${response.slice(0, 4000)}` },
-      ], { format: WALK_FORMAT });
-      ops = parseWalk(out);
+      store.setScope(convoId);
+      const prompt = buildHypothesisPrompt(level, targetId);
+      if (!prompt.trim()) return;
+      const out = await chatOnce(model, [
+        { role: "system", content: getHypothesisSystemPrompt(level) },
+        { role: "user", content: prompt },
+      ]);
+      const text = String(out || "").trim().split("\n")[0].replace(/^["']|["']$/g, "").slice(0, 240);
+      if (!text) return;
+      store.setScope(convoId);
+      const key = typeof targetId === "string" ? targetId
+        : (targetId?.documentId || (targetId?.start != null ? `${targetId.start}-${targetId.end}` : "_"));
+      const hist = store.hypotheses.getHistory(level, key);
+      store.hypotheses.write(level, key, text, {
+        afterLabel: new Date().toISOString().slice(0, 16).replace("T", " "),
+        inputCount: hist.length + 1,
+      });
+    } catch { /* hypothesis is best-effort */ }
+  };
+
+  /* After a walk, pick the touched entities that need a (re-)hypothesis:
+     those with none yet, or whose centroid has drifted past 0.15 since the
+     last revision. Capped so a turn fires only a few background calls. */
+  const hypothesizeEntities = async (convoId, touched, model, cap = 3) => {
+    store.setScope(convoId);
+    const due = (touched || []).filter(id => {
+      const e = store.entities.get(id);
+      if (!e) return false;
+      if (!e.hypothesis) return true;
+      const last = store.hypotheses.getCurrent("entity", id);
+      return store.vectors.driftSince(id, last?.created_at || 0).total > 0.15;
+    }).slice(0, cap);
+    for (const id of due) await runHypothesis(convoId, "entity", id, model);
+    return due.length;
+  };
+
+  /* The MUTATE call — background, fired only when a mechanical trigger flags
+     an ambiguity. Produces exactly one action. FORK/MERGE/CORRECT/RECLASSIFY
+     are logged as pending mutations needing user consent (auto-commit tier
+     PROMPT); NONE is applied and logged silently. */
+  const runMutate = async (convoId, msgId, trigger, model) => {
+    let parsed = null;
+    try {
+      store.setScope(convoId);
+      const prompt = buildMutatePrompt(trigger);
+      const out = await chatOnce(model, [
+        { role: "system", content: MUTATE_SYSTEM },
+        { role: "user", content: prompt },
+      ], MUTATE_SCHEMA);
+      parsed = parseMutate(out);
+    } catch { /* fail silently — the turn already succeeded */ }
+    if (!parsed) return;
+    // Sync block: no await past this point.
+    store.setScope(convoId);
+    if (commitTier(parsed.action) === "AUTO") {
+      applyMutation(parsed, trigger.type);
+    } else {
+      store.mutations.log(parsed.action, { ...parsed, trigger: trigger.type, msgId },
+        parsed.reason, trigger.type, "pending");
+    }
+    bumpDb();
+  };
+
+  /* The EXTRACT call — background, reads a completed turn into the chat's
+     graph as INS/CON/DEF/EVA events. Both messages are appended to the
+     Given-Log; mechanical triggers then fire a MUTATE call per ambiguity. */
+  const runExtract = async (convoId, msgId, userGiven, modelGiven, model, memCtx) => {
+    // First pass — mechanical NER mints SIG entities for the user's message
+    // before the model walk reaches them.
+    try { store.setScope(convoId); await firstPass(userGiven.text, { givenId: userGiven.id }); } catch { /* optional */ }
+
+    let events = [];
+    try {
+      store.setScope(convoId);
+      const prompt = buildExtractPrompt(userGiven.text, modelGiven.text, userGiven.id, modelGiven.id);
+      const out = await chatOnce(model, [
+        { role: "system", content: EXTRACT_SYSTEM },
+        { role: "user", content: prompt },
+      ], EVENT_SCHEMA);
+      events = parseEvents(out);
     } catch { /* fail silently — the turn already succeeded */ }
 
-    let learned = 0;
-    setConvos(prev => prev.map(c => {
-      if (c.id !== convoId) return c;
-      const memory = cloneMemory(c.memory);
-      learned = applyWalk(memory, ops);
-      memory.lastTurn = {
-        entities: (memCtx.entities || []).map(e => e.canonical),
-        topic: (memCtx.sig?.keywords || []).slice(0, 3).join(" "),
-        userMessage: userMessage.slice(0, 100),
-      };
-      return { ...c, memory };
-    }));
-    patchMsg(convoId, msgId, m => ({ mem: { ...(m.mem || {}), learned } }));
-  };
-
-  /* Run (or resume) a persisted ingest job: walk each remaining passage into a
-     document graph. The job — its trace, partial graph and next index — is
-     saved after every passage, so a reload or crash resumes from where it
-     stopped rather than starting over. The walk uses constrained decoding so
-     the per-passage output is structurally valid. */
-  const runIngestJob = async (job) => {
-    setIngestRunning(true);
-    // A passage left mid-read by a crash never had its ops applied — re-read it.
-    const trace = job.trace.map(t => t.status === "reading" ? { ...t, status: "pending" } : { ...t });
-    const docMem = job.docMem || { entities: {}, edges: {}, defs: {} };
-    const sync = () => setIngestTrace(trace.map(t => ({ ...t })));
-    sync();
+    // Embed up front (async), then apply in one synchronous, scope-stable block.
+    let spanVecs = [], userVec = null;
     try {
-      for (let i = job.nextIndex || 0; i < job.passages.length; i++) {
-        trace[i].status = "reading"; sync();
-        try {
-          const out = await chatOnce(job.model, [
-            { role: "system", content: WALK_SYSTEM },
-            { role: "user", content: `${buildRoster(docMem)}\n\nPASSAGE:\n${job.passages[i]}` },
-          ], { format: WALK_FORMAT });
-          const ops = parseWalk(out);
-          trace[i].applied = applyWalk(docMem, ops);
-          trace[i].rawOutput = out;
-          trace[i].ops = ops;
-          trace[i].status = "done";
-        } catch (e) {
-          trace[i].status = "error";
-          trace[i].rawOutput = String(e?.message || e);
-        }
-        // Persist only after the graph and index agree: docMem now reflects
-        // passages [0, i], so resume continues at i + 1.
-        saveIngestJob({ ...job, trace, docMem, nextIndex: i + 1 });
-        sync();
-      }
+      spanVecs = await store.embedDefSpans(events);
+      userVec = await store.embed(userGiven.text.slice(0, 500));
+    } catch { /* embeddings optional */ }
 
-      const learned = trace.reduce((n, t) => n + (t.applied || 0), 0);
-      const doc = {
-        id: job.docId,
-        title: job.title || job.source || (job.text.slice(0, 40) + (job.text.length > 40 ? "…" : "")),
-        source: job.source || "pasted text",
-        addedAt: new Date().toISOString(),
-        chars: job.text.length, passages: job.passages.length, learned,
-        text: job.text,
-        memory: docMem,
-        trace: trace.map(t => ({
-          index: t.index, chars: t.chars, status: t.status, applied: t.applied,
-          signal: { names: t.signal.ner.names, dates: t.signal.ner.dates, keywords: t.signal.keywords },
-          ops: t.ops, rawOutput: t.rawOutput,
-        })),
-      };
-      setLibrary(prev => prev.some(d => d.id === doc.id) ? prev : [doc, ...prev]);
-      setConvos(prev => prev.map(c => c.id === job.convoId
-        ? { ...c, docs: [...new Set([...(c.docs || []), job.docId])], updatedAt: Date.now() } : c));
-    } finally {
-      clearIngestJob();
-      setIngestRunning(false);
-    }
+    const prevEntities = convos.find(c => c.id === convoId)?.lastTurn?.entities || [];
+    store.setScope(convoId);
+    store.given.write(userGiven);
+    store.given.write(modelGiven);
+    if (userVec) store.vectors.writeUnwalked(userGiven.id, userVec);
+    const res = store.applyEvents(events, userGiven.id, spanVecs);
+    // The turn's exchange is now read — its entities are grounded.
+    store.entities.markWalked(res.touched);
+    const triggers = detectMutationTriggers(modelGiven.text, events, memCtx.sig);
+    const corr = userCorrectionTrigger(userGiven.text, prevEntities);
+    if (corr) triggers.push(corr);
+
+    const lastTurn = {
+      entities: (memCtx.results || []).filter(r => r.type === "entity").map(r => r.id),
+      topic: (memCtx.sig?.keywords || []).slice(0, 3).join(" "),
+      userMessage: userGiven.text.slice(0, 100),
+    };
+    setConvos(prev => prev.map(c => c.id === convoId ? { ...c, lastTurn } : c));
+    patchMsg(convoId, msgId, m => ({ mem: { ...(m.mem || {}), learned: res.applied } }));
+    bumpDb();
+    // Re-hypothesise entities the turn moved, then resolve any ambiguities.
+    await hypothesizeEntities(convoId, res.touched, model);
+    bumpDb();
+    for (const t of triggers) await runMutate(convoId, msgId, t, model);
   };
 
-  /* Read a block of text into a library document with a stateful walk: split
-     it into sentences, group them into passages, and read each passage with
-     the roster of sites already found in hand — so the model resolves and
-     enriches sites instead of duplicating them. The document is added to the
-     library and opted in to the current chat. Reading runs in the background:
-     the Library modal can be closed and the job survives a reload. */
+  /* Read a block of text into a library document. The text is split into
+     passages and each is read by the INGEST call into the document's graph
+     as INS/CON/DEF/EVA events, with the register of known entities in hand
+     so the model resolves rather than duplicates. AMBIG ops fire a MUTATE
+     call. The document is added to the library and opted in to the chat. */
   const runIngest = async (rawText, title, source) => {
     const text = (rawText || "").trim();
     if (!text || ingestRunning) return;
-    const fallback = composerModel === AUTO_MODEL ? modelNames[0] : composerModel;
-    const model = resolveRoleModel("ingest", modelNames, fallback, roleConfig);
+    const model = backgroundModel(composerModel === AUTO_MODEL ? modelNames[0] : composerModel);
     if (!model) return;
 
     // A document needs a Memory-mode chat to belong to — make or adopt one.
@@ -1227,60 +1423,151 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
       convoId = "c" + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
       setConvos(prev => [{
         id: convoId, title: title || ("Library · " + text.slice(0, 32)),
-        model: fallback || model, updatedAt: Date.now(), messages: [], mode: "memory",
-        memory: emptyMemory(), docs: [],
+        model, updatedAt: Date.now(), messages: [], mode: "memory", docs: [],
       }, ...prev]);
       setActiveId(convoId);
       setMode("memory");
     } else if (cur.mode !== "memory") {
-      setConvos(prev => prev.map(c => c.id === convoId
-        ? { ...c, mode: "memory", memory: c.memory || emptyMemory() } : c));
+      setConvos(prev => prev.map(c => c.id === convoId ? { ...c, mode: "memory" } : c));
       setMode("memory");
     }
+    if (!dbReady) { setIngestRunning(false); return; }
 
     const docId = "d" + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
     const passages = batchSentences(splitSentences(text));
-    const job = {
-      id: "j" + Date.now().toString(36),
-      convoId, docId, model,
-      title: title || "", source: source || "",
-      text, passages,
-      trace: passages.map((c, i) => ({
-        index: i, chars: c.length, text: c, signal: signal(c),
-        status: "pending", rawOutput: "", ops: [], applied: 0,
+    const trace = passages.map((c, i) => ({
+      index: i, chars: c.length, text: c, signal: signal(c),
+      status: "pending", rawOutput: "", ops: [], applied: 0,
+    }));
+    const sync = () => setIngestTrace(trace.map(t => ({ ...t })));
+    setIngestRunning(true);
+    ingestAbortRef.current = false;
+    sync();
+    store.setScope(convoId);
+    store.documents.register(docId, title || source || "document", passages.length);
+
+    // ── Phase 1: first pass — instant. Mechanical NER + embedding over
+    //    every passage, so the whole document is chattable as impressions
+    //    (SIG entities, centroids) before the slow walk begins. The walk
+    //    never blocks the conversation.
+    const givenIds = [];
+    for (let i = 0; i < passages.length; i++) {
+      if (ingestAbortRef.current) break;
+      trace[i].status = "scanning"; sync();
+      try {
+        const passageGiven = logPassage(passages[i], docId, i, { title });
+        givenIds[i] = passageGiven.id;
+        store.setScope(convoId);
+        store.given.write(passageGiven);
+        await firstPass(passages[i], { documentId: docId, passageIdx: i, givenId: passageGiven.id });
+      } catch { /* a passage that fails the scan is still walked below */ }
+      trace[i].status = "queued"; sync();
+    }
+    bumpDb();
+
+    // ── Phase 2: the walk — the LLM reads each passage into typed structure
+    //    in the background. The conversation already has Phase 1 to draw on.
+    const allAmbigs = [];
+    const docTouched = new Set();
+    try {
+    for (let i = 0; i < passages.length; i++) {
+      if (ingestAbortRef.current) { trace[i].status = "stopped"; sync(); break; }
+      trace[i].status = "reading"; sync();
+      try {
+        const givenId = givenIds[i] || logPassage(passages[i], docId, i, { title }).id;
+        store.setScope(convoId);
+        const register = buildRegister();
+        const out = await chatOnce(model, [
+          { role: "system", content: INGEST_SYSTEM },
+          { role: "user", content: `${register}\n\nPASSAGE:\n${passages[i]}` },
+        ], EVENT_SCHEMA);
+        const events = parseEvents(out);
+        const spanVecs = await store.embedDefSpans(events);
+        // Sync apply block.
+        store.setScope(convoId);
+        const res = store.applyEvents(events, givenId, spanVecs);
+        for (const id of res.touched) docTouched.add(id);
+        trace[i].applied = res.applied;
+        trace[i].ambigs = res.ambigs;
+        allAmbigs.push(...res.ambigs);
+        trace[i].rawOutput = typeof out === "string" ? out : JSON.stringify(out);
+        trace[i].ops = events;
+        trace[i].status = "done";
+      } catch (e) {
+        trace[i].status = "error";
+        trace[i].rawOutput = String(e?.message || e);
+      }
+      // Roll up group and section hypotheses at the configured intervals.
+      if ((i + 1) % INTERVALS.GROUP_HYPOTHESIS === 0) {
+        await runHypothesis(convoId, "group", { start: i - INTERVALS.GROUP_HYPOTHESIS + 1, end: i }, model);
+      }
+      if ((i + 1) % INTERVALS.SECTION_HYPOTHESIS === 0) {
+        await runHypothesis(convoId, "section", { start: i - INTERVALS.SECTION_HYPOTHESIS + 1, end: i }, model);
+      }
+      store.setScope(convoId);
+      store.documents.setWalked(docId, i + 1);
+      sync();
+    }
+    } catch (e) {
+      /* unexpected failure — the document is left partially read */
+      console.error("ingest failed", e);
+    }
+
+    // Each AMBIG the ingest emitted fires a MUTATE call for a clean decision.
+    for (const a of allAmbigs) {
+      const trigger = { type: "ingest_ambig", name: a.name, candidateHash: a.candidateHash, span: a.span };
+      try {
+        store.setScope(convoId);
+        const prompt = buildMutatePrompt(trigger);
+        const out = await chatOnce(model, [
+          { role: "system", content: MUTATE_SYSTEM },
+          { role: "user", content: prompt },
+        ], MUTATE_SCHEMA);
+        const parsed = parseMutate(out);
+        if (parsed) {
+          store.setScope(convoId);
+          if (commitTier(parsed.action) === "AUTO") {
+            applyMutation(parsed, trigger.type);
+          } else {
+            store.mutations.log(parsed.action, { ...parsed, trigger: trigger.type, docId },
+              parsed.reason, trigger.type, "pending");
+          }
+        }
+      } catch { /* fail silently — the document was still read */ }
+    }
+
+    // The document is fully read — ground its entities, drop the unwalked
+    // scaffolding, hypothesise the entities it moved, roll up the document.
+    try {
+      store.setScope(convoId);
+      store.entities.markWalked([...docTouched]);
+      store.documents.setWalked(docId, passages.length);
+      store.vectors.pruneWalked(docId);
+      await hypothesizeEntities(convoId, [...docTouched], model, 8);
+      await runHypothesis(convoId, "document", { documentId: docId }, model);
+    } catch (e) {
+      console.error("ingest rollup failed", e);
+    }
+
+    const learned = trace.reduce((n, t) => n + (t.applied || 0), 0);
+    const doc = {
+      id: docId,
+      title: title || source || (text.slice(0, 40) + (text.length > 40 ? "…" : "")),
+      source: source || "pasted text",
+      addedAt: new Date().toISOString(),
+      chars: text.length, passages: passages.length, learned, scope: convoId,
+      text,
+      trace: trace.map(t => ({
+        index: t.index, chars: t.chars, status: t.status, applied: t.applied,
+        signal: { names: t.signal.ner.names, dates: t.signal.ner.dates, keywords: t.signal.keywords },
+        ops: t.ops, ambigs: t.ambigs || [], rawOutput: t.rawOutput,
       })),
-      docMem: { entities: {}, edges: {}, defs: {} },
-      nextIndex: 0,
-      createdAt: Date.now(),
     };
-    saveIngestJob(job);
-    await runIngestJob(job);
-  };
-
-  /* Resume an ingest job left unfinished by a reload or crash. Runs once, and
-     for an Ollama-backed job waits until Ollama is reachable so the first
-     passage does not just fail. */
-  const ingestResumed = useRef(false);
-  useEffect(() => {
-    if (ingestResumed.current || ingestRunning) return;
-    const job = loadIngestJob();
-    if (!job) return;
-    if ((job.nextIndex || 0) >= job.passages.length) { clearIngestJob(); return; }
-    const browser = providerOf[job.model] === "browser";
-    if (!browser && !ollamaUp) return; // wait for the next render once Ollama is up
-    ingestResumed.current = true;
-    runIngestJob(job);
-  }, [ollamaUp, providerOf, ingestRunning]);
-
-  /* Set (or clear, with an empty value) the model override for a memory role. */
-  const setRoleModel = (role, model) => {
-    setRoleConfig(prev => {
-      const next = { ...prev };
-      if (model) next[role] = model;
-      else delete next[role];
-      saveRoleConfig(next);
-      return next;
-    });
+    setLibrary(prev => [doc, ...prev]);
+    setConvos(prev => prev.map(c => c.id === convoId
+      ? { ...c, docs: [...(c.docs || []), docId], updatedAt: Date.now() } : c));
+    bumpDb();
+    setIngestRunning(false);
   };
 
   /* Opt the active chat in or out of a library document. */
@@ -1290,7 +1577,7 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
       if (c.id !== activeId) return c;
       const has = (c.docs || []).includes(docId);
       return {
-        ...c, mode: "memory", memory: c.memory || emptyMemory(), updatedAt: Date.now(),
+        ...c, mode: "memory", updatedAt: Date.now(),
         docs: has ? c.docs.filter(d => d !== docId) : [...(c.docs || []), docId],
       };
     }));
@@ -1318,12 +1605,20 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
         reasoning: m.reasoning || undefined, elapsed: m.elapsed, tokens: m.tokens,
         routing: m.routing || undefined, memory: m.mem || undefined,
         promptSent: m.prompt || undefined,
+        givenId: m.givenId || undefined,
+        dossierHash: m.dossierHash || undefined,
+        spans: m.spans || undefined,
       })),
-      memory: c.memory || undefined,
+      graph: dbReady ? (store.setScope(c.id), {
+        entities: store.entities.getAll(),
+        defs: store.defs.getAll(),
+        given: store.given.getAll(),
+        mutations: store.mutations.getAll(),
+      }) : undefined,
       library: attached.map(d => ({
         id: d.id, title: d.title, source: d.source, addedAt: d.addedAt,
         chars: d.chars, passages: d.passages, learned: d.learned,
-        text: d.text, memory: d.memory, readTrace: d.trace,
+        text: d.text, readTrace: d.trace,
       })),
     };
     const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
@@ -1378,8 +1673,7 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
       convoId = "c" + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
       setConvos(prev => [{
         id: convoId, title: text.slice(0, 48) + (text.length > 48 ? "…" : ""),
-        model: chosenModel, updatedAt: Date.now(), messages: [],
-        mode, memory: mode === "memory" ? emptyMemory() : undefined,
+        model: chosenModel, updatedAt: Date.now(), messages: [], mode,
       }, ...prev]);
       setActiveId(convoId);
     }
@@ -1389,14 +1683,14 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
     // Every turn is projected and every turn is read back into the graph — the
     // prompt stays minimal regardless of how much the chat has covered.
     let apiMessages, memCtx = null, memBadge;
-    if (mode === "memory") {
+    if (mode === "memory" && dbReady) {
       const sig = signal(text);
-      const sys = memorySystemPrompt(existing, sig);
+      const sys = await memorySystemPrompt({ id: convoId, lastTurn: existing?.lastTurn }, sig, text);
       apiMessages = [
         { role: "system", content: sys.content },
         { role: "user", content: text },
       ];
-      memCtx = { sig, entities: sys.entities };
+      memCtx = { sig, results: sys.results, dossierHash: sys.dossierHash, spans: sys.spans };
       memBadge = { used: sys.used };
     } else {
       const apiHistory = quantize ? quantizeHistory(history) : history;
@@ -1405,7 +1699,11 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
 
     const userMsg = { id: "u" + Date.now(), role: "user", content: text };
     const aId = "a" + Date.now();
-    const placeholder = { id: aId, role: "assistant", model: chosenModel, content: "", streaming: true, routing, mem: memBadge, prompt: apiMessages };
+    const placeholder = {
+      id: aId, role: "assistant", model: chosenModel, content: "", streaming: true,
+      routing, mem: memBadge, prompt: apiMessages,
+      dossierHash: memCtx?.dossierHash, spans: memCtx?.spans,
+    };
     setConvos(prev => prev.map(c => {
       if (c.id !== convoId) return c;
       const base = evalDoneIds.size
@@ -1420,8 +1718,14 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
     maybeREC();
 
     // Background: read every memory-mode turn back into the chat's graph.
+    // Both messages are recorded in the Given-Log with content hashes; the
+    // model entry carries the dossier projection that produced it.
     if (mode === "memory" && memCtx && finalContent) {
-      runMemoryExtract(convoId, aId, text, finalContent, chosenModel, memCtx);
+      const turn = (existing?.messages.filter(m => m.role === "assistant").length || 0) + 1;
+      const userGiven = logUserMessage(text, memCtx.sig, convoId, turn);
+      const modelGiven = logModelResponse(finalContent, chosenModel, memCtx.dossierHash, convoId, turn);
+      patchMsg(convoId, aId, { givenId: modelGiven.id });
+      runExtract(convoId, aId, userGiven, modelGiven, backgroundModel(chosenModel), memCtx);
     }
   };
 
@@ -1469,15 +1773,18 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
     // Memory mode: rebuild the fixed-size prompt instead of replaying history.
     // A re-run only regenerates the reply — it does not re-extract memory.
     let apiMessages, memBadge = oldMsg.mem;
-    if (active.mode === "memory") {
+    let memSpans = oldMsg.spans, memDossierHash = oldMsg.dossierHash;
+    if (active.mode === "memory" && dbReady) {
       const promptMsg = [...active.messages.slice(0, idx)].reverse().find(m => m.role === "user");
       const promptText = promptMsg?.content || "";
-      const sys = memorySystemPrompt(active, signal(promptText));
+      const sys = await memorySystemPrompt(active, signal(promptText), promptText);
       apiMessages = [
         { role: "system", content: sys.content },
         { role: "user", content: promptText },
       ];
       memBadge = { used: sys.used };
+      memSpans = sys.spans;
+      memDossierHash = sys.dossierHash;
     } else {
       apiMessages = quantize ? quantizeHistory(history) : history;
     }
@@ -1485,6 +1792,8 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
     patchMsg(active.id, msgId, {
       model: useModel, content: "", reasoning: undefined, streaming: true, error: false,
       elapsed: undefined, tokens: undefined, routing: newRouting, mem: memBadge, prompt: apiMessages,
+      dossierHash: active.mode === "memory" ? memDossierHash : undefined,
+      spans: active.mode === "memory" ? memSpans : undefined,
     });
     await runTurn(active.id, msgId, useModel, apiMessages, { candidates, routingId: routing?.id });
     setBusy(false);
@@ -1500,6 +1809,18 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
     else if (action === "down") appendSignal(r.id, { type: "explicit", value: -0.5, action: "thumbs-down", model: r.model });
     patchMsg(active.id, msgId, m => ({ routing: { ...m.routing, evalDone: true, feedback: action } }));
     maybeREC();
+  };
+
+  /* Accept or dismiss a pending MUTATE commit. Accepting applies the action
+     to the chat's graph (which holds both conversation and document data). */
+  const resolveMutation = (mutId, accept) => {
+    if (!active || !dbReady) return;
+    store.setScope(active.id);
+    const mut = store.mutations.getPending().find(m => m.id === mutId);
+    if (!mut) return;
+    if (accept) applyMutation(mut.detail, mut.detail.trigger || mut.triggered_by);
+    store.mutations.setStatus(mutId, accept ? "accepted" : "dismissed");
+    bumpDb();
   };
 
   const handleWrongModel = (msgId, altModel) => {
@@ -1522,8 +1843,21 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
   const offline = !isBrowserModel(composerModel)
     && (ollamaUp === false || ollamaUp === "cors");
 
-  const memStats = mode === "memory" ? memoryStats(combinedMemory(active)) : null;
+  const memStats = (mode === "memory" && dbReady && active)
+    ? (store.setScope(active.id), store.stats())
+    : null;
   const docCount = active?.docs?.length || 0;
+
+  /* Pending MUTATE commits awaiting consent. Those tied to a message render
+     inline beneath it; the rest (e.g. from ingest) render after the thread. */
+  const pendingMuts = (mode === "memory" && dbReady && active)
+    ? (store.setScope(active.id), store.mutations.getPending().map(m => ({
+        id: m.id, action: m.action, reason: m.reason,
+        trigger: m.triggered_by, triggerDetail: m.detail?.span || "",
+        msgId: m.detail?.msgId || null,
+      })))
+    : [];
+  const orphanMuts = pendingMuts.filter(m => !m.msgId || !messages.some(x => x.id === m.msgId));
 
   return (
     <div style={{ display: "flex", height: "100%", width: "100%", background: C.bg, fontFamily: sans, color: C.text }}>
@@ -1550,6 +1884,9 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
           <HeaderBtn icon="book" label={ingestRunning ? "Reading…" : "Library"}
             onClick={() => setLibOpen(true)}
             badge={ingestRunning ? "•••" : (library.length || undefined)} />
+          {active && mode === "memory" && dbReady && (
+            <HeaderBtn icon="memory" label="Log" onClick={() => setLogOpen(true)} />
+          )}
           {active && <HeaderBtn icon="download" label="Export" onClick={() => exportConvo(active)} />}
           {headerModel && (
             <span style={{ display: "flex", alignItems: "center", gap: 6, padding: "5px 10px", background: C.s1, border: `1px solid ${C.border}`, borderRadius: 7, fontFamily: mono, fontSize: 11.5, flexShrink: 0 }}>
@@ -1590,17 +1927,30 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
               messages.map((m, i) => {
                 const prevAi = [...messages.slice(0, i)].reverse().find(x => x.role === "assistant");
                 const userMsgsAfter = messages.slice(i + 1).filter(x => x.role === "user").length;
+                const msgMuts = pendingMuts.filter(x => x.msgId === m.id);
                 return (
-                  <MessageBubble
-                    key={m.id || i} msg={m} prevModel={prevAi?.model}
-                    onCopy={copy} copied={copied} onRerun={rerun} onFork={forkConvo} busy={busy}
-                    installed={installed} userMsgsAfter={userMsgsAfter}
-                    onFeedback={handleFeedback} onWrongModel={handleWrongModel}
-                    wrongModelFor={wrongModelFor} setWrongModelFor={setWrongModelFor}
-                  />
+                  <div key={m.id || i}>
+                    <MessageBubble
+                      msg={m} prevModel={prevAi?.model}
+                      onCopy={copy} copied={copied} onRerun={rerun} onFork={forkConvo} busy={busy}
+                      installed={installed} userMsgsAfter={userMsgsAfter}
+                      onFeedback={handleFeedback} onWrongModel={handleWrongModel}
+                      wrongModelFor={wrongModelFor} setWrongModelFor={setWrongModelFor}
+                    />
+                    {msgMuts.map(mut => (
+                      <MutationPill key={mut.id} mut={mut}
+                        onAccept={() => resolveMutation(mut.id, true)}
+                        onDismiss={() => resolveMutation(mut.id, false)} />
+                    ))}
+                  </div>
                 );
               })
             )}
+            {orphanMuts.map(mut => (
+              <MutationPill key={mut.id} mut={mut}
+                onAccept={() => resolveMutation(mut.id, true)}
+                onDismiss={() => resolveMutation(mut.id, false)} />
+            ))}
           </div>
         </div>
 
@@ -1617,14 +1967,19 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
           isReply={messages.length > 0}
           quantize={quantize} setQuantize={setQuantize}
           mode={mode}
+          memModel={memModel} memModels={modelNames} setMemModel={setMemModel}
         />
       </main>
       <LibraryModal
         open={libOpen} onClose={() => setLibOpen(false)}
         library={library} activeConvo={active} canIngest={modelNames.length > 0}
         ingestRunning={ingestRunning} ingestTrace={ingestTrace}
-        onIngest={runIngest} onToggleDoc={toggleDoc} onRemoveDoc={removeDoc}
-        modelNames={modelNames} roleConfig={roleConfig} onSetRoleModel={setRoleModel}
+        onIngest={runIngest} onStopIngest={() => { ingestAbortRef.current = true; }}
+        onToggleDoc={toggleDoc} onRemoveDoc={removeDoc}
+      />
+      <GivenLogModal
+        open={logOpen} onClose={() => setLogOpen(false)}
+        entries={(logOpen && active && dbReady) ? (store.setScope(active.id), store.given.getAll()) : []}
       />
     </div>
   );
