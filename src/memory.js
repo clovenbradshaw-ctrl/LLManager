@@ -14,8 +14,8 @@
 
 export const MEMORY_SYSTEM = `You are a helpful assistant with long-term memory.
 The [CONTEXT] block holds facts recalled from this conversation.
-The [LIBRARY] block lists documents that have been read into this chat — treat
-everything in it as material you have already read and can discuss directly.
+The [LIBRARY] block contains the full text of documents read into this chat —
+treat them as source material you have already read and can quote directly.
 The [POSITION] block notes what was discussed on the previous turn.
 Use them to answer accurately and stay consistent. If they do not cover
 something, answer normally from your own knowledge — never claim you have no
@@ -221,30 +221,28 @@ Last user message: "${lastTurn.userMessage || ""}"
 [/POSITION]`;
 }
 
-/* ── The Library card: a compact, always-present overview of the documents
-   read into a chat, so the model knows what it has even when the query does
-   not lexically match any entity. Bounded per document to keep prompts small. */
-export function buildLibrary(docs) {
+/* ── The Library card: the actual text of every document read into a chat,
+   so the model is prompted with the source material itself — not just a list
+   of entity names. Capped per document; this block is fixed-size relative to
+   the conversation (it never grows as the chat goes on). */
+export function buildLibrary(docs, perDocCap = 8000) {
   if (!docs || !docs.length) return "";
-  const lines = ["[LIBRARY]"];
+  const out = [
+    "[LIBRARY]",
+    "Full text of the documents read into this chat. Treat them as source",
+    "material you have already read and may quote or summarise directly.",
+  ];
   for (const d of docs) {
-    const entities = Object.values(d.memory?.entities || {});
-    const edges = Object.values(d.memory?.edges || {});
-    const defs = Object.values(d.memory?.defs || {}).filter(x => x.value);
-    const top = [...entities].sort((a, b) => (b.mentions || 0) - (a.mentions || 0)).slice(0, 16);
-    lines.push(`Document: "${d.title}" — ${entities.length} entities, ${edges.length} connections`);
-    if (top.length) lines.push("  Mentions: " + top.map(e => e.canonical).join(", "));
-    for (const def of defs.slice(0, 8)) {
-      const e = d.memory.entities[def.entity];
-      lines.push(`  ${e ? e.canonical : def.entity} · ${def.field}: ${def.value}`);
-    }
-    for (const g of edges.slice(0, 8)) {
-      const f = d.memory.entities[g.from], t = d.memory.entities[g.to];
-      lines.push(`  ${f ? f.canonical : g.from} —${g.type}→ ${t ? t.canonical : g.to}`);
-    }
+    const text = String(d.text || "").trim();
+    const body = text.length > perDocCap
+      ? text.slice(0, perDocCap) + " …[truncated]"
+      : text;
+    out.push("");
+    out.push(`Document: "${d.title}"`);
+    out.push(body || "(no readable text was extracted from this document)");
   }
-  lines.push("[/LIBRARY]");
-  return lines.join("\n");
+  out.push("[/LIBRARY]");
+  return out.join("\n");
 }
 
 /* ── The Extract: parse the model's JSON event list ── */

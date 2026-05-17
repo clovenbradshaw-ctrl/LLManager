@@ -1091,6 +1091,7 @@ export default function Chat({ ollamaUrl, installed, ollamaUp }) {
       source: source || "pasted text",
       addedAt: new Date().toISOString(),
       chars: text.length, sentences: sentences.length, learned,
+      text,
       memory: docMem,
       trace: trace.map(t => ({
         index: t.index, chars: t.chars, status: t.status, applied: t.applied,
@@ -1144,7 +1145,7 @@ export default function Chat({ ollamaUrl, installed, ollamaUp }) {
       library: attached.map(d => ({
         id: d.id, title: d.title, source: d.source, addedAt: d.addedAt,
         chars: d.chars, sentences: d.sentences, learned: d.learned,
-        memory: d.memory, readTrace: d.trace,
+        text: d.text, memory: d.memory, readTrace: d.trace,
       })),
     };
     const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
