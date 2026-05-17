@@ -795,6 +795,37 @@ function LibraryModal({ open, onClose, library, activeConvo, canIngest,
             </div>
           )}
 
+          {/* ── Memory models — which model does each background graph role ── */}
+          <div style={{ fontSize: 12, fontWeight: 700, margin: "18px 0 4px" }}>Memory models</div>
+          <div style={{ fontSize: 11.5, color: C.dim, lineHeight: 1.6, marginBottom: 10 }}>
+            Reading text into the graph is background work, separate from the
+            conversation. Each role picks its own model — leave a role on Auto
+            to use the best installed match. The walk runs with constrained
+            decoding, so even a small fast model stays structurally valid.
+          </div>
+          {Object.values(ROLES).map(role => {
+            const auto = resolveRoleModel(role.id, modelNames, "", { ...roleConfig, [role.id]: null });
+            return (
+              <div key={role.id} style={{ display: "flex", alignItems: "center", gap: 10,
+                padding: "8px 11px", marginBottom: 6, background: C.bg,
+                border: `1px solid ${C.border}`, borderRadius: 8 }}>
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{ fontSize: 12, fontWeight: 600 }}>{role.label}</div>
+                  <div style={{ fontSize: 10, color: C.dim, lineHeight: 1.5 }}>{role.desc}</div>
+                </div>
+                <select
+                  value={roleConfig[role.id] && modelNames.includes(roleConfig[role.id]) ? roleConfig[role.id] : ""}
+                  onChange={e => onSetRoleModel?.(role.id, e.target.value)}
+                  style={{ padding: "5px 8px", background: C.s2, color: C.text,
+                    border: `1px solid ${C.border}`, borderRadius: 6, fontSize: 11,
+                    fontFamily: mono, outline: "none", maxWidth: 200 }}>
+                  <option value="">Auto{auto ? ` · ${auto}` : ""}</option>
+                  {modelNames.map(n => <option key={n} value={n}>{n}</option>)}
+                </select>
+              </div>
+            );
+          })}
+
           {ingestTrace.length > 0 && (
             <div style={{ marginTop: 14 }}>
               <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6,
@@ -1850,8 +1881,9 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
               <Icon name="memory" size={11} /> {memStats.entities} remembered{docCount ? ` · ${docCount} doc${docCount === 1 ? "" : "s"}` : ""}
             </span>
           )}
-          <HeaderBtn icon="book" label="Library" onClick={() => setLibOpen(true)}
-            badge={library.length || undefined} />
+          <HeaderBtn icon="book" label={ingestRunning ? "Reading…" : "Library"}
+            onClick={() => setLibOpen(true)}
+            badge={ingestRunning ? "•••" : (library.length || undefined)} />
           {active && mode === "memory" && dbReady && (
             <HeaderBtn icon="memory" label="Log" onClick={() => setLogOpen(true)} />
           )}
