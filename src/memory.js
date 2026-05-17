@@ -379,28 +379,43 @@ export async function reach(sig, message) {
 
 /* The first pass — mechanical NER, no model. Mints SIG entities the instant
    text arrives: an impression with a centroid but no provenance, weighted
-   low until a walk reaches it. Run on document passages and chat turns. */
-export async function firstPass(text) {
+   low until a walk reaches it. Records a mention per (entity, passage) and,
+   given a Given-Log id, keeps the passage as an unwalked vector. Run on
+   document passages and chat turns so material is chattable immediately. */
+export async function firstPass(text, opts = {}) {
   const myScope = store.getScope();
   const sig = signal(text);
-  const newOnes = sig.ner.names.filter(n =>
-    n.length > 1 &&
-    !store.entities.search(n).some(m => m.canonical.toLowerCase() === n.toLowerCase()));
-  if (!newOnes.length) return { created: 0 };
+  const names = sig.ner.names.filter(n => n.length > 1);
   let vec = null;
   try { vec = await store.embed(String(text).slice(0, 500)); } catch { /* optional */ }
   store.setScope(myScope); // re-assert before the sync writes
-  for (const name of newOnes) {
-    const id = store.mintEntityId(name);
-    store.entities.create(id, name, "Entity", { status: "sig" });
-    const kind = sig.ner.typed[name];
-    if (kind) {
-      const defId = "d_" + store.mintHash(`${id}::kind::${Date.now()}::${Math.random()}`);
-      store.defs.write(defId, id, "kind", kind, { source: "ner:firstpass" });
+  if (vec && opts.givenId) store.vectors.writeUnwalked(opts.givenId, vec);
+  let created = 0;
+  for (const name of names) {
+    let ent = store.entities.search(name)
+      .find(m => m.canonical.toLowerCase() === name.toLowerCase());
+    if (!ent) {
+      const id = store.mintEntityId(name);
+      store.entities.create(id, name, "Entity", { status: "sig" });
+      const kind = sig.ner.typed[name];
+      if (kind) {
+        const defId = "d_" + store.mintHash(`${id}::kind::${Date.now()}::${Math.random()}`);
+        store.defs.write(defId, id, "kind", kind, { source: opts.givenId || "ner:firstpass" });
+      }
+      ent = store.entities.get(id);
+      created++;
     }
-    if (vec) store.vectors.foldClause(id, vec); // seeds the centroid, drift 1.0
+    // While the entity is still an impression, fold this context into its
+    // centroid (the drift is the surprise) and record the mention.
+    if (ent && ent.status === "sig") {
+      const drift = vec ? store.vectors.foldClause(ent.id, vec) : null;
+      store.mentions.record(ent.id, {
+        documentId: opts.documentId || null, passageIdx: opts.passageIdx ?? null,
+        givenId: opts.givenId || null, context: String(text).slice(0, 400), drift,
+      });
+    }
   }
-  return { created: newOnes.length };
+  return { created };
 }
 
 /* A provisional dossier entry for a SIG entity — impressionistic but not

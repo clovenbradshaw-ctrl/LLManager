@@ -629,12 +629,14 @@ function ChunkTrace({ chunk }) {
   const [open, setOpen] = useState(false);
   const stColor = chunk.status === "done" ? C.green
     : chunk.status === "error" ? C.red
-    : chunk.status === "reading" ? C.orange : C.dim;
+    : (chunk.status === "reading" || chunk.status === "scanning") ? C.orange : C.dim;
   const ner = chunk.signal?.ner || chunk.signal || { names: [], dates: [], numbers: [] };
   const kws = chunk.signal?.keywords || [];
   const label = chunk.status === "done" ? `+${chunk.applied} ops`
     : chunk.status === "reading" ? "reading…"
-    : chunk.status === "error" ? "error" : "queued";
+    : chunk.status === "scanning" ? "scanning…"
+    : chunk.status === "error" ? "error"
+    : chunk.status === "stopped" ? "stopped" : "queued";
   const opLine = (e) => {
     if (e.op === "INS") return `+ entity ${e.entity} (${e.terrain || "Entity"})`;
     if (e.op === "DEF") return `= ${e.entity} · ${e.field}: "${e.value}"`;
@@ -714,7 +716,7 @@ function LibraryModal({ open, onClose, library, activeConvo, canIngest,
     onIngest(text, title.trim(), source);
   };
 
-  const done = ingestTrace.filter(t => t.status !== "pending" && t.status !== "reading").length;
+  const done = ingestTrace.filter(t => ["done", "error", "stopped"].includes(t.status)).length;
   const learned = ingestTrace.reduce((n, t) => n + (t.applied || 0), 0);
   const attached = new Set(activeConvo?.docs || []);
   const btn = (active) => ({
@@ -1347,7 +1349,27 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
     store.setScope(convoId);
     store.documents.register(docId, title || source || "document", passages.length);
 
-    // The document is walked into the chat's own graph scope.
+    // ── Phase 1: first pass — instant. Mechanical NER + embedding over
+    //    every passage, so the whole document is chattable as impressions
+    //    (SIG entities, centroids) before the slow walk begins. The walk
+    //    never blocks the conversation.
+    const givenIds = [];
+    for (let i = 0; i < passages.length; i++) {
+      if (ingestAbortRef.current) break;
+      trace[i].status = "scanning"; sync();
+      try {
+        const passageGiven = logPassage(passages[i], docId, i, { title });
+        givenIds[i] = passageGiven.id;
+        store.setScope(convoId);
+        store.given.write(passageGiven);
+        await firstPass(passages[i], { documentId: docId, passageIdx: i, givenId: passageGiven.id });
+      } catch { /* a passage that fails the scan is still walked below */ }
+      trace[i].status = "queued"; sync();
+    }
+    bumpDb();
+
+    // ── Phase 2: the walk — the LLM reads each passage into typed structure
+    //    in the background. The conversation already has Phase 1 to draw on.
     const allAmbigs = [];
     const docTouched = new Set();
     try {
@@ -1355,10 +1377,7 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
       if (ingestAbortRef.current) { trace[i].status = "stopped"; sync(); break; }
       trace[i].status = "reading"; sync();
       try {
-        const passageGiven = logPassage(passages[i], docId, i, { title });
-        // First pass — mechanical NER mints SIG entities before the walk.
-        store.setScope(convoId);
-        await firstPass(passages[i], { documentId: docId, passageIdx: i, givenId: passageGiven.id });
+        const givenId = givenIds[i] || logPassage(passages[i], docId, i, { title }).id;
         store.setScope(convoId);
         const register = buildRegister();
         const out = await chatOnce(model, [
@@ -1369,8 +1388,7 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
         const spanVecs = await store.embedDefSpans(events);
         // Sync apply block.
         store.setScope(convoId);
-        store.given.write(passageGiven);
-        const res = store.applyEvents(events, passageGiven.id, spanVecs);
+        const res = store.applyEvents(events, givenId, spanVecs);
         for (const id of res.touched) docTouched.add(id);
         trace[i].applied = res.applied;
         trace[i].ambigs = res.ambigs;
