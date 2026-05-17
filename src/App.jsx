@@ -9,6 +9,7 @@ import { webGPUAvailable, listBrowserModels, getBrowserEngine, unloadBrowserEngi
 
 const GATE_SKIP_KEY = "llm-manager-gate-skipped";
 const PROVIDER_KEY = "llm-manager-provider";
+const BROWSER_LOADED_KEY = "llm-manager-browser-loaded";
 const fmtVram = mb => (mb ? (mb >= 1024 ? `${(mb / 1024).toFixed(1)} GB` : `${Math.round(mb)} MB`) : "—");
 
 const MODEL_CATALOG = [
@@ -113,35 +114,59 @@ export default function App() {
   const [browserModels, setBrowserModels] = useState([]);
   // { modelId, status: "loading" | "ready" | "error", progress, text, error }
   const [browserEngine, setBrowserEngine] = useState(null);
+  // In-browser models the user has loaded at least once — cached in this
+  // browser, and so offered as ready-to-use in the chat model picker.
+  const [browserLoaded, setBrowserLoaded] = useState(() => {
+    try { return JSON.parse(localStorage.getItem(BROWSER_LOADED_KEY) || "[]"); }
+    catch { return []; }
+  });
 
   useEffect(() => {
     try { localStorage.setItem(PROVIDER_KEY, provider); } catch { /* ignore */ }
   }, [provider]);
 
   useEffect(() => {
-    if (provider !== "browser" || browserModels.length || !webGPUAvailable()) return;
+    try { localStorage.setItem(BROWSER_LOADED_KEY, JSON.stringify(browserLoaded)); }
+    catch { /* ignore */ }
+  }, [browserLoaded]);
+
+  useEffect(() => {
+    if (browserModels.length || !webGPUAvailable()) return;
     let cancelled = false;
     listBrowserModels()
       .then(list => { if (!cancelled) setBrowserModels(list); })
       .catch(() => { /* WebGPU panel surfaces the failure */ });
     return () => { cancelled = true; };
-  }, [provider, browserModels.length]);
+  }, [browserModels.length]);
 
-  // Browser models reshaped to the { name, size } form the chat UI expects.
-  const browserModelList = useMemo(
-    () => browserModels.map(m => ({ name: m.id, size: m.vramMB ? m.vramMB * 1024 * 1024 : 0, details: {} })),
-    [browserModels],
+  const markBrowserLoaded = (id) =>
+    setBrowserLoaded(prev => (prev.includes(id) ? prev : [...prev, id]));
+
+  // The two model rosters the chat picker offers: every installed Ollama model,
+  // and every in-browser model the user has loaded (cached and ready to run).
+  const ollamaModelList = useMemo(
+    () => installed.map(m => ({ ...m, provider: "ollama" })),
+    [installed],
   );
-  const chatModels = provider === "browser" ? browserModelList : installed;
-  const chatUp = provider === "browser" ? (webGPUAvailable() ? true : false) : ollamaUp;
+  const loadedBrowserList = useMemo(
+    () => browserModels
+      .filter(m => browserLoaded.includes(m.id))
+      .map(m => ({ name: m.id, provider: "browser", size: m.vramMB ? m.vramMB * 1024 * 1024 : 0 })),
+    [browserModels, browserLoaded],
+  );
 
   const loadBrowserModel = async (id) => {
-    if (loadedBrowserModel() === id) { setBrowserEngine({ modelId: id, status: "ready", progress: 1 }); return; }
+    if (loadedBrowserModel() === id) {
+      setBrowserEngine({ modelId: id, status: "ready", progress: 1 });
+      markBrowserLoaded(id);
+      return;
+    }
     setBrowserEngine({ modelId: id, status: "loading", progress: 0, text: "starting…" });
     try {
       await getBrowserEngine(id, report => setBrowserEngine(s => (s && s.modelId === id)
         ? { ...s, progress: report.progress ?? s.progress, text: report.text || s.text } : s));
       setBrowserEngine({ modelId: id, status: "ready", progress: 1, text: "loaded" });
+      markBrowserLoaded(id);
     } catch (e) {
       setBrowserEngine({ modelId: id, status: "error", error: e.message });
     }
@@ -410,7 +435,7 @@ OLLAMA_ORIGINS="${pageOrigin || "https://myapp.com"},http://localhost:3000" olla
 
       {tab === "chat" ? (
         <div style={{ flex: 1, minHeight: 0 }}>
-          <Chat key={provider} provider={provider} ollamaUrl={ollamaUrl} installed={chatModels} ollamaUp={chatUp} />
+          <Chat ollamaUrl={ollamaUrl} ollamaModels={ollamaModelList} browserModels={loadedBrowserList} ollamaUp={ollamaUp} />
         </div>
       ) : tab === "matrix" ? (
         <div style={{ flex: 1, minHeight: 0, overflowY: "auto" }}>
@@ -549,7 +574,7 @@ OLLAMA_ORIGINS="${pageOrigin || "https://myapp.com"},http://localhost:3000" olla
 
         {/* ═══ MODELS ═══ */}
         {settingsSection === "models" && provider === "browser" && (<>
-          <Box title="In-Browser Model Catalog" sub="Models download once, cache in this browser, and run fully on-device via WebGPU — no server.">
+          <Box title="In-Browser Model Catalog" sub="Pre-load a model to download it once, cache it in this browser, and run it fully on-device via WebGPU — no server. Loaded models then appear in the chat model picker.">
             {!webGPUAvailable() ? (
               <div style={{ fontSize: 12, color: C.red, lineHeight: 1.6 }}>
                 WebGPU is not available in this browser. In-browser models need a recent Chrome or Edge with WebGPU enabled.
@@ -565,6 +590,7 @@ OLLAMA_ORIGINS="${pageOrigin || "https://myapp.com"},http://localhost:3000" olla
                     <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
                       <span style={{ fontSize: 12, fontFamily: mono, fontWeight: 600 }}>{m.id}</span>
                       {loaded && <Pill color={C.green}>LOADED</Pill>}
+                      {!loaded && browserLoaded.includes(m.id) && <Pill color={C.green}>in chat picker</Pill>}
                       {m.lowResource && <Pill color={C.accent}>low-resource</Pill>}
                     </div>
                     <div style={{ fontSize: 11, color: C.dim, marginTop: 2 }}>~{fmtVram(m.vramMB)} VRAM</div>
