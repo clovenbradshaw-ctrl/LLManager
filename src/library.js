@@ -10,7 +10,7 @@
    document's graph is merged into that chat's memory projection so the model
    can draw on it. The same document can be opted into any number of chats. */
 
-const LIB_KEY = "llmanager.library.v1";
+const LIB_KEY = "llmanager.library.v2";
 
 export const loadLibrary = () => {
   try {

@@ -9,10 +9,12 @@ import {
   processImplicitSignals, runREC, shouldRunREC,
 } from "./router.js";
 import {
-  MEMORY_SYSTEM, WALK_SYSTEM,
+  MEMORY_SYSTEM, INGEST_SYSTEM, EXTRACT_SYSTEM, MUTATE_SYSTEM,
   emptyMemory, cloneMemory, memoryStats, mergeMemory, splitSentences, batchSentences,
   signal, reach, buildDossier, buildPosition, buildLibrary, buildRoster,
+  collectSpans, dossierHashOf, makeGiven, appendGiven,
   parseWalk, applyWalk,
+  detectMutationTriggers, buildMutateUser, parseMutate, makeMutation, applyMutation,
 } from "./memory.js";
 import { loadLibrary, saveLibrary, docStats } from "./library.js";
 
@@ -24,7 +26,7 @@ const C = {
   green: "#30a46c", red: "#e5484d", orange: "#f76b15",
 };
 
-const LS_KEY = "llmanager.chats.v1";
+const LS_KEY = "llmanager.chats.v2";
 const QUANT_KEY = "llmanager.quantize.v1";
 const MODE_KEY = "llmanager.chatmode.v1";
 
@@ -132,6 +134,30 @@ function MemoryPill({ mem }) {
       }}>
       <Icon name="memory" size={10} /> {txt}
     </span>
+  );
+}
+
+/* ── Mutation pill — a pending MUTATE action awaiting user consent ── */
+const MUT_LABEL = { FORK: "Fork", MERGE: "Merge", CORRECT: "Correct", RECLASSIFY: "Reclassify" };
+function MutationPill({ mut, onAccept, onDismiss }) {
+  const btn = (bg, color) => ({
+    fontSize: 10.5, fontFamily: mono, padding: "3px 10px", borderRadius: 6,
+    border: `1px solid ${color}55`, cursor: "pointer", background: bg, color, fontWeight: 600,
+  });
+  return (
+    <div title={`MUTATE — flagged by ${mut.trigger || "trigger"}${mut.triggerDetail ? ": " + mut.triggerDetail : ""}`}
+      style={{
+        display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap", margin: "6px 0 12px",
+        padding: "8px 11px", borderRadius: 9, background: C.orange + "12",
+        border: `1px solid ${C.orange}44`, fontSize: 11.5, fontFamily: mono,
+      }}>
+      <span style={{ fontWeight: 700, color: C.orange, textTransform: "uppercase", letterSpacing: 0.5 }}>
+        {MUT_LABEL[mut.action] || mut.action}
+      </span>
+      <span style={{ flex: 1, minWidth: 140, color: C.text, lineHeight: 1.5 }}>{mut.reason || "Graph change proposed."}</span>
+      <button onClick={onAccept} style={btn(C.green + "22", C.green)}>Accept</button>
+      <button onClick={onDismiss} style={btn("transparent", C.dim)}>Dismiss</button>
+    </div>
   );
 }
 
@@ -313,8 +339,10 @@ function Reasoning({ text, streaming }) {
   );
 }
 
-/* ── Prompt audit panel — the exact messages this reply was given ── */
-function PromptView({ prompt }) {
+/* ── Prompt audit panel — the exact messages this reply was given, plus the
+   underlying evidence spans the projected dossier was built from. The model
+   sees the distilled hypotheses; the spans expose where they came from. ── */
+function PromptView({ prompt, spans, dossierHash }) {
   const [open, setOpen] = useState(false);
   if (!prompt || !prompt.length) return null;
   const chars = prompt.reduce((n, m) => n + (m.content || "").length, 0);
@@ -327,7 +355,7 @@ function PromptView({ prompt }) {
       }}>
         <Icon name="eye" size={11} />
         {open ? "Hide prompt" : "View prompt sent"}
-        <span style={{ color: C.dim }}>· {prompt.length} msg · {chars} chars</span>
+        <span style={{ color: C.dim }}>· {prompt.length} msg · {chars} chars{spans?.length ? ` · ${spans.length} spans` : ""}</span>
       </button>
       {open && (
         <div style={{
@@ -335,13 +363,28 @@ function PromptView({ prompt }) {
           borderRadius: 8,
         }}>
           {prompt.map((m, i) => (
-            <div key={i} style={{ marginBottom: i < prompt.length - 1 ? 10 : 0 }}>
+            <div key={i} style={{ marginBottom: 10 }}>
               <div style={{ fontFamily: mono, fontSize: 9.5, fontWeight: 700, letterSpacing: 0.5,
                 textTransform: "uppercase", color: C.accent, marginBottom: 3 }}>{m.role}</div>
               <div style={{ fontFamily: mono, fontSize: 11.5, lineHeight: 1.6, color: C.dim,
                 whiteSpace: "pre-wrap", wordBreak: "break-word" }}>{m.content}</div>
             </div>
           ))}
+          {spans && spans.length > 0 && (
+            <div style={{ borderTop: `1px solid ${C.border}`, paddingTop: 8 }}>
+              <div style={{ fontFamily: mono, fontSize: 9.5, fontWeight: 700, letterSpacing: 0.5,
+                textTransform: "uppercase", color: C.accent, marginBottom: 5 }}>
+                Source spans{dossierHash ? ` · ${dossierHash}` : ""}
+              </div>
+              {spans.map((s, i) => (
+                <div key={i} style={{ fontFamily: mono, fontSize: 11, lineHeight: 1.55, color: C.dim,
+                  marginBottom: 4, whiteSpace: "pre-wrap", wordBreak: "break-word" }}>
+                  <span style={{ color: C.accent }}>{s.source || "—"}</span>
+                  {" "}<span style={{ color: C.dim, opacity: 0.7 }}>[{s.entity}]</span> {s.text}
+                </div>
+              ))}
+            </div>
+          )}
         </div>
       )}
     </div>
@@ -426,7 +469,7 @@ function MessageBubble({ msg, prevModel, onCopy, copied, onRerun, onFork, busy, 
         </div>
       )}
       {!msg.streaming && msg.prompt && (
-        <div style={{ paddingLeft: 13 }}><PromptView prompt={msg.prompt} /></div>
+        <div style={{ paddingLeft: 13 }}><PromptView prompt={msg.prompt} spans={msg.spans} dossierHash={msg.dossierHash} /></div>
       )}
     </div>
   );
@@ -831,13 +874,20 @@ export default function Chat({ ollamaUrl, installed, ollamaUp, provider = "ollam
   const memorySystemPrompt = (convo, sig) => {
     const projected = combinedMemory(convo);
     const entities = reach(sig, projected);
+    const dossier = buildDossier(entities, projected);
     const parts = [
       MEMORY_SYSTEM,
-      buildDossier(entities, projected),
+      dossier,
       buildLibrary(attachedDocs(convo)),
       buildPosition((convo?.memory || emptyMemory()).lastTurn),
     ].filter(Boolean);
-    return { content: parts.join("\n\n"), used: entities.length, entities };
+    return {
+      content: parts.join("\n\n"),
+      used: entities.length,
+      entities,
+      dossierHash: dossierHashOf(dossier),
+      spans: collectSpans(entities, projected),
+    };
   };
 
   /* Switch the active chat's mode (or just the default for the next new chat).
@@ -1034,32 +1084,66 @@ export default function Chat({ ollamaUrl, installed, ollamaUp, provider = "ollam
     return null;
   };
 
-  /* Background memory walk — read a completed turn into the chat's graph
-     against its current roster of sites, and refresh the position marker. */
-  const runMemoryExtract = async (convoId, msgId, userMessage, response, model, memCtx) => {
+  /* The MUTATE call — background, fired only when a mechanical trigger flags
+     an ambiguity. Produces exactly one action; FORK/MERGE/CORRECT/RECLASSIFY
+     land as a pending mutation needing user consent (auto-commit tier PROMPT),
+     NONE is logged silently. `snapshot` is the post-Extract graph. */
+  const runMutate = async (convoId, msgId, trigger, model, snapshot) => {
+    let mut = null;
+    try {
+      const out = await chatOnce(model, [
+        { role: "system", content: MUTATE_SYSTEM },
+        { role: "user", content: buildMutateUser(snapshot || emptyMemory(), trigger) },
+      ]);
+      const parsed = parseMutate(out);
+      if (parsed) mut = makeMutation(parsed, { trigger, msgId });
+    } catch { /* fail silently — the turn already succeeded */ }
+    if (!mut) return;
+    setConvos(prev => prev.map(c => {
+      if (c.id !== convoId) return c;
+      const memory = cloneMemory(c.memory);
+      memory.mutations.push(mut);
+      return { ...c, memory };
+    }));
+  };
+
+  /* The EXTRACT call — background, reads a completed turn into the chat's
+     graph. The exchange is labelled with its Given-Log ids; both messages are
+     appended to the Given-Log. After applying, mechanical triggers are checked
+     and a MUTATE call is fired for each ambiguity found. */
+  const runExtract = async (convoId, msgId, userGiven, modelGiven, model, memCtx) => {
     let ops = [];
     try {
       const convo = convos.find(c => c.id === convoId);
       const out = await chatOnce(model, [
-        { role: "system", content: WALK_SYSTEM },
-        { role: "user", content: `${buildRoster(convo?.memory)}\n\nPASSAGE:\nUser: ${userMessage.slice(0, 4000)}\nAssistant: ${response.slice(0, 4000)}` },
+        { role: "system", content: EXTRACT_SYSTEM },
+        { role: "user", content: `${buildRoster(convo?.memory)}\n\nEXCHANGE:\n`
+          + `User [${userGiven.id}]: "${userGiven.text.slice(0, 4000)}"\n`
+          + `Model [${modelGiven.id}]: "${modelGiven.text.slice(0, 4000)}"` },
       ]);
       ops = parseWalk(out);
     } catch { /* fail silently — the turn already succeeded */ }
 
-    let learned = 0;
+    let learned = 0, triggers = [], snapshot = null;
     setConvos(prev => prev.map(c => {
       if (c.id !== convoId) return c;
       const memory = cloneMemory(c.memory);
-      learned = applyWalk(memory, ops);
+      memory.givenLog.push({ ...userGiven }, { ...modelGiven });
+      const res = applyWalk(memory, ops, { source: userGiven.id });
+      learned = res.applied;
       memory.lastTurn = {
         entities: (memCtx.entities || []).map(e => e.canonical),
         topic: (memCtx.sig?.keywords || []).slice(0, 3).join(" "),
-        userMessage: userMessage.slice(0, 100),
+        userMessage: userGiven.text.slice(0, 100),
       };
+      triggers = detectMutationTriggers({
+        memory, userMessage: userGiven.text, modelResponse: modelGiven.text, ambigs: res.ambigs,
+      });
+      snapshot = memory;
       return { ...c, memory };
     }));
     patchMsg(convoId, msgId, m => ({ mem: { ...(m.mem || {}), learned } }));
+    for (const t of triggers) runMutate(convoId, msgId, t, model, snapshot);
   };
 
   /* Read a block of text into a library document with a stateful walk: split
@@ -1101,16 +1185,23 @@ export default function Chat({ ollamaUrl, installed, ollamaUp, provider = "ollam
     setIngestRunning(true);
     sync();
 
-    const docMem = { entities: {}, edges: {}, defs: {} };
+    const docMem = emptyMemory();
+    const docGiven = appendGiven(docMem, makeGiven({
+      agent: "system:ingest", text: title || source || "pasted text",
+    }));
+    const allAmbigs = [];
     for (let i = 0; i < passages.length; i++) {
       trace[i].status = "reading"; sync();
       try {
         const out = await chatOnce(model, [
-          { role: "system", content: WALK_SYSTEM },
+          { role: "system", content: INGEST_SYSTEM },
           { role: "user", content: `${buildRoster(docMem)}\n\nPASSAGE:\n${passages[i]}` },
         ]);
         const ops = parseWalk(out);
-        trace[i].applied = applyWalk(docMem, ops);
+        const res = applyWalk(docMem, ops, { source: docGiven.id });
+        trace[i].applied = res.applied;
+        trace[i].ambigs = res.ambigs;
+        allAmbigs.push(...res.ambigs);
         trace[i].rawOutput = out;
         trace[i].ops = ops;
         trace[i].status = "done";
@@ -1120,6 +1211,25 @@ export default function Chat({ ollamaUrl, installed, ollamaUp, provider = "ollam
       }
       sync();
     }
+
+    // Each AMBIG the ingest emitted fires a MUTATE call for a clean decision.
+    const docMutations = [];
+    for (const a of allAmbigs) {
+      const trigger = { kind: "ambig", target: a.candidate, name: a.name, detail: a.span || a.name };
+      try {
+        const out = await chatOnce(model, [
+          { role: "system", content: MUTATE_SYSTEM },
+          { role: "user", content: buildMutateUser(docMem, trigger) },
+        ]);
+        const parsed = parseMutate(out);
+        if (parsed) {
+          const mut = makeMutation(parsed, { trigger });
+          mut.docId = docId;
+          docMutations.push(mut);
+        }
+      } catch { /* fail silently — the document was still read */ }
+    }
+    docMem.mutations.push(...docMutations);
 
     const learned = trace.reduce((n, t) => n + (t.applied || 0), 0);
     const doc = {
@@ -1133,12 +1243,17 @@ export default function Chat({ ollamaUrl, installed, ollamaUp, provider = "ollam
       trace: trace.map(t => ({
         index: t.index, chars: t.chars, status: t.status, applied: t.applied,
         signal: { names: t.signal.ner.names, dates: t.signal.ner.dates, keywords: t.signal.keywords },
-        ops: t.ops, rawOutput: t.rawOutput,
+        ops: t.ops, ambigs: t.ambigs || [], rawOutput: t.rawOutput,
       })),
     };
     setLibrary(prev => [doc, ...prev]);
-    setConvos(prev => prev.map(c => c.id === convoId
-      ? { ...c, docs: [...(c.docs || []), docId], updatedAt: Date.now() } : c));
+    const pendingDocMuts = docMutations.filter(m => m.status === "pending");
+    setConvos(prev => prev.map(c => {
+      if (c.id !== convoId) return c;
+      const memory = cloneMemory(c.memory);
+      memory.mutations.push(...pendingDocMuts);
+      return { ...c, docs: [...(c.docs || []), docId], memory, updatedAt: Date.now() };
+    }));
     setIngestRunning(false);
   };
 
@@ -1177,6 +1292,9 @@ export default function Chat({ ollamaUrl, installed, ollamaUp, provider = "ollam
         reasoning: m.reasoning || undefined, elapsed: m.elapsed, tokens: m.tokens,
         routing: m.routing || undefined, memory: m.mem || undefined,
         promptSent: m.prompt || undefined,
+        givenId: m.givenId || undefined,
+        dossierHash: m.dossierHash || undefined,
+        spans: m.spans || undefined,
       })),
       memory: c.memory || undefined,
       library: attached.map(d => ({
@@ -1255,7 +1373,7 @@ export default function Chat({ ollamaUrl, installed, ollamaUp, provider = "ollam
         { role: "system", content: sys.content },
         { role: "user", content: text },
       ];
-      memCtx = { sig, entities: sys.entities };
+      memCtx = { sig, entities: sys.entities, dossierHash: sys.dossierHash, spans: sys.spans };
       memBadge = { used: sys.used };
     } else {
       const apiHistory = quantize ? quantizeHistory(history) : history;
@@ -1264,7 +1382,11 @@ export default function Chat({ ollamaUrl, installed, ollamaUp, provider = "ollam
 
     const userMsg = { id: "u" + Date.now(), role: "user", content: text };
     const aId = "a" + Date.now();
-    const placeholder = { id: aId, role: "assistant", model: chosenModel, content: "", streaming: true, routing, mem: memBadge, prompt: apiMessages };
+    const placeholder = {
+      id: aId, role: "assistant", model: chosenModel, content: "", streaming: true,
+      routing, mem: memBadge, prompt: apiMessages,
+      dossierHash: memCtx?.dossierHash, spans: memCtx?.spans,
+    };
     setConvos(prev => prev.map(c => {
       if (c.id !== convoId) return c;
       const base = evalDoneIds.size
@@ -1279,8 +1401,16 @@ export default function Chat({ ollamaUrl, installed, ollamaUp, provider = "ollam
     maybeREC();
 
     // Background: read every memory-mode turn back into the chat's graph.
+    // Both messages are recorded in the Given-Log with content hashes; the
+    // model entry carries the dossier projection that produced it.
     if (mode === "memory" && memCtx && finalContent) {
-      runMemoryExtract(convoId, aId, text, finalContent, chosenModel, memCtx);
+      const userGiven = makeGiven({ agent: "user", text });
+      const modelGiven = makeGiven({
+        agent: "model:" + chosenModel, text: finalContent,
+        dossierHash: memCtx.dossierHash, spans: memCtx.spans,
+      });
+      patchMsg(convoId, aId, { givenId: modelGiven.id });
+      runExtract(convoId, aId, userGiven, modelGiven, chosenModel, memCtx);
     }
   };
 
@@ -1361,6 +1491,31 @@ export default function Chat({ ollamaUrl, installed, ollamaUp, provider = "ollam
     maybeREC();
   };
 
+  /* Accept or dismiss a pending MUTATE action. Accepting applies it to the
+     graph it belongs to — the chat's own memory, or a library document's
+     graph when the mutation came from ingest. */
+  const resolveMutation = (mutId, accept) => {
+    if (!active) return;
+    const mut = (active.memory?.mutations || []).find(m => m.id === mutId);
+    if (!mut) return;
+    if (accept && mut.docId) {
+      setLibrary(prev => prev.map(d => {
+        if (d.id !== mut.docId) return d;
+        const memory = cloneMemory(d.memory);
+        applyMutation(memory, mut);
+        return { ...d, memory };
+      }));
+    }
+    setConvos(prev => prev.map(c => {
+      if (c.id !== active.id) return c;
+      const memory = cloneMemory(c.memory);
+      if (accept && !mut.docId) applyMutation(memory, mut);
+      memory.mutations = memory.mutations.map(m =>
+        m.id === mutId ? { ...m, status: accept ? "accepted" : "dismissed" } : m);
+      return { ...c, memory };
+    }));
+  };
+
   const handleWrongModel = (msgId, altModel) => {
     setWrongModelFor(null);
     if (!active || !altModel) return;
@@ -1382,6 +1537,11 @@ export default function Chat({ ollamaUrl, installed, ollamaUp, provider = "ollam
 
   const memStats = mode === "memory" ? memoryStats(combinedMemory(active)) : null;
   const docCount = active?.docs?.length || 0;
+
+  /* Pending MUTATE actions awaiting consent. Those tied to a message render
+     inline beneath it; the rest (e.g. from ingest) render after the thread. */
+  const pendingMuts = (active?.memory?.mutations || []).filter(m => m.status === "pending");
+  const orphanMuts = pendingMuts.filter(m => !m.msgId || !messages.some(x => x.id === m.msgId));
 
   return (
     <div style={{ display: "flex", height: "100%", width: "100%", background: C.bg, fontFamily: sans, color: C.text }}>
@@ -1447,17 +1607,30 @@ export default function Chat({ ollamaUrl, installed, ollamaUp, provider = "ollam
               messages.map((m, i) => {
                 const prevAi = [...messages.slice(0, i)].reverse().find(x => x.role === "assistant");
                 const userMsgsAfter = messages.slice(i + 1).filter(x => x.role === "user").length;
+                const msgMuts = pendingMuts.filter(x => x.msgId === m.id);
                 return (
-                  <MessageBubble
-                    key={m.id || i} msg={m} prevModel={prevAi?.model}
-                    onCopy={copy} copied={copied} onRerun={rerun} onFork={forkConvo} busy={busy}
-                    installed={installed} userMsgsAfter={userMsgsAfter}
-                    onFeedback={handleFeedback} onWrongModel={handleWrongModel}
-                    wrongModelFor={wrongModelFor} setWrongModelFor={setWrongModelFor}
-                  />
+                  <div key={m.id || i}>
+                    <MessageBubble
+                      msg={m} prevModel={prevAi?.model}
+                      onCopy={copy} copied={copied} onRerun={rerun} onFork={forkConvo} busy={busy}
+                      installed={installed} userMsgsAfter={userMsgsAfter}
+                      onFeedback={handleFeedback} onWrongModel={handleWrongModel}
+                      wrongModelFor={wrongModelFor} setWrongModelFor={setWrongModelFor}
+                    />
+                    {msgMuts.map(mut => (
+                      <MutationPill key={mut.id} mut={mut}
+                        onAccept={() => resolveMutation(mut.id, true)}
+                        onDismiss={() => resolveMutation(mut.id, false)} />
+                    ))}
+                  </div>
                 );
               })
             )}
+            {orphanMuts.map(mut => (
+              <MutationPill key={mut.id} mut={mut}
+                onAccept={() => resolveMutation(mut.id, true)}
+                onDismiss={() => resolveMutation(mut.id, false)} />
+            ))}
           </div>
         </div>
 
