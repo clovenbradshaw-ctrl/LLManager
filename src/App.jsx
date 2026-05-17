@@ -84,6 +84,7 @@ const Box = ({ title, sub, children }) => (
 
 export default function App() {
   const [tab, setTab] = useState("chat");
+  const [settingsSection, setSettingsSection] = useState("connection");
   const [matrixSession, setMatrixSession] = useState(loadSession);
   const [gateDone, setGateDone] = useState(
     () => !!loadSession() || localStorage.getItem(GATE_SKIP_KEY) === "1",
@@ -338,7 +339,7 @@ OLLAMA_ORIGINS="${pageOrigin || "https://myapp.com"},http://localhost:3000" olla
           </div>
         </div>
         <div style={{ display: "flex", gap: 6 }}>
-          {["chat", "matrix", "models", "optimize", "connect"].map(t => (
+          {["chat", "matrix", "settings"].map(t => (
             <button key={t} onClick={() => setTab(t)} style={{
               padding: "7px 16px", fontSize: 12, fontWeight: 600, borderRadius: 8, cursor: "pointer", textTransform: "capitalize",
               border: `1px solid ${tab === t ? C.accent : C.border}`, background: tab === t ? C.accent : "transparent", color: tab === t ? "#fff" : C.dim,
@@ -367,8 +368,20 @@ OLLAMA_ORIGINS="${pageOrigin || "https://myapp.com"},http://localhost:3000" olla
       <div style={{ flex: 1, overflowY: "auto" }}>
       <div style={{ padding: "16px 20px", maxWidth: 820, margin: "0 auto" }}>
 
-        {/* ═══ STATUS ═══ */}
-        {tab === "status" && (<>
+        {/* ═══ SETTINGS — sub-nav ═══ */}
+        <div style={{ display: "flex", gap: 6, marginBottom: 14, flexWrap: "wrap" }}>
+          {[["connection", "Connection"], ["models", "Models"], ["optimize", "Optimize"], ["connect", "Connect"]].map(([id, label]) => (
+            <button key={id} onClick={() => setSettingsSection(id)} style={{
+              padding: "6px 14px", fontSize: 11.5, fontWeight: 600, borderRadius: 7, cursor: "pointer",
+              border: `1px solid ${settingsSection === id ? C.accent : C.border}`,
+              background: settingsSection === id ? "rgba(110,86,207,.18)" : "transparent",
+              color: settingsSection === id ? C.text : C.dim,
+            }}>{label}</button>
+          ))}
+        </div>
+
+        {/* ═══ CONNECTION ═══ */}
+        {settingsSection === "connection" && (<>
           <Box title="Hardware" sub="Browser-reported — approximate for some values">
             {hw && (
               <div style={{ fontFamily: mono, fontSize: 12, lineHeight: 2, color: C.dim }}>
@@ -476,7 +489,7 @@ OLLAMA_ORIGINS="${pageOrigin || "https://myapp.com"},http://localhost:3000" olla
         </>)}
 
         {/* ═══ MODELS ═══ */}
-        {tab === "models" && (<>
+        {settingsSection === "models" && (<>
           <Box title="Model Catalog" sub={ramGB ? `~${ramGB} GB detected → ~${(ramGB * .75).toFixed(0)} GB usable for models` : "RAM not exposed by browser — check terminal"}>
             {!ramGB && <div style={{ marginBottom: 12 }}><CopyBlock copy={copy} copied={copied} id="ram" text='sysctl -n hw.memsize | awk "{print $1/1073741824\" GB\"}"' label="Check actual RAM" /></div>}
             {MODEL_CATALOG.map(m => {
@@ -521,7 +534,7 @@ OLLAMA_ORIGINS="${pageOrigin || "https://myapp.com"},http://localhost:3000" olla
         </>)}
 
         {/* ═══ OPTIMIZE ═══ */}
-        {tab === "optimize" && (() => {
+        {settingsSection === "optimize" && (() => {
           const tone = { best: C.green, ok: C.accent, warn: C.orange, bad: C.red };
           const serverEnv = `# Keep models warm across requests (default 5m)
 launchctl setenv OLLAMA_KEEP_ALIVE 24h
@@ -568,7 +581,7 @@ ollama serve`;
 
             <Box title="Keep models warm" sub="Cold-loading a model into GPU memory can take 30s+. Keep it resident between requests.">
               <div style={{ fontSize: 12, color: C.dim, lineHeight: 1.6, marginBottom: 10 }}>
-                Use the keep-alive selector on the <strong style={{ color: C.text }}>Status</strong> tab to load a model
+                Use the keep-alive selector on the <strong style={{ color: C.text }}>Connection</strong> section to load a model
                 and pin it in memory. To make Ollama keep every model warm by default, set the env var below.
               </div>
               <CopyBlock copy={copy} copied={copied} id="opt-env" text={serverEnv} label="Server tuning — paste into terminal" />
@@ -601,7 +614,7 @@ ollama serve`;
         })()}
 
         {/* ═══ CONNECT ═══ */}
-        {tab === "connect" && (<>
+        {settingsSection === "connect" && (<>
           <Box title="Connect Other Browser Apps" sub="Any web app running locally can call your Ollama models directly via fetch. Copy these snippets into your app code.">
             <div style={{ fontSize: 12, color: C.dim, lineHeight: 1.6, marginBottom: 14 }}>
               Ollama exposes an <strong style={{ color: C.text }}>OpenAI-compatible API</strong> at <code style={{ fontFamily: mono, color: C.accent }}>{ollamaUrl}/v1/chat/completions</code>.
@@ -619,7 +632,7 @@ ollama serve`;
                 ))}
               </>
             ) : (
-              <div style={{ fontSize: 12, color: C.orange }}>No models installed. Pull one from the Models tab first.</div>
+              <div style={{ fontSize: 12, color: C.orange }}>No models installed. Pull one from Settings → Models first.</div>
             )}
 
             {model && (<>

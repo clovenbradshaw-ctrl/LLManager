@@ -690,7 +690,7 @@ function LibraryModal({ open, onClose, library, activeConvo, canIngest,
           </div>
           {!canIngest && (
             <div style={{ fontSize: 10.5, color: C.orange, marginTop: 6 }}>
-              No model available — pull one from the Models tab first.
+              No model available — pull one from Settings → Models first.
             </div>
           )}
 
@@ -992,7 +992,7 @@ export default function Chat({ ollamaUrl, installed, ollamaUp }) {
     }
     patchMsg(convoId, msgId, {
       streaming: false, error: true,
-      content: `Could not reach Ollama: ${lastErr?.message}\n\nMake sure Ollama is running and that this page's origin is allowed — see the Status tab.`,
+      content: `Could not reach Ollama: ${lastErr?.message}\n\nMake sure Ollama is running and that this page's origin is allowed — see Settings → Connection.`,
     });
     abortRef.current = null;
     return null;
@@ -1384,8 +1384,8 @@ export default function Chat({ ollamaUrl, installed, ollamaUp }) {
         {offline && (
           <div style={{ margin: "12px 24px 0", padding: "10px 14px", background: C.red + "12", border: `1px solid ${C.red}40`, borderRadius: 8, fontSize: 12, color: C.red }}>
             {ollamaUp === "cors"
-              ? "Ollama is running but is blocking this page. Open the Status tab to fix the allowed origins."
-              : "Ollama is not reachable. Open the Status tab for setup steps."}
+              ? "Ollama is running but is blocking this page. Open Settings → Connection to fix the allowed origins."
+              : "Ollama is not reachable. Open Settings → Connection for setup steps."}
           </div>
         )}
 
@@ -1400,7 +1400,7 @@ export default function Chat({ ollamaUrl, installed, ollamaUp }) {
                   <div style={{ fontSize: 20, fontWeight: 600, marginBottom: 8 }}>Start a new chat</div>
                   <div style={{ fontSize: 13, color: C.dim, lineHeight: 1.6 }}>
                     {!modelNames.length
-                      ? "No models installed yet. Pull one from the Models tab first."
+                      ? "No models installed yet. Pull one from Settings → Models first."
                       : mode === "memory"
                         ? "Memory mode is on. Every turn is distilled into a per-chat graph and replayed as a fixed-size context block, so the prompt never grows with the conversation. Use Library in the header to read documents into memory. Switch back to Regular in the header."
                         : "Pick a model below and ask anything. You can switch models mid-conversation — each reply is labelled with the model that produced it. Try Memory mode in the header for a chat whose prompt never grows."}
