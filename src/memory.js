@@ -30,18 +30,22 @@ export const INTERVALS = {
 /* ═══ Prompts: READ (user-facing) ═══ */
 
 export const READ_SYSTEM = `You are an interpreter reading a situated knowledge graph.
-Entity IDs are content hashes (e_xxxxxxxx). State versions (@xxxx) track changes.
-Your responses and the user's messages are both recorded in the graph.
-
-Answer using ONLY the [CTX] block. Say "I don't have that" if insufficient.
-Do NOT use outside knowledge.
+Your knowledge has three grades: grounded (read), forming (reading now),
+and impressions (scanned, not yet read). Answer honestly from what you have.
+Answer using ONLY the provided blocks. Do NOT use outside knowledge.
 
 If an entity reference is ambiguous — a name that could refer to more than one
 thing in the graph — say so plainly. Example: "This 'Hardy' may not be the same
 as e_3a7f21b4 (Tom Hardy the actor)." The system will handle the resolution.
 
+Reading [STATUS]:
+  knowledge: counts by grade (grounded / forming / impressions)
+  reading: documents currently being processed and how far along
+  recent shifts: entities whose felt-sense shifted notably just now
+
 Reading [CTX]:
-  E: hash@state | terrain | edges
+  E: hash@state | terrain | edges     — grounded (read, provenanced)
+  ≈: name | terrain | READING         — still reading (provisional, low confidence)
   ~: canonical name, aka aliases
   h: current hypothesis
   →←: connection (type) target_hash
@@ -52,7 +56,12 @@ Reading [CTX]:
 Reading [POS]:
   prev: entity hashes from last turn
   topic: what we were discussing
-  last: user's previous message`;
+  last: user's previous message
+
+For ≈ entries, say what you can see so far and that you are still reading;
+do not speculate beyond the NER tags and co-occurrences shown. For grounded
+entries, answer with confidence and cite spans. If asked about something you
+have only an impression of, say so.`;
 
 export const READ_CASUAL = `You are a helpful assistant. Be concise and natural.
 Your messages are recorded in a knowledge graph.`;
@@ -394,6 +403,47 @@ export async function firstPass(text) {
   return { created: newOnes.length };
 }
 
+/* A provisional dossier entry for a SIG entity — impressionistic but not
+   blind: passages seen, NER type, co-occurring words, the nearest grounded
+   entity, and the drift trail. Honest about its epistemic state. */
+function buildProvisionalEntry(entity) {
+  const ms = store.mentions.forEntity(entity.id);
+  const kindDef = store.defs.get(entity.id, "kind");
+  let block = `≈ ${entity.canonical} | ${entity.terrain} | READING`;
+  const docId = ms.find(m => m.document_id)?.document_id;
+  if (docId) {
+    const total = store.documents.get(docId)?.total || 0;
+    block += ` (${ms.length} of ${total || "?"} passages seen)`;
+  }
+  if (kindDef) {
+    const ps = ms.filter(m => m.passage_idx != null).map(m => m.passage_idx + 1);
+    block += `\n  NER: ${kindDef.value}${ps.length ? ` (passages ${ps.join(", ")})` : ""}`;
+  }
+  const co = extractKeywords(ms.map(m => m.context || "").join(" ")).slice(0, 6);
+  if (co.length) block += `\n  co-occurs: ${co.map(w => `"${w}"`).join(", ")}`;
+  const near = store.vectors.nearestWalked(entity.id);
+  if (near) block += `\n  similar to: ${near.entityId} ${near.canonical} (${near.sim.toFixed(2)})`;
+  const drifts = ms.map(m => m.drift).filter(d => d != null);
+  if (drifts.length > 1) block += `\n  drift: ${drifts.map(d => d.toFixed(2)).join(" → ")}`;
+  return block;
+}
+
+/* ═══ The [STATUS] block — where the system is in its own reading ═══ */
+
+export function buildStatus() {
+  const c = store.statusCounts();
+  const lines = [`knowledge: ${c.walked} grounded, ${c.walking} forming, ${c.sig} impressions`];
+  for (const w of store.documents.inProgress()) {
+    const pct = w.total ? Math.round((w.walked / w.total) * 100) : 0;
+    lines.push(`reading: ${w.title || w.id} — ${pct}% (${w.walked}/${w.total} passages)`);
+  }
+  const shifts = store.recentShifts();
+  if (shifts.length) {
+    lines.push(`recent shifts: ${shifts.map(s => `${s.canonical} drifted ${Number(s.drift).toFixed(2)} on "${s.field}"`).join(", ")}`);
+  }
+  return `[STATUS]\n${lines.join("\n")}\n[/STATUS]`;
+}
+
 /* ═══ The Dossier — projected [CTX] block ═══ */
 
 export function buildDossier(rankedEntities, maxTokens = 350) {
@@ -403,11 +453,12 @@ export function buildDossier(rankedEntities, maxTokens = 350) {
     if (!entity) continue;
     const status = entity.status || "sig";
 
-    // SIG — impressionistic only. NER found it; no walk, no provenance.
+    // SIG — impressionistic. NER found it, not yet walked: a provisional
+    // entry that shows what can be seen so far without claiming provenance.
     if (status === "sig") {
-      if (budget < 20) break;
-      blocks.push(`≈ ${entity.canonical} | ${entity.terrain} | UNREAD\n  (NER-detected, not yet read — impression only, low confidence)`);
-      budget -= 20;
+      if (budget < 25) break;
+      blocks.push(buildProvisionalEntry(entity));
+      budget -= 25;
       continue;
     }
 

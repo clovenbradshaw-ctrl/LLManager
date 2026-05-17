@@ -66,9 +66,19 @@ async function getEmbedder() {
   return embedder;
 }
 
+/* Race a promise against a timeout so a stalled model load or inference
+   surfaces as an error the caller can handle, never an unbounded hang. */
+function withTimeout(promise, ms, label) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => setTimeout(() => reject(new Error(`${label} timed out`)), ms)),
+  ]);
+}
+
 export async function embed(text) {
-  const model = await getEmbedder();
-  const out = await model(String(text || ""), { pooling: "mean", normalize: true });
+  const model = await withTimeout(getEmbedder(), 120000, "embedding model load");
+  const out = await withTimeout(
+    model(String(text || ""), { pooling: "mean", normalize: true }), 30000, "embed");
   return new Float32Array(out.data);
 }
 
@@ -176,6 +186,31 @@ const SCHEMA = `
     PRIMARY KEY (scope, id)
   );
 
+  -- SIG-level mentions: one row per (entity, passage) the first-pass NER
+  -- scan saw, with the passage context and the drift it caused. The raw
+  -- material of a provisional dossier entry. Pruned once the entity walks.
+  CREATE TABLE IF NOT EXISTS sig_mentions (
+    scope       TEXT NOT NULL,
+    entity_id   TEXT NOT NULL,
+    document_id TEXT,
+    passage_idx INTEGER,
+    given_id    TEXT,
+    context     TEXT,
+    drift       REAL,
+    created_at  INTEGER NOT NULL
+  );
+
+  -- Documents being walked, with reading progress for the [STATUS] block.
+  CREATE TABLE IF NOT EXISTS documents (
+    scope       TEXT NOT NULL,
+    id          TEXT NOT NULL,
+    title       TEXT,
+    total       INTEGER NOT NULL DEFAULT 0,
+    walked      INTEGER NOT NULL DEFAULT 0,
+    created_at  INTEGER NOT NULL,
+    PRIMARY KEY (scope, id)
+  );
+
   CREATE TABLE IF NOT EXISTS vec_centroids (
     scope       TEXT NOT NULL,
     entity_id   TEXT NOT NULL,
@@ -203,6 +238,8 @@ const SCHEMA = `
   CREATE INDEX IF NOT EXISTS idx_hyp_target    ON hypotheses(scope, level, target_id);
   CREATE INDEX IF NOT EXISTS idx_vec_unwalked ON vec_unwalked(scope);
   CREATE INDEX IF NOT EXISTS idx_entities_terrain ON entities(scope, terrain);
+  CREATE INDEX IF NOT EXISTS idx_entities_status ON entities(scope, status);
+  CREATE INDEX IF NOT EXISTS idx_sig_mentions ON sig_mentions(scope, entity_id);
 `;
 
 /* ── Vector ↔ BLOB ── */
@@ -272,7 +309,10 @@ export const entities = {
     db.exec({ sql: "UPDATE entities SET status=?, updated_at=? WHERE scope=? AND id=?", bind: [status, Date.now(), scope, id] });
   },
   markWalked(ids) {
-    for (const id of ids || []) entities.setStatus(id, "walked");
+    for (const id of ids || []) {
+      entities.setStatus(id, "walked");
+      mentions.prune(id); // SIG scaffolding superseded by the grounded entity
+    }
   },
   updateTerrain(id, terrain) {
     db.exec({ sql: "UPDATE entities SET terrain=?, updated_at=? WHERE scope=? AND id=?", bind: [terrain, Date.now(), scope, id] });
@@ -453,6 +493,61 @@ export const mutations = {
   },
 };
 
+/* ── SIG mentions — the raw material of a provisional dossier entry ── */
+
+export const mentions = {
+  record(entityId, { documentId = null, passageIdx = null, givenId = null, context = null, drift = null } = {}) {
+    db.exec({
+      sql: `INSERT INTO sig_mentions (scope,entity_id,document_id,passage_idx,given_id,context,drift,created_at)
+            VALUES (?,?,?,?,?,?,?,?)`,
+      bind: [scope, entityId, documentId, passageIdx, givenId, context, drift, Date.now()],
+    });
+  },
+  forEntity(entityId) {
+    return db.selectObjects("SELECT * FROM sig_mentions WHERE scope=? AND entity_id=? ORDER BY created_at", [scope, entityId]);
+  },
+  prune(entityId) {
+    db.exec({ sql: "DELETE FROM sig_mentions WHERE scope=? AND entity_id=?", bind: [scope, entityId] });
+  },
+};
+
+/* ── Documents — reading progress, for the [STATUS] block ── */
+
+export const documents = {
+  register(id, title, total) {
+    db.exec({
+      sql: "INSERT OR REPLACE INTO documents (scope,id,title,total,walked,created_at) VALUES (?,?,?,?,?,?)",
+      bind: [scope, id, title || "document", total || 0, 0, Date.now()],
+    });
+  },
+  setWalked(id, n) {
+    db.exec({ sql: "UPDATE documents SET walked=? WHERE scope=? AND id=?", bind: [n, scope, id] });
+  },
+  inProgress() {
+    return db.selectObjects("SELECT * FROM documents WHERE scope=? AND walked < total ORDER BY created_at", [scope]);
+  },
+  get(id) {
+    return db.selectObject("SELECT * FROM documents WHERE scope=? AND id=?", [scope, id]);
+  },
+};
+
+/* ── Reading state, for the [STATUS] block ── */
+
+export function statusCounts() {
+  const rows = db.selectObjects("SELECT status, COUNT(*) AS n FROM entities WHERE scope=? GROUP BY status", [scope]);
+  const get = (s) => rows.find(r => r.status === s)?.n || 0;
+  return { sig: get("sig"), walking: get("walking"), walked: get("walked") };
+}
+
+export function recentShifts(sinceMs = 5 * 60 * 1000, limit = 3) {
+  return db.selectObjects(`
+    SELECT d.entity_id, e.canonical, d.drift, d.field FROM defs d
+    JOIN entities e ON d.entity_id = e.id AND e.scope = d.scope
+    WHERE d.scope=? AND d.drift > 0.15 AND d.created_at > ?
+    ORDER BY d.created_at DESC LIMIT ?`,
+    [scope, Date.now() - sinceMs, limit]);
+}
+
 /* ── Embeddings ── */
 
 export const vectors = {
@@ -520,6 +615,23 @@ export const vectors = {
     return db.selectObjects("SELECT entity_id, vector FROM vec_centroids WHERE scope=?", [scope])
       .map(r => ({ entityId: r.entity_id, similarity: cosineSim(qv, toVec(r.vector)) }))
       .sort((a, b) => b.similarity - a.similarity).slice(0, topK);
+  },
+  /* The nearest walked (grounded) entity to a SIG entity's centroid —
+     "this impression looks like something we already know." */
+  nearestWalked(entityId, floor = 0.5) {
+    const row = db.selectObject("SELECT vector FROM vec_centroids WHERE scope=? AND entity_id=?", [scope, entityId]);
+    if (!row) return null;
+    const v = toVec(row.vector);
+    const walked = db.selectObjects(`
+      SELECT c.entity_id, c.vector, e.canonical FROM vec_centroids c
+      JOIN entities e ON c.entity_id = e.id AND e.scope = c.scope
+      WHERE c.scope=? AND e.status='walked'`, [scope]);
+    let best = null;
+    for (const w of walked) {
+      const s = cosineSim(v, toVec(w.vector));
+      if (!best || s > best.sim) best = { entityId: w.entity_id, canonical: w.canonical, sim: s };
+    }
+    return best && best.sim >= floor ? best : null;
   },
   async findSimilarByHypothesis(queryText, topK = 5) {
     const qv = await embed(queryText);

@@ -11,7 +11,7 @@ import {
 import {
   READ_SYSTEM, INGEST_SYSTEM, EXTRACT_SYSTEM, MUTATE_SYSTEM,
   INTERVALS, splitSentences, batchSentences,
-  signal, reach, firstPass, buildDossier, buildPosition, buildRegister,
+  signal, reach, firstPass, buildDossier, buildStatus, buildPosition, buildRegister,
   collectSpans, dossierHashOf, logUserMessage, logModelResponse, logPassage,
   buildExtractPrompt, buildMutatePrompt, buildHypothesisPrompt, getHypothesisSystemPrompt,
   parseEvents, detectMutationTriggers, userCorrectionTrigger, parseMutate, applyMutation, commitTier,
@@ -689,7 +689,7 @@ function ChunkTrace({ chunk }) {
 
 /* ── Library & reading modal ── */
 function LibraryModal({ open, onClose, library, activeConvo, canIngest,
-                        ingestRunning, ingestTrace, onIngest, onToggleDoc, onRemoveDoc }) {
+                        ingestRunning, ingestTrace, onIngest, onStopIngest, onToggleDoc, onRemoveDoc }) {
   const [text, setText] = useState("");
   const [title, setTitle] = useState("");
   const [source, setSource] = useState("");
@@ -724,7 +724,7 @@ function LibraryModal({ open, onClose, library, activeConvo, canIngest,
   });
 
   return (
-    <div onClick={() => !ingestRunning && onClose()} style={{
+    <div onClick={() => onClose()} style={{
       position: "fixed", inset: 0, background: "rgba(0,0,0,.62)", zIndex: 50,
       display: "flex", alignItems: "center", justifyContent: "center", padding: 24,
     }}>
@@ -737,8 +737,11 @@ function LibraryModal({ open, onClose, library, activeConvo, canIngest,
           borderBottom: `1px solid ${C.border}` }}>
           <Icon name="book" size={15} />
           <div style={{ fontSize: 13.5, fontWeight: 700, flex: 1 }}>Library &amp; Reading</div>
-          <button onClick={onClose} disabled={ingestRunning} style={{ background: "transparent",
-            border: "none", color: C.dim, cursor: ingestRunning ? "default" : "pointer", display: "flex" }}>
+          {ingestRunning && (
+            <span style={{ fontSize: 11, fontFamily: mono, color: C.accent }}>reading in background — safe to close</span>
+          )}
+          <button onClick={onClose} style={{ background: "transparent",
+            border: "none", color: C.dim, cursor: "pointer", display: "flex" }}>
             <Icon name="x" size={16} />
           </button>
         </div>
@@ -773,10 +776,16 @@ function LibraryModal({ open, onClose, library, activeConvo, canIngest,
               {text.length} chars{source ? ` · ${source}` : ""}
             </span>
             <div style={{ flex: 1 }} />
-            <button onClick={ingest} disabled={ingestRunning || !text.trim() || !canIngest}
-              style={{ ...btn(true), opacity: (ingestRunning || !text.trim() || !canIngest) ? 0.5 : 1 }}>
-              {ingestRunning ? "Reading…" : "Read into memory"}
-            </button>
+            {ingestRunning ? (
+              <button onClick={onStopIngest} style={{ ...btn(false) }}>
+                Stop reading
+              </button>
+            ) : (
+              <button onClick={ingest} disabled={!text.trim() || !canIngest}
+                style={{ ...btn(true), opacity: (!text.trim() || !canIngest) ? 0.5 : 1 }}>
+                Read into memory
+              </button>
+            )}
           </div>
           {!canIngest && (
             <div style={{ fontSize: 10.5, color: C.orange, marginTop: 6 }}>
@@ -869,6 +878,7 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
   const [, setDbVersion] = useState(0);
   const bumpDb = () => setDbVersion(v => v + 1);
   const abortRef = useRef(null);
+  const ingestAbortRef = useRef(false);
   const scrollRef = useRef(null);
 
   /* Open the SQLite store once, on mount. */
@@ -954,8 +964,9 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
   const memorySystemPrompt = async (convo, sig, text) => {
     store.setScope(convo.id);
     const ranked = await reach(sig, text);
+    store.setScope(convo.id);
     const dossier = buildDossier(ranked);
-    const parts = [READ_SYSTEM, dossier, buildPosition(convo?.lastTurn)].filter(Boolean);
+    const parts = [READ_SYSTEM, buildStatus(), dossier, buildPosition(convo?.lastTurn)].filter(Boolean);
     return {
       content: parts.join("\n\n"),
       used: ranked.length,
@@ -1096,14 +1107,23 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
       });
       return reply.choices?.[0]?.message?.content || "";
     }
-    const r = await fetch(`${ollamaUrl}/api/chat`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        model, messages: apiMessages, stream: false, options: { temperature: 0 },
-        ...(format ? { format } : {}),
-      }),
-    });
+    // A background call must never hang the walk: abort after 2 minutes.
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 120000);
+    let r;
+    try {
+      r = await fetch(`${ollamaUrl}/api/chat`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model, messages: apiMessages, stream: false, options: { temperature: 0 },
+          ...(format ? { format } : {}),
+        }),
+        signal: ctrl.signal,
+      });
+    } finally {
+      clearTimeout(timer);
+    }
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
     const j = await r.json();
     return j.message?.content || "";
@@ -1240,7 +1260,7 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
   const runExtract = async (convoId, msgId, userGiven, modelGiven, model, memCtx) => {
     // First pass — mechanical NER mints SIG entities for the user's message
     // before the model walk reaches them.
-    try { store.setScope(convoId); await firstPass(userGiven.text); } catch { /* optional */ }
+    try { store.setScope(convoId); await firstPass(userGiven.text, { givenId: userGiven.id }); } catch { /* optional */ }
 
     let events = [];
     try {
@@ -1322,18 +1342,23 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
     }));
     const sync = () => setIngestTrace(trace.map(t => ({ ...t })));
     setIngestRunning(true);
+    ingestAbortRef.current = false;
     sync();
+    store.setScope(convoId);
+    store.documents.register(docId, title || source || "document", passages.length);
 
     // The document is walked into the chat's own graph scope.
     const allAmbigs = [];
     const docTouched = new Set();
+    try {
     for (let i = 0; i < passages.length; i++) {
+      if (ingestAbortRef.current) { trace[i].status = "stopped"; sync(); break; }
       trace[i].status = "reading"; sync();
       try {
         const passageGiven = logPassage(passages[i], docId, i, { title });
         // First pass — mechanical NER mints SIG entities before the walk.
         store.setScope(convoId);
-        await firstPass(passages[i]);
+        await firstPass(passages[i], { documentId: docId, passageIdx: i, givenId: passageGiven.id });
         store.setScope(convoId);
         const register = buildRegister();
         const out = await chatOnce(model, [
@@ -1364,7 +1389,13 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
       if ((i + 1) % INTERVALS.SECTION_HYPOTHESIS === 0) {
         await runHypothesis(convoId, "section", { start: i - INTERVALS.SECTION_HYPOTHESIS + 1, end: i }, model);
       }
+      store.setScope(convoId);
+      store.documents.setWalked(docId, i + 1);
       sync();
+    }
+    } catch (e) {
+      /* unexpected failure — the document is left partially read */
+      console.error("ingest failed", e);
     }
 
     // Each AMBIG the ingest emitted fires a MUTATE call for a clean decision.
@@ -1392,11 +1423,16 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
 
     // The document is fully read — ground its entities, drop the unwalked
     // scaffolding, hypothesise the entities it moved, roll up the document.
-    store.setScope(convoId);
-    store.entities.markWalked([...docTouched]);
-    store.vectors.pruneWalked(docId);
-    await hypothesizeEntities(convoId, [...docTouched], model, 8);
-    await runHypothesis(convoId, "document", { documentId: docId }, model);
+    try {
+      store.setScope(convoId);
+      store.entities.markWalked([...docTouched]);
+      store.documents.setWalked(docId, passages.length);
+      store.vectors.pruneWalked(docId);
+      await hypothesizeEntities(convoId, [...docTouched], model, 8);
+      await runHypothesis(convoId, "document", { documentId: docId }, model);
+    } catch (e) {
+      console.error("ingest rollup failed", e);
+    }
 
     const learned = trace.reduce((n, t) => n + (t.applied || 0), 0);
     const doc = {
@@ -1819,7 +1855,8 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
         open={libOpen} onClose={() => setLibOpen(false)}
         library={library} activeConvo={active} canIngest={modelNames.length > 0}
         ingestRunning={ingestRunning} ingestTrace={ingestTrace}
-        onIngest={runIngest} onToggleDoc={toggleDoc} onRemoveDoc={removeDoc}
+        onIngest={runIngest} onStopIngest={() => { ingestAbortRef.current = true; }}
+        onToggleDoc={toggleDoc} onRemoveDoc={removeDoc}
       />
     </div>
   );
