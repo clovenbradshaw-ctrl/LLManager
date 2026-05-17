@@ -9,7 +9,7 @@ import {
   processImplicitSignals, runREC, shouldRunREC,
 } from "./router.js";
 import {
-  READ_SYSTEM, INGEST_SYSTEM, EXTRACT_SYSTEM, MUTATE_SYSTEM,
+  READ_SYSTEM, READ_CASUAL, INGEST_SYSTEM, EXTRACT_SYSTEM, MUTATE_SYSTEM,
   INTERVALS, splitPassages, classifyPassage, attachChromeContext, gateClassify,
   signal, retrieve, firstPass, lookupDocuments, formatRetrieved, buildStatus, buildPosition, buildRegister,
   collectSpans, dossierHashOf, logUserMessage, logModelResponse, logPassage,
@@ -34,6 +34,11 @@ const LS_KEY = "llmanager.chats.v3";
 const QUANT_KEY = "llmanager.quantize.v1";
 const MODE_KEY = "llmanager.chatmode.v1";
 const MEM_MODEL_KEY = "llmanager.memorymodel.v1";
+
+/* Hold models resident between turns. Reloading an 8B model is a ~10s cold
+   start; keeping it warm for half an hour means back-to-back turns (and the
+   background memory walk) reuse the loaded weights instead of paying it again. */
+const KEEP_ALIVE = "30m";
 
 /* Context quantization: cap the history so Ollama re-processes a smaller
    prompt. Keeps the most recent messages and truncates very long ones. */
@@ -455,6 +460,14 @@ function MessageBubble({ msg, prevModel, onCopy, copied, onRerun, onFork, busy, 
         {msg.mem && <MemoryPill mem={msg.mem} />}
         {msg.elapsed && <span style={{ fontFamily: mono, fontSize: 10.5, color: C.dim }}>· {msg.elapsed}s</span>}
         {msg.tokens ? <span style={{ fontFamily: mono, fontSize: 10.5, color: C.dim }}>· {msg.tokens} tok</span> : null}
+        {msg.loadMs > 1500 && (
+          <span title="The model was loaded from cold for this turn — most of the wait was loading weights, not generating. The next turn reuses the warm model."
+            style={{ fontFamily: mono, fontSize: 10.5, color: C.orange }}>· {(msg.loadMs / 1000).toFixed(1)}s cold load</span>
+        )}
+        {msg.tps != null && msg.tps < 8 && (
+          <span title="Low generation rate — the model is likely running on CPU or contending for GPU memory with another app. Free VRAM (unload other models) or pick a smaller model."
+            style={{ fontFamily: mono, fontSize: 10.5, color: C.orange }}>· {msg.tps.toFixed(1)} tok/s ⚠</span>
+        )}
       </div>
       <div style={{ paddingLeft: 15, borderLeft: `1.5px solid ${C.border}` }}>
         {msg.error ? (
@@ -1280,6 +1293,17 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
     // One representation per passage: when a [DOCS] block carries the raw
     // unwalked text, drop the redundant ≈ passage entries from the dossier.
     if (excludePassages) results = results.filter(r => r.type !== "passage");
+    // Casual chatter ("hi", "thanks") with nothing recalled: the "answer from
+    // the material below" framing only makes the model refuse a greeting with
+    // "no information provided". With no dossier to ground anyway, fall back to
+    // a plain prompt — faster (a fraction of the tokens) and a natural reply.
+    if (results.length === 0 && !gateClassify(text).knowledgeBearing) {
+      return {
+        content: READ_CASUAL,
+        used: 0, results: [],
+        dossierHash: dossierHashOf(""), spans: [],
+      };
+    }
     const dossier = formatRetrieved(results);
     const parts = [READ_SYSTEM, buildStatus(), dossier, buildPosition(convo?.lastTurn)].filter(Boolean);
     return {
@@ -1377,7 +1401,7 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
     const r = await fetch(`${ollamaUrl}/api/chat`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ model, messages: apiMessages, stream: true }),
+      body: JSON.stringify({ model, messages: apiMessages, stream: true, keep_alive: KEEP_ALIVE }),
       signal,
     });
     if (!r.ok || !r.body) throw new Error(`HTTP ${r.status}`);
@@ -1402,7 +1426,14 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
           const { reasoning, answer } = splitReasoning(raw, thinking);
           onToken(answer, reasoning);
         }
-        if (j.done) usage = { tokens: j.eval_count };
+        if (j.done) usage = {
+          tokens: j.eval_count,
+          // Ollama reports nanoseconds. load_duration is non-trivial only on a
+          // cold start; eval rate exposes a model that fell back to CPU.
+          loadMs: j.load_duration ? Math.round(j.load_duration / 1e6) : 0,
+          tps: (j.eval_count && j.eval_duration)
+            ? j.eval_count / (j.eval_duration / 1e9) : null,
+        };
       }
     }
     const { reasoning, answer } = splitReasoning(raw, thinking);
@@ -1431,7 +1462,8 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          model, messages: apiMessages, stream: false, options: { temperature: 0 },
+          model, messages: apiMessages, stream: false, keep_alive: KEEP_ALIVE,
+          options: { temperature: 0 },
           ...(format ? { format } : {}),
         }),
         signal: ctrl.signal,
@@ -1477,6 +1509,7 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
         patchMsg(convoId, msgId, {
           content, reasoning, streaming: false, error: false, model: useModel,
           elapsed: ((Date.now() - t0) / 1000).toFixed(1), tokens: usage.tokens,
+          loadMs: usage.loadMs, tps: usage.tps,
         });
         setConvos(prev => prev.map(c => c.id === convoId ? { ...c, model: useModel, updatedAt: Date.now() } : c));
         abortRef.current = null;
