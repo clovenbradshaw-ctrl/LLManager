@@ -13,7 +13,14 @@ export const webGPUAvailable = () =>
 export async function listBrowserModels() {
   const webllm = await loadModule();
   const list = webllm.prebuiltAppConfig?.model_list || [];
+  const embedding = webllm.ModelType?.embedding;
   return list
+    // Embedding models can't serve chat completions — selecting one fails with
+    // an LLMChatPipeline error, so keep them out of the chat model list.
+    .filter(m => {
+      if (embedding != null && m.model_type === embedding) return false;
+      return !/(^|[-_/])embed/i.test(m.model_id || "");
+    })
     .map(m => ({
       id: m.model_id,
       vramMB: m.vram_required_MB || null,

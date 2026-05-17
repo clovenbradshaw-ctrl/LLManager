@@ -269,8 +269,9 @@ function ConvoRow({ convo, active, onSelect, onDelete }) {
   );
 }
 
-/* ── Model picker (opens upward, sits in composer) ── */
-function ModelPicker({ value, models, onChange }) {
+/* ── Model picker (opens upward, sits in composer) ──
+   Two grouped lists: Ollama models and loaded in-browser (WebGPU) models. */
+function ModelPicker({ value, groups, onChange }) {
   const [open, setOpen] = useState(false);
   const ref = useRef(null);
   useEffect(() => {
@@ -278,40 +279,63 @@ function ModelPicker({ value, models, onChange }) {
     document.addEventListener("mousedown", h);
     return () => document.removeEventListener("mousedown", h);
   }, []);
-  const disabled = models.length === 0;
+  const hasOllama = groups.auto || groups.ollama.length > 0;
+  const empty = !hasOllama && groups.browser.length === 0;
+  const headerStyle = {
+    padding: "8px 10px 4px", fontSize: 10, fontFamily: mono, color: C.dim,
+    textTransform: "uppercase", letterSpacing: 0.6,
+  };
+  const row = (m) => (
+    <button key={m} onClick={() => { onChange(m); setOpen(false); }} style={{
+      width: "100%", textAlign: "left", display: "flex", alignItems: "center", gap: 10, padding: "8px 10px",
+      background: m === value ? "rgba(110,86,207,.18)" : "transparent", border: "none", borderRadius: 6,
+      cursor: "pointer", fontFamily: mono, fontSize: 12, color: C.text,
+    }}>
+      <span style={{ width: 7, height: 7, borderRadius: 99, background: C.accent, flexShrink: 0,
+        animation: m === AUTO_MODEL ? "llm-pulse 1.4s ease-in-out infinite" : "none" }} />
+      <span style={{ flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+        {m === AUTO_MODEL ? "⚡ Auto — route per message" : m}
+      </span>
+    </button>
+  );
   return (
     <div ref={ref} style={{ position: "relative" }}>
-      <button onClick={() => !disabled && setOpen(o => !o)} disabled={disabled} style={{
+      <button onClick={() => setOpen(o => !o)} style={{
         display: "flex", alignItems: "center", gap: 7, padding: "5px 9px", background: C.s2,
-        border: `1px solid ${C.border}`, borderRadius: 7, cursor: disabled ? "default" : "pointer",
-        fontFamily: mono, fontSize: 11, color: disabled ? C.dim : C.text, maxWidth: 240,
+        border: `1px solid ${C.border}`, borderRadius: 7, cursor: "pointer",
+        fontFamily: mono, fontSize: 11, color: empty ? C.dim : C.text, maxWidth: 240,
       }}>
-        <span style={{ width: 6, height: 6, borderRadius: 99, background: disabled ? C.dim : C.accent, flexShrink: 0,
+        <span style={{ width: 6, height: 6, borderRadius: 99, background: empty ? C.dim : C.accent, flexShrink: 0,
           animation: value === AUTO_MODEL ? "llm-pulse 1.4s ease-in-out infinite" : "none" }} />
         <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-          {value === AUTO_MODEL ? "⚡ Auto" : (value || "no models")}
+          {value === AUTO_MODEL ? "⚡ Auto" : (value || "Select model")}
         </span>
-        {!disabled && <span style={{ color: C.dim, display: "flex" }}><Icon name="chev" size={12} /></span>}
+        <span style={{ color: C.dim, display: "flex" }}><Icon name="chev" size={12} /></span>
       </button>
       {open && (
         <div style={{
-          position: "absolute", bottom: "calc(100% + 6px)", left: 0, minWidth: 240, maxHeight: 280, overflowY: "auto", zIndex: 30,
+          position: "absolute", bottom: "calc(100% + 6px)", left: 0, minWidth: 250, maxHeight: 320, overflowY: "auto", zIndex: 30,
           background: C.s2, border: `1px solid ${C.border}`, borderRadius: 10, boxShadow: "0 12px 32px rgba(0,0,0,.5)", padding: 4,
         }}>
-          <div style={{ padding: "8px 10px 6px", fontSize: 10, fontFamily: mono, color: C.dim, textTransform: "uppercase", letterSpacing: 0.6 }}>Select model</div>
-          {models.map(m => (
-            <button key={m} onClick={() => { onChange(m); setOpen(false); }} style={{
-              width: "100%", textAlign: "left", display: "flex", alignItems: "center", gap: 10, padding: "8px 10px",
-              background: m === value ? "rgba(110,86,207,.18)" : "transparent", border: "none", borderRadius: 6,
-              cursor: "pointer", fontFamily: mono, fontSize: 12, color: C.text,
-            }}>
-              <span style={{ width: 7, height: 7, borderRadius: 99, background: C.accent, flexShrink: 0,
-                animation: m === AUTO_MODEL ? "llm-pulse 1.4s ease-in-out infinite" : "none" }} />
-              <span style={{ flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                {m === AUTO_MODEL ? "⚡ Auto — route per message" : m}
-              </span>
-            </button>
-          ))}
+          <div style={headerStyle}>Ollama</div>
+          {hasOllama ? (
+            <>
+              {groups.auto && row(AUTO_MODEL)}
+              {groups.ollama.map(row)}
+            </>
+          ) : (
+            <div style={{ padding: "2px 10px 8px", fontSize: 10.5, fontFamily: mono, color: C.dim, lineHeight: 1.5 }}>
+              No Ollama models — see Settings → Connection.
+            </div>
+          )}
+          <div style={headerStyle}>In-browser · WebGPU</div>
+          {groups.browser.length > 0
+            ? groups.browser.map(row)
+            : (
+              <div style={{ padding: "2px 10px 8px", fontSize: 10.5, fontFamily: mono, color: C.dim, lineHeight: 1.5 }}>
+                No models loaded yet. Load one in Settings → Models to use it here.
+              </div>
+            )}
         </div>
       )}
     </div>
@@ -491,7 +515,7 @@ function IconBtn({ onClick, active, disabled, title, icon }) {
 }
 
 /* ── Composer ── */
-function Composer({ value, setValue, model, models, setModel, onSend, onStop, busy, isReply, quantize, setQuantize, mode, memModel, memModels, setMemModel }) {
+function Composer({ value, setValue, model, groups, setModel, onSend, onStop, busy, isReply, quantize, setQuantize, mode, memModel, memModels, setMemModel }) {
   const ref = useRef(null);
   useEffect(() => {
     if (ref.current) {
@@ -513,7 +537,7 @@ function Composer({ value, setValue, model, models, setModel, onSend, onStop, bu
           style={{ width: "100%", padding: "10px 12px 4px", background: "transparent", color: C.text, border: "none", outline: "none", resize: "none", fontSize: 14, lineHeight: 1.55, fontFamily: sans, boxSizing: "border-box" }}
         />
         <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "6px 6px 4px" }}>
-          <ModelPicker value={model} models={models} onChange={setModel} />
+          <ModelPicker value={model} groups={groups} onChange={setModel} />
           {mode === "memory" ? (
             <>
               <span
@@ -529,11 +553,16 @@ function Composer({ value, setValue, model, models, setModel, onSend, onStop, bu
                 <span title="Background model — runs EXTRACT, INGEST and MUTATE. Defaults to the chat model above."
                   style={{ display: "flex", alignItems: "center", gap: 6, fontFamily: mono, fontSize: 10.5, color: C.dim }}>
                   bg
-                  <ModelPicker
-                    value={memModel || "(chat model)"}
-                    models={["(chat model)", ...memModels]}
-                    onChange={v => setMemModel(v === "(chat model)" ? "" : v)}
-                  />
+                  <select
+                    value={memModel}
+                    onChange={e => setMemModel(e.target.value)}
+                    style={{
+                      background: C.s2, color: C.text, border: `1px solid ${C.border}`,
+                      borderRadius: 7, fontFamily: mono, fontSize: 11, padding: "5px 7px", outline: "none",
+                    }}>
+                    <option value="">(chat model)</option>
+                    {memModels.map(m => <option key={m} value={m}>{m}</option>)}
+                  </select>
                 </span>
               )}
             </>
@@ -571,7 +600,7 @@ function Composer({ value, setValue, model, models, setModel, onSend, onStop, bu
         </div>
       </div>
       <div style={{ maxWidth: 820, margin: "8px auto 0", textAlign: "center", fontSize: 10.5, color: C.dim }}>
-        Running locally on Ollama · conversations are saved in this browser only.
+        Runs locally — Ollama or in-browser via WebGPU · conversations are saved in this browser only.
       </div>
     </div>
   );
@@ -816,8 +845,9 @@ function LibraryModal({ open, onClose, library, activeConvo, canIngest,
 }
 
 /* ── Main chat ── */
-export default function Chat({ ollamaUrl, installed, ollamaUp, provider = "ollama" }) {
-  const isBrowser = provider === "browser";
+export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [], ollamaUp }) {
+  // Auto-routing and routing feedback operate on the Ollama roster only.
+  const installed = ollamaModels;
   const [convos, setConvos] = useState(loadConvos);
   const [activeId, setActiveId] = useState(null);
   const [query, setQuery] = useState("");
@@ -848,14 +878,29 @@ export default function Chat({ ollamaUrl, installed, ollamaUp, provider = "ollam
     return () => { live = false; };
   }, []);
 
-  const modelNames = useMemo(() => installed.map(m => m.name), [installed]);
+  const allModels = useMemo(() => [...ollamaModels, ...browserModels], [ollamaModels, browserModels]);
+  const modelNames = useMemo(() => allModels.map(m => m.name), [allModels]);
+  /* Which runtime each model belongs to — "ollama" or "browser". */
+  const providerOf = useMemo(() => {
+    const map = {};
+    for (const m of allModels) map[m.name] = m.provider;
+    return map;
+  }, [allModels]);
+  const isBrowserModel = (name) => providerOf[name] === "browser";
   const active = convos.find(c => c.id === activeId) || null;
   const messages = active?.messages || [];
 
-  /* Default composer model once models load */
+  /* Default composer model once models load; also recover if the selected
+     model disappears (e.g. a browser model that was never loaded). Auto-mode
+     needs Ollama models to route across — fall back if there are none. */
   useEffect(() => {
-    if (!composerModel && modelNames.length) setComposerModel(modelNames[0]);
-  }, [modelNames, composerModel]);
+    if (!modelNames.length) return;
+    if (composerModel === AUTO_MODEL) {
+      if (ollamaModels.length === 0) setComposerModel(modelNames[0]);
+      return;
+    }
+    if (!composerModel || !modelNames.includes(composerModel)) setComposerModel(modelNames[0]);
+  }, [modelNames, composerModel, ollamaModels.length]);
 
   /* Persist Auto-mode on/off */
   useEffect(() => {
@@ -978,7 +1023,7 @@ export default function Chat({ ollamaUrl, installed, ollamaUp, provider = "ollam
   /* Stream a chat completion from Ollama; calls onToken(answer, reasoning)
      with the full text so far. Reasoning output is kept separate. */
   const streamChat = async (model, apiMessages, onToken, signal) => {
-    if (isBrowser) {
+    if (isBrowserModel(model)) {
       const engine = await getBrowserEngine(model, report => {
         const pct = Math.round((report.progress || 0) * 100);
         onToken("", `Loading ${model} — ${report.text || `${pct}%`}`);
@@ -1044,7 +1089,7 @@ export default function Chat({ ollamaUrl, installed, ollamaUp, provider = "ollam
      well-formed JSON. (The in-browser runtime is left unconstrained — the
      walk parser still tolerates fenced or noisy output.) */
   const chatOnce = async (model, apiMessages, format) => {
-    if (isBrowser) {
+    if (isBrowserModel(model)) {
       const engine = await getBrowserEngine(model);
       const reply = await engine.chat.completions.create({
         messages: apiMessages, temperature: 0,
@@ -1113,7 +1158,7 @@ export default function Chat({ ollamaUrl, installed, ollamaUp, provider = "ollam
     }
     patchMsg(convoId, msgId, {
       streaming: false, error: true,
-      content: isBrowser
+      content: isBrowserModel(model)
         ? `In-browser model failed: ${lastErr?.message}\n\nThe model may be too large for this device's WebGPU memory — try a smaller model from Settings → Models.`
         : `Could not reach Ollama: ${lastErr?.message}\n\nMake sure Ollama is running and that this page's origin is allowed — see Settings → Connection.`,
     });
@@ -1574,7 +1619,8 @@ export default function Chat({ ollamaUrl, installed, ollamaUp, provider = "ollam
     ? (active.messages.filter(m => m.role === "assistant").pop()?.model || active.model)
     : composerModel;
 
-  const offline = ollamaUp === false || ollamaUp === "cors";
+  const offline = !isBrowserModel(composerModel)
+    && (ollamaUp === false || ollamaUp === "cors");
 
   const memStats = (mode === "memory" && dbReady && active)
     ? (store.setScope(active.id), store.stats())
@@ -1685,7 +1731,13 @@ export default function Chat({ ollamaUrl, installed, ollamaUp, provider = "ollam
 
         <Composer
           value={draft} setValue={setDraft}
-          model={composerModel} models={modelNames.length ? [AUTO_MODEL, ...modelNames] : []} setModel={setComposerModel}
+          model={composerModel}
+          groups={{
+            auto: ollamaModels.length > 0,
+            ollama: ollamaModels.map(m => m.name),
+            browser: browserModels.map(m => m.name),
+          }}
+          setModel={setComposerModel}
           onSend={send} onStop={stop} busy={busy}
           isReply={messages.length > 0}
           quantize={quantize} setQuantize={setQuantize}
