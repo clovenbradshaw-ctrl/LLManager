@@ -13,7 +13,8 @@ import {
   INTERVALS, splitPassages, classifyPassage, attachChromeContext, gateClassify,
   signal, retrieve, firstPass, lookupDocuments, formatRetrieved, buildStatus, buildPosition, buildRegister,
   collectSpans, dossierHashOf, logUserMessage, logModelResponse, logPassage,
-  buildExtractPrompt, buildMutatePrompt, buildHypothesisPrompt, getHypothesisSystemPrompt,
+  buildExtractPrompt, buildMutatePrompt, buildHypothesisPrompt, buildSkimPrompt,
+  getHypothesisSystemPrompt, HYPOTHESIS_SKIM,
   parseEvents, detectMutationTriggers, userCorrectionTrigger, parseMutate, applyMutation, commitTier,
 } from "./memory.js";
 import * as store from "./local-store.js";
@@ -1559,6 +1560,29 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
     } catch { /* hypothesis is best-effort */ }
   };
 
+  /* A skim hypothesis — the document's first impression, formed right after
+     Phase 1 from passage openings and the names NER caught, before the slow
+     walk reads a word. Written as document revision 1 so the walk's rollup
+     revises it rather than starting from a blank page. */
+  const runSkimHypothesis = async (convoId, docId, passages, classes, model) => {
+    try {
+      const content = passages.filter((_, i) => classes[i]?.type !== "chrome");
+      if (!content.length) return;
+      const prompt = buildSkimPrompt(content);
+      if (!prompt.trim()) return;
+      const out = await chatOnce(model, [
+        { role: "system", content: HYPOTHESIS_SKIM },
+        { role: "user", content: prompt },
+      ]);
+      const text = String(out || "").trim().split("\n")[0].replace(/^["']|["']$/g, "").slice(0, 240);
+      if (!text) return;
+      store.setScope(convoId);
+      store.hypotheses.write("document", docId, text, { afterLabel: "skim", inputCount: 0 });
+      logEvent("ok", "ingest", "Formed a first impression on a skim", text);
+      bumpDb();
+    } catch { /* skim is best-effort */ }
+  };
+
   /* After a walk, pick the touched entities that need a (re-)hypothesis:
      those with none yet, or whose centroid has drifted past 0.15 since the
      last revision. Capped so a turn fires only a few background calls. */
@@ -1771,6 +1795,13 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
     persistDoc();
     setConvos(prev => prev.map(c => c.id === convoId
       ? { ...c, docs: [...new Set([...(c.docs || []), docId])], updatedAt: Date.now() } : c));
+
+    // Before the walk reads a word, form the first impression a person would
+    // on a glance — so the document carries a working hypothesis immediately.
+    if (!ingestAbortRef.current) {
+      await runSkimHypothesis(convoId, docId, passages, classes, model);
+      persistDoc();
+    }
 
     // ── Phase 2: the walk — the LLM reads each passage into typed structure
     //    in the background. The conversation already has Phase 1 to draw on.

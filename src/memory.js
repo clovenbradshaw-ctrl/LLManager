@@ -219,6 +219,11 @@ You see ONLY document and session hypotheses.
 Under 200 characters. Capture the overarching inquiry.
 Write ONLY the sentence.`;
 
+export const HYPOTHESIS_SKIM = `You are skimming a document for the first time — only its opening lines and the names that jump out, not a close reading.
+Write a one-sentence hypothesis for what this document is probably about.
+Under 200 characters. A first impression: specific but provisional, the kind a reader forms in a few seconds.
+Write ONLY the sentence.`;
+
 /* ═══ Prompts: Write mode ═══ */
 
 export const WRITE_OUTLINE = `Create a document outline from the material below.
@@ -923,6 +928,17 @@ function getChildInputs(level, id) {
       ];
     default: return [];
   }
+}
+
+/* A skim prompt — passage openings plus the names NER caught, the way a
+   reader glances over a document before reading it closely. */
+export function buildSkimPrompt(passages) {
+  const skim = passages.slice(0, 12).map(p => p.slice(0, 200).trim()).join("\n---\n");
+  const names = [...new Set(passages.flatMap(p => signal(p).ner.names))].slice(0, 20);
+  let prompt = "";
+  if (names.length) prompt += `Names that jump out: ${names.join(", ")}\n\n`;
+  prompt += `Skim (passage openings):\n${skim}`;
+  return prompt;
 }
 
 export function buildHypothesisPrompt(level, id) {
