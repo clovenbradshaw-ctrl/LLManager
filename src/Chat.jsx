@@ -8,10 +8,10 @@ import {
   processImplicitSignals, runREC, shouldRunREC,
 } from "./router.js";
 import {
-  MEMORY_SYSTEM, EXTRACT_SYSTEM, INGEST_SYSTEM,
-  emptyMemory, cloneMemory, memoryStats, mergeMemory, splitSentences,
-  signal, reach, buildDossier, buildPosition, buildLibrary,
-  parseEvents, applyEvents,
+  MEMORY_SYSTEM, WALK_SYSTEM,
+  emptyMemory, cloneMemory, memoryStats, mergeMemory, splitSentences, batchSentences,
+  signal, reach, buildDossier, buildPosition, buildLibrary, buildRoster,
+  parseWalk, applyWalk,
 } from "./memory.js";
 import { loadLibrary, saveLibrary, docStats } from "./library.js";
 
@@ -535,7 +535,7 @@ function HeaderBtn({ icon, label, onClick, disabled, badge }) {
   );
 }
 
-/* ── Per-sentence read trace — one row of the reading process ── */
+/* ── Per-passage read trace — one row of the reading walk ── */
 function ChunkTrace({ chunk }) {
   const [open, setOpen] = useState(false);
   const stColor = chunk.status === "done" ? C.green
@@ -543,10 +543,16 @@ function ChunkTrace({ chunk }) {
     : chunk.status === "reading" ? C.orange : C.dim;
   const ner = chunk.signal?.ner || { names: [], dates: [], numbers: [] };
   const kws = chunk.signal?.keywords || [];
-  const label = chunk.status === "done" ? `+${chunk.applied} facts`
+  const label = chunk.status === "done" ? `+${chunk.applied} ops`
     : chunk.status === "reading" ? "reading…"
-    : chunk.status === "error" ? "error"
-    : chunk.status === "skipped" ? "skipped — no content" : "queued";
+    : chunk.status === "error" ? "error" : "queued";
+  const opLine = (e) => {
+    if (e.op === "SIG") return `+ site ${e.canonical || e.id} (${e.kind || "thing"})`;
+    if (e.op === "DEF") return `~ revise ${e.id || e.canonical}`;
+    if (e.op === "CON") return `→ ${e.from} —${e.relation || e.type || "related to"}→ ${e.to}`;
+    if (e.op === "REC") return `⟳ rename ${e.id} → "${e.canonical}"`;
+    return JSON.stringify(e);
+  };
   return (
     <div style={{ border: `1px solid ${C.border}`, borderRadius: 8, marginBottom: 6, background: C.bg }}>
       <button onClick={() => setOpen(o => !o)} style={{
@@ -558,23 +564,20 @@ function ChunkTrace({ chunk }) {
           <Icon name="chev" size={11} />
         </span>
         <span style={{ width: 7, height: 7, borderRadius: 99, background: stColor, flexShrink: 0 }} />
-        <span>Sentence {chunk.index + 1} · {chunk.chars} chars</span>
+        <span>Passage {chunk.index + 1} · {chunk.chars} chars</span>
         <span style={{ flex: 1 }} />
         <span style={{ color: stColor }}>{label}</span>
       </button>
       {open && (
         <div style={{ padding: "0 10px 10px", fontFamily: mono, fontSize: 10.5, color: C.dim, lineHeight: 1.7 }}>
           <div><span style={{ color: C.text }}>Scanned names:</span> {ner.names.join(", ") || "—"}</div>
-          <div><span style={{ color: C.text }}>Scanned dates:</span> {ner.dates.join(", ") || "—"}</div>
           <div><span style={{ color: C.text }}>Keywords:</span> {kws.slice(0, 14).join(", ") || "—"}</div>
-          {chunk.events?.length > 0 && (
+          {chunk.ops?.length > 0 && (
             <div style={{ marginTop: 6 }}>
-              <span style={{ color: C.text }}>Extracted into the graph:</span>
-              {chunk.events.map((e, i) => (
-                <div key={i} style={{ paddingLeft: 10, color: C.accent }}>
-                  {e.op === "INS" && `+ ${e.entity} (${e.kind || "thing"})`}
-                  {e.op === "CON" && `+ ${e.from} —${e.type || "related to"}→ ${e.to}`}
-                  {e.op === "DEF" && `+ ${e.entity}.${e.field} = ${e.value}`}
+              <span style={{ color: C.text }}>Operations applied to the graph:</span>
+              {chunk.ops.map((e, i) => (
+                <div key={i} style={{ paddingLeft: 10, color: C.accent, wordBreak: "break-word" }}>
+                  {opLine(e)}
                 </div>
               ))}
             </div>
@@ -654,10 +657,11 @@ function LibraryModal({ open, onClose, library, activeConvo, canIngest,
           {/* ── Read new content ── */}
           <div style={{ fontSize: 12, fontWeight: 700, marginBottom: 6 }}>Read new content</div>
           <div style={{ fontSize: 11.5, color: C.dim, lineHeight: 1.6, marginBottom: 10 }}>
-            Paste or upload any text. It is split into sentences, each sentence is
-            mechanically scanned for entities and then read by the model into a knowledge
-            graph. The document is added to the library and opted in to the current chat —
-            every sentence is shown below as it is read.
+            Paste or upload any text. It is split into sentences, grouped into passages
+            of a few sentences, and read by the model one passage at a time — each passage
+            against the sites already found, so the graph resolves rather than duplicates.
+            The document is added to the library and opted in to the current chat. Every
+            passage and its operations are shown below as it is read.
           </div>
           <input value={title} onChange={e => setTitle(e.target.value)} placeholder="Document title (optional)"
             disabled={ingestRunning}
@@ -694,7 +698,7 @@ function LibraryModal({ open, onClose, library, activeConvo, canIngest,
             <div style={{ marginTop: 14 }}>
               <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6,
                 fontFamily: mono, fontSize: 11, color: C.dim }}>
-                <span>{done}/{ingestTrace.length} sentences read</span>
+                <span>{done}/{ingestTrace.length} passages read</span>
                 <span>·</span>
                 <span style={{ color: C.accent }}>+{learned} facts learned</span>
               </div>
@@ -731,7 +735,7 @@ function LibraryModal({ open, onClose, library, activeConvo, canIngest,
                   <div style={{ fontSize: 12, fontWeight: 600, whiteSpace: "nowrap", overflow: "hidden",
                     textOverflow: "ellipsis" }}>{doc.title}</div>
                   <div style={{ fontSize: 10, fontFamily: mono, color: C.dim }}>
-                    {st.entities} entities · {st.edges} links · {st.defs} facts · {doc.sentences} sentences
+                    {st.entities} sites · {st.edges} links · {doc.passages} passages
                   </div>
                 </div>
                 <button onClick={() => onToggleDoc(doc.id)} disabled={!activeConvo} style={btn(on)}>
@@ -994,23 +998,24 @@ export default function Chat({ ollamaUrl, installed, ollamaUp }) {
     return null;
   };
 
-  /* Background memory Extract — distil new facts from a completed turn into
-     the chat's knowledge graph, and refresh the one-turn position marker. */
+  /* Background memory walk — read a completed turn into the chat's graph
+     against its current roster of sites, and refresh the position marker. */
   const runMemoryExtract = async (convoId, msgId, userMessage, response, model, memCtx) => {
-    let events = [];
+    let ops = [];
     try {
+      const convo = convos.find(c => c.id === convoId);
       const out = await chatOnce(model, [
-        { role: "system", content: EXTRACT_SYSTEM },
-        { role: "user", content: `User said: "${userMessage.slice(0, 4000)}"\n\nAssistant said: "${response.slice(0, 4000)}"` },
+        { role: "system", content: WALK_SYSTEM },
+        { role: "user", content: `${buildRoster(convo?.memory)}\n\nPASSAGE:\nUser: ${userMessage.slice(0, 4000)}\nAssistant: ${response.slice(0, 4000)}` },
       ]);
-      events = parseEvents(out);
+      ops = parseWalk(out);
     } catch { /* fail silently — the turn already succeeded */ }
 
     let learned = 0;
     setConvos(prev => prev.map(c => {
       if (c.id !== convoId) return c;
       const memory = cloneMemory(c.memory);
-      learned = applyEvents(memory, events);
+      learned = applyWalk(memory, ops);
       memory.lastTurn = {
         entities: (memCtx.entities || []).map(e => e.canonical),
         topic: (memCtx.sig?.keywords || []).slice(0, 3).join(" "),
@@ -1021,10 +1026,11 @@ export default function Chat({ ollamaUrl, installed, ollamaUp }) {
     patchMsg(convoId, msgId, m => ({ mem: { ...(m.mem || {}), learned } }));
   };
 
-  /* Read a block of text into a library document: split it into sentences,
-     mechanically scan each one, then have the model distil it into a
-     knowledge graph. The finished document is added to the library and opted
-     in to the current chat. The per-sentence trace is shown live. */
+  /* Read a block of text into a library document with a stateful walk: split
+     it into sentences, group them into passages, and read each passage with
+     the roster of sites already found in hand — so the model resolves and
+     enriches sites instead of duplicating them. The document is added to the
+     library and opted in to the current chat. The per-passage trace is live. */
   const runIngest = async (rawText, title, source) => {
     const text = (rawText || "").trim();
     if (!text || ingestRunning) return;
@@ -1050,32 +1056,27 @@ export default function Chat({ ollamaUrl, installed, ollamaUp }) {
     }
 
     const docId = "d" + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
-    const sentences = splitSentences(text);
-    const trace = sentences.map((c, i) => ({
+    const passages = batchSentences(splitSentences(text));
+    const trace = passages.map((c, i) => ({
       index: i, chars: c.length, text: c, signal: signal(c),
-      status: "pending", rawOutput: "", events: [], applied: 0,
+      status: "pending", rawOutput: "", ops: [], applied: 0,
     }));
     const sync = () => setIngestTrace(trace.map(t => ({ ...t })));
     setIngestRunning(true);
     sync();
 
     const docMem = { entities: {}, edges: {}, defs: {} };
-    for (let i = 0; i < sentences.length; i++) {
-      // Skip sentences with no content signal — navigation, boilerplate, etc.
-      const sg = trace[i].signal;
-      if (sg.ner.names.length === 0 && sg.keywords.length <= 1) {
-        trace[i].status = "skipped"; sync(); continue;
-      }
+    for (let i = 0; i < passages.length; i++) {
       trace[i].status = "reading"; sync();
       try {
         const out = await chatOnce(model, [
-          { role: "system", content: INGEST_SYSTEM },
-          { role: "user", content: sentences[i] },
+          { role: "system", content: WALK_SYSTEM },
+          { role: "user", content: `${buildRoster(docMem)}\n\nPASSAGE:\n${passages[i]}` },
         ]);
-        const events = parseEvents(out);
-        trace[i].applied = applyEvents(docMem, events);
+        const ops = parseWalk(out);
+        trace[i].applied = applyWalk(docMem, ops);
         trace[i].rawOutput = out;
-        trace[i].events = events;
+        trace[i].ops = ops;
         trace[i].status = "done";
       } catch (e) {
         trace[i].status = "error";
@@ -1090,13 +1091,13 @@ export default function Chat({ ollamaUrl, installed, ollamaUp }) {
       title: title || source || (text.slice(0, 40) + (text.length > 40 ? "…" : "")),
       source: source || "pasted text",
       addedAt: new Date().toISOString(),
-      chars: text.length, sentences: sentences.length, learned,
+      chars: text.length, passages: passages.length, learned,
       text,
       memory: docMem,
       trace: trace.map(t => ({
         index: t.index, chars: t.chars, status: t.status, applied: t.applied,
         signal: { names: t.signal.ner.names, dates: t.signal.ner.dates, keywords: t.signal.keywords },
-        events: t.events, rawOutput: t.rawOutput,
+        ops: t.ops, rawOutput: t.rawOutput,
       })),
     };
     setLibrary(prev => [doc, ...prev]);
@@ -1144,7 +1145,7 @@ export default function Chat({ ollamaUrl, installed, ollamaUp }) {
       memory: c.memory || undefined,
       library: attached.map(d => ({
         id: d.id, title: d.title, source: d.source, addedAt: d.addedAt,
-        chars: d.chars, sentences: d.sentences, learned: d.learned,
+        chars: d.chars, passages: d.passages, learned: d.learned,
         text: d.text, memory: d.memory, readTrace: d.trace,
       })),
     };
