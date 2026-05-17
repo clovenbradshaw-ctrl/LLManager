@@ -2079,12 +2079,13 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
     // fixed-size prompt: system + projected dossier + one-turn position marker.
     // Every turn is projected and every turn is read back into the graph — the
     // prompt stays minimal regardless of how much the chat has covered.
-    // "Ask with documents": a manual, mechanical pull of the most relevant
-    // passages from this chat's opted-in library documents into the prompt.
+    // "Ask with documents": an embedding-based pull of the most relevant
+    // passages from this chat's opted-in library documents — but only from
+    // documents not yet fully read; once read, the [CTX] graph carries them.
     let docBlock = "";
     if (askWithDocs) {
       const docs = attachedDocs(existing);
-      docBlock = lookupDocuments(text, docs);
+      docBlock = await lookupDocuments(text, docs);
       logEvent(docBlock ? "info" : "warn", "lookup",
         docBlock ? `Ask with documents — injected passages from ${docs.length} file(s)`
                  : "Ask with documents on, but no document text to pull from");

@@ -35,6 +35,16 @@ If the material covers the question, answer from it.
 If it only partly covers it, say what you can see and what is still being read.
 If it doesn't cover it at all, just answer normally.
 
+The material is graded by how well it has been read — state your confidence
+to match it:
+  - Grounded entities (E:) and their facts have been read closely — answer
+    with confidence.
+  - PARTIAL entities and [partial] passages come from a document still being
+    read — answer provisionally and say the reading is in progress.
+  - UNREAD passages and [skim] passages are a quick embedding match from a
+    document not yet read closely — flag the answer as a first impression.
+When you are not working from a confident, grounded answer, say so plainly.
+
 When the user asks what the material says or what you have, give a summary
 of the key points — not just "yes" or a one-liner.
 
@@ -586,35 +596,14 @@ export async function retrieve(query, { topK = 6, position = null } = {}) {
   return deduped.slice(0, topK);
 }
 
-/* Mechanical document lookup — no model, no embeddings. Splits each opted-in
-   document back into passages and scores every passage against the query by
-   keyword and entity-name overlap, returning the top matches as a [DOCS]
-   block to inject straight into the prompt. This backs the composer's
-   "ask with documents" trigger: a deterministic pull of source text, separate
-   from the graph projection. When nothing overlaps (a general question), it
-   falls back to each document's opening passages so the block is never empty.
-   Identical passage text is deduplicated, so the same document imported twice
-   never lands the same passage in the block more than once. */
-export function lookupDocuments(query, docs, { topK = 6 } = {}) {
+/* Keyword fallback — entity-name and keyword overlap, no embeddings. Used
+   only when a document has no stored passage vectors to score against
+   (opted in from another chat's scope, or never embedded). */
+function scorePassagesByKeyword(query, passages) {
   const qSig = signal(query || "");
   const qKw = qSig.keywords;
   const qNames = qSig.ner.names.map(n => n.toLowerCase());
-
-  const passages = [];
-  const seenText = new Set();
-  for (const doc of docs || []) {
-    const text = (doc?.text || "").trim();
-    if (!text) continue;
-    splitPassages(text).forEach((p, i) => {
-      const key = p.trim().toLowerCase();
-      if (seenText.has(key)) return;
-      seenText.add(key);
-      passages.push({ text: p, index: i });
-    });
-  }
-  if (!passages.length) return "";
-
-  const scored = passages.map(p => {
+  return passages.map(p => {
     const pSig = signal(p.text);
     const pl = p.text.toLowerCase();
     const kwHits = qKw.filter(k => pSig.keywords.includes(k) || pl.includes(k)).length;
@@ -623,11 +612,75 @@ export function lookupDocuments(query, docs, { topK = 6 } = {}) {
     const nameScore = qNames.length ? nameHits / qNames.length : 0;
     return { ...p, score: kwScore * 0.6 + nameScore * 0.4 };
   });
+}
 
-  let top = scored.filter(p => p.score > 0).sort((a, b) => b.score - a.score).slice(0, topK);
-  if (!top.length) top = passages.slice(0, topK); // general question — show the openings
+/* Document lookup — embedding-based RAG over opted-in library documents,
+   backing the composer's "ask with documents" trigger.
 
-  const lines = top.map((r, i) => `${i + 1}: "${r.text.trim()}"`);
+   Standard embedding similarity: the query is embedded once, then scored by
+   cosine against each document's precomputed passage vectors (written during
+   the first pass) — no per-query re-embedding, so the pull is fast. A
+   document is only pulled here until it has been fully read; once its walk
+   completes the graph projection ([CTX] entities) carries it instead, so a
+   read document is skipped. Each passage is tagged with the document's
+   reading confidence — [skim] (not yet read) or [partial] (walk in progress)
+   — so the model can state how provisional its answer is. Documents with no
+   stored vectors fall back to keyword overlap. Identical passage text is
+   deduplicated. */
+export async function lookupDocuments(query, docs, { topK = 6 } = {}) {
+  const callerScope = store.getScope();
+  let queryVec = null;
+  try { queryVec = await store.embed(query || ""); } catch { /* embeddings optional */ }
+  store.setScope(callerScope);
+
+  const scored = [];
+  for (const doc of docs || []) {
+    const text = (doc?.text || "").trim();
+    if (!text) continue;
+    const docPassages = splitPassages(text);
+
+    // Walk progress lives under the scope the document was ingested into.
+    let walked = 0, total = docPassages.length, vecRows = [];
+    if (doc.scope) {
+      store.setScope(doc.scope);
+      const d = store.documents.get(doc.id);
+      if (d) { walked = d.walked || 0; total = d.total || total; }
+      vecRows = store.vectors.dumpUnwalked().filter(r => r.documentId === doc.id);
+      store.setScope(callerScope);
+    }
+    // Fully read — the [CTX] graph projection carries it with confidence.
+    if (total > 0 && walked >= total) continue;
+    const confidence = walked > 0 ? "partial" : "skim";
+
+    if (queryVec && vecRows.length) {
+      for (const r of vecRows) {
+        scored.push({
+          text: r.text, index: r.passageIdx ?? 0, confidence,
+          score: store.cosineSim(queryVec, r.vec),
+        });
+      }
+    } else {
+      // No stored vectors — keyword fallback over the raw passages.
+      for (const s of scorePassagesByKeyword(query,
+        docPassages.map((p, i) => ({ text: p, index: i })))) {
+        scored.push({ ...s, confidence });
+      }
+    }
+  }
+  if (!scored.length) return "";
+
+  const seen = new Set();
+  const dedup = (rows) => rows.filter(r => {
+    const k = r.text.trim().toLowerCase();
+    if (seen.has(k)) return false;
+    seen.add(k);
+    return true;
+  });
+  let top = dedup(scored.filter(r => r.score > 0).sort((a, b) => b.score - a.score))
+    .slice(0, topK);
+  if (!top.length) top = dedup(scored).slice(0, topK); // general question — openings
+
+  const lines = top.map((r, i) => `${i + 1}: [${r.confidence}] "${r.text.trim()}"`);
   return `[DOCS]\n${lines.join("\n")}\n[/DOCS]`;
 }
 
