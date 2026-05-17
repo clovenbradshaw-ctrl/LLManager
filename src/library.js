@@ -30,6 +30,41 @@ export const saveLibrary = (docs) => {
   }
 };
 
+/* The ingest job — a single in-progress document read, persisted so it
+   survives a reload or crash. Reading walks one passage at a time; after each
+   passage the job (its trace, partial graph and next index) is saved here. On
+   startup an unfinished job is resumed from where it stopped. Only one job
+   exists at a time — a new read may not start while one is running. */
+const INGEST_JOB_KEY = "llmanager.ingestJob.v1";
+
+export const loadIngestJob = () => {
+  try {
+    const raw = localStorage.getItem(INGEST_JOB_KEY);
+    const parsed = raw ? JSON.parse(raw) : null;
+    return parsed && typeof parsed === "object" && Array.isArray(parsed.passages)
+      ? parsed
+      : null;
+  } catch {
+    return null;
+  }
+};
+
+export const saveIngestJob = (job) => {
+  try {
+    localStorage.setItem(INGEST_JOB_KEY, JSON.stringify(job));
+  } catch {
+    /* quota — ignore; progress simply won't survive a crash for huge docs */
+  }
+};
+
+export const clearIngestJob = () => {
+  try {
+    localStorage.removeItem(INGEST_JOB_KEY);
+  } catch {
+    /* ignore */
+  }
+};
+
 /* Quick count of what a document's graph holds, for UI badges. */
 export const docStats = (doc) => ({
   entities: doc?.memory ? Object.keys(doc.memory.entities || {}).length : 0,
