@@ -83,7 +83,7 @@ const Box = ({ title, sub, children }) => (
 );
 
 export default function App() {
-  const [tab, setTab] = useState("status");
+  const [tab, setTab] = useState("chat");
   const [matrixSession, setMatrixSession] = useState(loadSession);
   const [gateDone, setGateDone] = useState(
     () => !!loadSession() || localStorage.getItem(GATE_SKIP_KEY) === "1",
@@ -338,7 +338,7 @@ OLLAMA_ORIGINS="${pageOrigin || "https://myapp.com"},http://localhost:3000" olla
           </div>
         </div>
         <div style={{ display: "flex", gap: 6 }}>
-          {["status", "chat", "matrix", "models", "optimize", "connect"].map(t => (
+          {["chat", "matrix", "models", "optimize", "connect"].map(t => (
             <button key={t} onClick={() => setTab(t)} style={{
               padding: "7px 16px", fontSize: 12, fontWeight: 600, borderRadius: 8, cursor: "pointer", textTransform: "capitalize",
               border: `1px solid ${tab === t ? C.accent : C.border}`, background: tab === t ? C.accent : "transparent", color: tab === t ? "#fff" : C.dim,
