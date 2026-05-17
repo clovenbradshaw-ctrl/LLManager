@@ -375,8 +375,8 @@ export async function retrieve(query, { topK = 6 } = {}) {
   for (const row of store.vectors.dumpCentroids()) {
     const entity = store.entities.get(row.entityId);
     if (!entity) continue;
-    const centroidSim = queryVec ? cosineSim(queryVec, row.vec) : 0;
-    const hypSim = (queryVec && hypMap[row.entityId]) ? cosineSim(queryVec, hypMap[row.entityId]) : 0;
+    const centroidSim = queryVec ? store.cosineSim(queryVec, row.vec) : 0;
+    const hypSim = (queryVec && hypMap[row.entityId]) ? store.cosineSim(queryVec, hypMap[row.entityId]) : 0;
     const name = entity.canonical.toLowerCase();
     const nameMatch = queryEntities.some(qe => name.includes(qe) || qe.includes(name)
       || (entity.aliases || []).some(a => a.toLowerCase().includes(qe)));
@@ -395,7 +395,7 @@ export async function retrieve(query, { topK = 6 } = {}) {
   for (const row of store.vectors.dumpUnwalked()) {
     const pSig = signal(row.text);
     const passageEntities = pSig.ner.names.map(n => n.toLowerCase());
-    const embSim = queryVec ? cosineSim(queryVec, row.vec) : 0;
+    const embSim = queryVec ? store.cosineSim(queryVec, row.vec) : 0;
     const nerOverlap = queryEntities.filter(qe =>
       passageEntities.some(pe => pe.includes(qe) || qe.includes(pe))).length;
     const nerScore = queryEntities.length ? nerOverlap / queryEntities.length : 0;
