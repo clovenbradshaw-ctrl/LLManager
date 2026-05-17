@@ -280,17 +280,34 @@ export function splitSentences(text, maxLen = 1200) {
   return out;
 }
 
-export function batchSentences(sentences, maxChars = 1400, maxCount = 5) {
-  const batches = [];
-  let buf = [], len = 0;
-  for (const s of sentences) {
-    if (buf.length && (len + s.length > maxChars || buf.length >= maxCount)) {
-      batches.push(buf.join(" ")); buf = []; len = 0;
-    }
-    buf.push(s); len += s.length + 1;
+/* Break a long sentence into clauses at strong internal boundaries —
+   semicolons, colons, spaced dashes, and commas before a coordinating or
+   subordinating conjunction. Short sentences pass through whole; tiny
+   fragments are merged back so a clause is never just a connective. */
+const CLAUSE_CONJ = /,\s+(?=(?:and|but|or|so|yet|nor|because|although|though|while|whereas|which|who|that|when|where|if|since)\b)/i;
+
+export function splitClauses(sentence, minLen = 160) {
+  const s = String(sentence || "").trim();
+  if (s.length <= minLen) return s ? [s] : [];
+  const parts = s
+    .split(/\s*[;:]\s+|\s+[—–]\s+/)
+    .flatMap(p => p.split(CLAUSE_CONJ))
+    .map(p => p.trim())
+    .filter(Boolean);
+  if (parts.length <= 1) return [s];
+  const out = [];
+  for (const p of parts) {
+    if (out.length && p.length < 40) out[out.length - 1] += " " + p;
+    else out.push(p);
   }
-  if (buf.length) batches.push(buf.join(" "));
-  return batches;
+  return out;
+}
+
+/* The unit of the reading walk: one sentence per passage, with long
+   sentences broken down to one clause each. Encoding at this grain gives
+   the model far cleaner extractions than multi-sentence chunks. */
+export function splitPassages(text) {
+  return splitSentences(text).flatMap(s => splitClauses(s));
 }
 
 /* ═══ The Signal — mechanical NER + keywords (SIG: candidates only) ═══ */
@@ -447,7 +464,7 @@ export function lookupDocuments(query, docs, { topK = 6 } = {}) {
   for (const doc of docs || []) {
     const text = (doc?.text || "").trim();
     if (!text) continue;
-    const split = batchSentences(splitSentences(text));
+    const split = splitPassages(text);
     split.forEach((p, i) => passages.push({ text: p, index: i, title: doc.title || "document" }));
   }
   if (!passages.length) return "";

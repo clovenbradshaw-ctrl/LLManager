@@ -10,7 +10,7 @@ import {
 } from "./router.js";
 import {
   READ_SYSTEM, INGEST_SYSTEM, EXTRACT_SYSTEM, MUTATE_SYSTEM,
-  INTERVALS, splitSentences, batchSentences,
+  INTERVALS, splitPassages,
   signal, retrieve, firstPass, lookupDocuments, formatRetrieved, buildStatus, buildPosition, buildRegister,
   collectSpans, dossierHashOf, logUserMessage, logModelResponse, logPassage,
   buildExtractPrompt, buildMutatePrompt, buildHypothesisPrompt, getHypothesisSystemPrompt,
@@ -625,6 +625,32 @@ function HeaderBtn({ icon, label, onClick, disabled, badge }) {
   );
 }
 
+/* EO operator notation — render one graph event the way the reading walk
+   applied it. Shared by the per-passage trace and the app event log so the
+   Log tab shows exactly how each passage and turn was processed. */
+function formatOp(e) {
+  if (!e || typeof e !== "object") return String(e);
+  if (e.op === "INS") return `+ entity ${e.entity} (${e.terrain || "Entity"})`;
+  if (e.op === "DEF") return `= ${e.entity} · ${e.field}: "${e.value}"`;
+  if (e.op === "CON") return `→ ${e.from} —${e.type || "related to"}→ ${e.to}`;
+  if (e.op === "EVA") return `⊙ ${e.entity} · ${e.claim} [${e.status || "holds"}]`;
+  if (e.op === "AMBIG") return `? ambiguous "${e.name}" ≈ ${e.candidate || "?"}`;
+  return JSON.stringify(e);
+}
+
+/* Render a retrieved-context row — an entity or unwalked passage the memory
+   projection pulled into a turn's prompt. */
+function formatRecalled(r) {
+  if (!r || typeof r !== "object") return String(r);
+  if (r.type === "entity") return `◆ ${r.canonical} [${r.status || "?"}]`;
+  if (r.type === "passage") {
+    const t = (r.text || "").replace(/\s+/g, " ").trim();
+    const snip = t.length > 120 ? t.slice(0, 120) + "…" : t;
+    return `≈ passage ${(r.passageIndex ?? 0) + 1}: "${snip}"`;
+  }
+  return JSON.stringify(r);
+}
+
 /* ── Per-passage read trace — one row of the reading walk ── */
 function ChunkTrace({ chunk }) {
   const [open, setOpen] = useState(false);
@@ -638,14 +664,6 @@ function ChunkTrace({ chunk }) {
     : chunk.status === "scanning" ? "scanning…"
     : chunk.status === "error" ? "error"
     : chunk.status === "stopped" ? "stopped" : "queued";
-  const opLine = (e) => {
-    if (e.op === "INS") return `+ entity ${e.entity} (${e.terrain || "Entity"})`;
-    if (e.op === "DEF") return `= ${e.entity} · ${e.field}: "${e.value}"`;
-    if (e.op === "CON") return `→ ${e.from} —${e.type || "related to"}→ ${e.to}`;
-    if (e.op === "EVA") return `⊙ ${e.entity} · ${e.claim} [${e.status || "holds"}]`;
-    if (e.op === "AMBIG") return `? ambiguous "${e.name}" ≈ ${e.candidate || "?"}`;
-    return JSON.stringify(e);
-  };
   return (
     <div style={{ border: `1px solid ${C.border}`, borderRadius: 8, marginBottom: 6, background: C.bg }}>
       <button onClick={() => setOpen(o => !o)} style={{
@@ -670,7 +688,7 @@ function ChunkTrace({ chunk }) {
               <span style={{ color: C.text }}>Operations applied to the graph:</span>
               {chunk.ops.map((e, i) => (
                 <div key={i} style={{ paddingLeft: 10, color: C.accent, wordBreak: "break-word" }}>
-                  {opLine(e)}
+                  {formatOp(e)}
                 </div>
               ))}
             </div>
@@ -702,6 +720,43 @@ const clockTime = (ts) => {
   catch { return ""; }
 };
 
+/* One row of the event log. When the event carries `lines` (EO operator
+   notation for a passage/turn, or the facts recalled on a memory turn) the
+   row expands to show them verbatim. */
+function EventRow({ e, levelColor }) {
+  const [open, setOpen] = useState(false);
+  const hasLines = e.lines?.length > 0;
+  return (
+    <div style={{ borderBottom: `1px solid ${C.border}` }}>
+      <div
+        onClick={hasLines ? () => setOpen(o => !o) : undefined}
+        style={{ display: "flex", gap: 8, padding: "5px 2px", fontFamily: mono, fontSize: 10.5,
+          alignItems: "baseline", cursor: hasLines ? "pointer" : "default" }}>
+        <span style={{ color: C.dim, flexShrink: 0 }}>{clockTime(e.ts)}</span>
+        <span style={{ width: 6, height: 6, borderRadius: 99, background: levelColor(e.level),
+          flexShrink: 0, alignSelf: "center" }} />
+        <span style={{ color: levelColor(e.level), flexShrink: 0, width: 54,
+          overflow: "hidden", textOverflow: "ellipsis" }}>{e.source}</span>
+        <span style={{ color: C.text, wordBreak: "break-word", flex: 1 }}>
+          {e.message}
+          {e.detail && <span style={{ color: C.dim }}> — {e.detail.slice(0, 220)}</span>}
+          {hasLines && (
+            <span style={{ color: C.accent }}> {open ? "▾" : "▸"} {e.lines.length} op{e.lines.length === 1 ? "" : "s"}</span>
+          )}
+        </span>
+      </div>
+      {hasLines && open && (
+        <div style={{ padding: "0 2px 7px 70px", fontFamily: mono, fontSize: 10,
+          color: C.accent, lineHeight: 1.7 }}>
+          {e.lines.map((ln, i) => (
+            <div key={i} style={{ wordBreak: "break-word" }}>{ln}</div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 /* ── App-wide event-log panel — a live feed of what the app is doing ── */
 function EventLogPanel() {
   const [events, setEvents] = useState(getEvents);
@@ -720,20 +775,7 @@ function EventLogPanel() {
         <div style={{ fontSize: 11.5, color: C.dim, padding: "20px 0", textAlign: "center" }}>
           No events yet — read a document or send a message.
         </div>
-      ) : events.map(e => (
-        <div key={e.id} style={{ display: "flex", gap: 8, padding: "5px 2px",
-          borderBottom: `1px solid ${C.border}`, fontFamily: mono, fontSize: 10.5, alignItems: "baseline" }}>
-          <span style={{ color: C.dim, flexShrink: 0 }}>{clockTime(e.ts)}</span>
-          <span style={{ width: 6, height: 6, borderRadius: 99, background: levelColor(e.level),
-            flexShrink: 0, alignSelf: "center" }} />
-          <span style={{ color: levelColor(e.level), flexShrink: 0, width: 54,
-            overflow: "hidden", textOverflow: "ellipsis" }}>{e.source}</span>
-          <span style={{ color: C.text, wordBreak: "break-word", flex: 1 }}>
-            {e.message}
-            {e.detail && <span style={{ color: C.dim }}> — {e.detail.slice(0, 220)}</span>}
-          </span>
-        </div>
-      ))}
+      ) : events.map(e => <EventRow key={e.id} e={e} levelColor={levelColor} />)}
     </div>
   );
 }
@@ -1560,6 +1602,10 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
     };
     setConvos(prev => prev.map(c => c.id === convoId ? { ...c, lastTurn } : c));
     patchMsg(convoId, msgId, m => ({ mem: { ...(m.mem || {}), learned: res.applied } }));
+    logEvent("info", "memory",
+      res.applied ? `Learned ${res.applied} fact${res.applied === 1 ? "" : "s"} from this turn`
+                  : "Nothing new learned from this turn",
+      null, events.map(formatOp));
     bumpDb();
     // Re-hypothesise entities the turn moved, then resolve any ambiguities.
     await hypothesizeEntities(convoId, res.touched, model);
@@ -1597,7 +1643,7 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
     if (!dbReady) { setIngestRunning(false); return; }
 
     const docId = "d" + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
-    const passages = batchSentences(splitSentences(text));
+    const passages = splitPassages(text);
     const trace = passages.map((c, i) => ({
       index: i, chars: c.length, text: c, signal: signal(c),
       status: "pending", rawOutput: "", ops: [], applied: 0,
@@ -1660,7 +1706,8 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
         trace[i].rawOutput = typeof out === "string" ? out : JSON.stringify(out);
         trace[i].ops = events;
         trace[i].status = "done";
-        logEvent("info", "ingest", `Passage ${i + 1} read`, `+${res.applied} ops`);
+        logEvent("info", "ingest", `Passage ${i + 1} read`, `+${res.applied} ops`,
+          events.map(formatOp));
       } catch (e) {
         trace[i].status = "error";
         trace[i].rawOutput = String(e?.message || e);
@@ -1876,6 +1923,10 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
       ];
       memCtx = { sig, results: sys.results, dossierHash: sys.dossierHash, spans: sys.spans };
       memBadge = { used: sys.used };
+      logEvent("info", "memory",
+        sys.used ? `Recalled ${sys.used} fact${sys.used === 1 ? "" : "s"} for this turn`
+                 : "No facts recalled for this turn",
+        null, sys.results.map(formatRecalled));
     } else {
       const apiHistory = quantize ? quantizeHistory(history) : history;
       apiMessages = [
