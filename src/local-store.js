@@ -117,6 +117,7 @@ const SCHEMA = `
     source      TEXT,
     supersedes  TEXT,
     retired     INTEGER NOT NULL DEFAULT 0,
+    drift       REAL,
     created_at  INTEGER NOT NULL,
     PRIMARY KEY (scope, id)
   );
@@ -157,10 +158,11 @@ const SCHEMA = `
     created_at  INTEGER NOT NULL
   );
 
-  CREATE TABLE IF NOT EXISTS vec_clauses (
+  -- Unwalked vectors: chat messages and unprocessed document passages.
+  -- No graph structure yet — SIG-level only. Deleted once walked.
+  CREATE TABLE IF NOT EXISTS vec_unwalked (
     scope       TEXT NOT NULL,
     id          TEXT NOT NULL,
-    entity_id   TEXT,
     vector      BLOB NOT NULL,
     created_at  INTEGER NOT NULL,
     PRIMARY KEY (scope, id)
@@ -185,12 +187,13 @@ const SCHEMA = `
 
   CREATE INDEX IF NOT EXISTS idx_defs_entity   ON defs(scope, entity_id);
   CREATE INDEX IF NOT EXISTS idx_defs_field    ON defs(scope, entity_id, field);
+  CREATE INDEX IF NOT EXISTS idx_defs_drift    ON defs(scope, entity_id, drift);
   CREATE INDEX IF NOT EXISTS idx_edges_from    ON edges(scope, from_id);
   CREATE INDEX IF NOT EXISTS idx_edges_to      ON edges(scope, to_id);
   CREATE INDEX IF NOT EXISTS idx_given_session ON given(scope, session_id);
   CREATE INDEX IF NOT EXISTS idx_given_doc     ON given(scope, document_id);
   CREATE INDEX IF NOT EXISTS idx_hyp_target    ON hypotheses(scope, level, target_id);
-  CREATE INDEX IF NOT EXISTS idx_vec_clause_ent ON vec_clauses(scope, entity_id);
+  CREATE INDEX IF NOT EXISTS idx_vec_unwalked ON vec_unwalked(scope);
   CREATE INDEX IF NOT EXISTS idx_entities_terrain ON entities(scope, terrain);
 `;
 
@@ -327,11 +330,11 @@ export const edges = {
 /* ── DEFs ── */
 
 export const defs = {
-  write(id, entityId, field, value, { span = null, source = null, supersedes = null, retired = 0 } = {}) {
+  write(id, entityId, field, value, { span = null, source = null, supersedes = null, retired = 0, drift = null } = {}) {
     db.exec({
-      sql: `INSERT OR REPLACE INTO defs (scope,id,entity_id,field,value,span,source,supersedes,retired,created_at)
-            VALUES (?,?,?,?,?,?,?,?,?,?)`,
-      bind: [scope, id, entityId, field, value, span, source, supersedes, retired ? 1 : 0, Date.now()],
+      sql: `INSERT OR REPLACE INTO defs (scope,id,entity_id,field,value,span,source,supersedes,retired,drift,created_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+      bind: [scope, id, entityId, field, value, span, source, supersedes, retired ? 1 : 0, drift, Date.now()],
     });
   },
   getFor(entityId) {
@@ -433,58 +436,56 @@ export const mutations = {
 /* ── Embeddings ── */
 
 export const vectors = {
-  /* A walked clause — embed it, fold it into the entity's centroid as a
-     running mean, then discard the vector. SIG is ephemeral: once INS has
-     created the anchor and DEF has attached the claims with spans, the
-     clause embedding that found the entity is scaffolding the graph
-     structure has replaced. The centroid is the compressed memory of every
-     context the entity appeared in; it absorbs each clause in real time and
-     never needs the individual vectors back. */
+  /* Absorb a walked clause into the entity's centroid as a running mean,
+     then discard the vector. Returns the drift — the cosine distance the
+     centroid moved (0 = redundant, 0.3+ = rupture). SIG is ephemeral: once
+     INS has the anchor and DEF the claims, the clause embedding is
+     scaffolding the graph structure has replaced. The centroid is the
+     compressed memory of every context the entity appeared in. */
   foldClause(entityId, vec) {
-    if (!entityId) return;
+    if (!entityId) return 0;
     const existing = db.selectObject(
       "SELECT vector, clause_count FROM vec_centroids WHERE scope=? AND entity_id=?", [scope, entityId]);
     if (existing) {
       const old = toVec(existing.vector), n = existing.clause_count;
       const updated = new Float32Array(DIMS);
       for (let i = 0; i < DIMS; i++) updated[i] = (old[i] * n + vec[i]) / (n + 1);
+      const drift = 1 - cosineSim(old, updated);
       db.exec({
         sql: "UPDATE vec_centroids SET vector=?, clause_count=?, updated_at=? WHERE scope=? AND entity_id=?",
         bind: [toBlob(updated), n + 1, Date.now(), scope, entityId],
       });
-    } else {
-      db.exec({
-        sql: "INSERT INTO vec_centroids (scope,entity_id,vector,clause_count,updated_at) VALUES (?,?,?,?,?)",
-        bind: [scope, entityId, toBlob(vec), 1, Date.now()],
-      });
+      return drift;
     }
+    db.exec({
+      sql: "INSERT INTO vec_centroids (scope,entity_id,vector,clause_count,updated_at) VALUES (?,?,?,?,?)",
+      bind: [scope, entityId, toBlob(vec), 1, Date.now()],
+    });
+    return 1.0; // first clause — maximum novelty
   },
   async addClause(id, entityId, text) {
-    const vec = await embed(text);
-    vectors.foldClause(entityId, vec);
-    return vec;
+    return vectors.foldClause(entityId, await embed(text));
   },
-  /* A Given-Log clause — chat history or an unwalked document. No graph
-     structure yet, so SIG is all there is: keep the vector until the
-     material is walked, then prune it. */
-  async addGivenVector(id, text) {
-    const vec = await embed(text);
+  /* An unwalked vector — chat history or an unprocessed document passage.
+     No graph structure yet; kept until the material is walked, then pruned. */
+  writeUnwalked(id, vec) {
     db.exec({
-      sql: "INSERT OR REPLACE INTO vec_clauses (scope,id,entity_id,vector,created_at) VALUES (?,?,?,?,?)",
-      bind: [scope, id, null, toBlob(vec), Date.now()],
+      sql: "INSERT OR REPLACE INTO vec_unwalked (scope,id,vector,created_at) VALUES (?,?,?,?)",
+      bind: [scope, id, toBlob(vec), Date.now()],
     });
+  },
+  async addUnwalked(id, text) {
+    const vec = await embed(String(text).slice(0, 500));
+    vectors.writeUnwalked(id, vec);
     return vec;
   },
-  /* After a document walk completes, tear down any clause vectors for the
-     entities it walked — the centroid has absorbed them. */
-  pruneWalkedVectors(documentId) {
-    const walked = db.selectObjects(`
-      SELECT DISTINCT d.entity_id FROM defs d
-      JOIN given g ON d.source = g.id AND g.scope = d.scope
-      WHERE d.scope=? AND g.document_id=?`, [scope, documentId]);
-    for (const { entity_id } of walked) {
-      db.exec({ sql: "DELETE FROM vec_clauses WHERE scope=? AND entity_id=?", bind: [scope, entity_id] });
-    }
+  /* After a document walk completes, tear down its unwalked vectors — the
+     centroids have absorbed the material. */
+  pruneWalked(documentId) {
+    db.exec({
+      sql: "DELETE FROM vec_unwalked WHERE scope=? AND id IN (SELECT id FROM given WHERE scope=? AND document_id=?)",
+      bind: [scope, scope, documentId],
+    });
   },
   async updateHypothesisVec(entityId, hypothesisText) {
     const vec = await embed(hypothesisText);
@@ -506,9 +507,9 @@ export const vectors = {
       .map(r => ({ entityId: r.entity_id, similarity: cosineSim(qv, toVec(r.vector)) }))
       .sort((a, b) => b.similarity - a.similarity).slice(0, topK);
   },
-  async findSimilarGiven(queryText, topK = 5) {
+  async findSimilarUnwalked(queryText, topK = 5) {
     const qv = await embed(queryText);
-    return db.selectObjects("SELECT id, vector FROM vec_clauses WHERE scope=? AND entity_id IS NULL", [scope])
+    return db.selectObjects("SELECT id, vector FROM vec_unwalked WHERE scope=?", [scope])
       .map(r => ({ id: r.id, similarity: cosineSim(qv, toVec(r.vector)) }))
       .sort((a, b) => b.similarity - a.similarity).slice(0, topK);
   },
@@ -532,11 +533,37 @@ export const vectors = {
     }
     return { decision: "DIFFERENT", confidence: "high", ...cmp };
   },
+  /* ── Drift queries — drift accumulates on DEFs as the centroid moves ── */
+  driftSince(entityId, since) {
+    const row = db.selectObject(
+      "SELECT SUM(drift) AS total, COUNT(*) AS n FROM defs WHERE scope=? AND entity_id=? AND drift IS NOT NULL AND created_at>?",
+      [scope, entityId, since]);
+    return { total: row?.total || 0, count: row?.n || 0 };
+  },
+  driftTrail(entityId) {
+    return db.selectObjects(
+      "SELECT field,value,drift,created_at FROM defs WHERE scope=? AND entity_id=? AND drift IS NOT NULL ORDER BY created_at",
+      [scope, entityId]);
+  },
+  highDriftEntities(threshold = 0.15, since = 0) {
+    return db.selectObjects(`
+      SELECT entity_id, SUM(drift) AS total_drift, COUNT(*) AS clause_count
+      FROM defs WHERE scope=? AND drift IS NOT NULL AND created_at>?
+      GROUP BY entity_id HAVING total_drift>? ORDER BY total_drift DESC`,
+      [scope, since, threshold]);
+  },
+  ruptures(threshold = 0.30) {
+    return db.selectObjects(`
+      SELECT d.*, e.canonical FROM defs d
+      JOIN entities e ON d.entity_id=e.id AND e.scope=d.scope
+      WHERE d.scope=? AND d.drift>? ORDER BY d.drift DESC`,
+      [scope, threshold]);
+  },
   stats() {
-    const clauses = db.selectObject("SELECT COUNT(*) AS n FROM vec_clauses WHERE scope=?", [scope])?.n || 0;
+    const unwalked = db.selectObject("SELECT COUNT(*) AS n FROM vec_unwalked WHERE scope=?", [scope])?.n || 0;
     const centroids = db.selectObject("SELECT COUNT(*) AS n FROM vec_centroids WHERE scope=?", [scope])?.n || 0;
     const hyps = db.selectObject("SELECT COUNT(*) AS n FROM vec_hypotheses WHERE scope=?", [scope])?.n || 0;
-    return { clauses, centroids, hypotheses: hyps, bytesEstimate: clauses * (DIMS * 4) };
+    return { unwalked, centroids, hypotheses: hyps, bytesEstimate: (unwalked + centroids + hyps) * (DIMS * 4) };
   },
 };
 
@@ -586,16 +613,22 @@ function resolveId(ref, events) {
   return matches.length ? matches[0].id : null;
 }
 
-export async function applyEvents(events, sourceGivenId = null) {
-  // Phase 1 (async): embed every DEF span up front.
-  const spanVecs = [];
+/* Embed every DEF span in an event batch. Async — call before applyEvents
+   so the apply itself has no awaits. */
+export async function embedDefSpans(events) {
+  const vecs = [];
   for (let i = 0; i < events.length; i++) {
     const e = events[i];
-    if (e.op === "DEF" && e.span && e.span.length > 10) spanVecs[i] = await embed(e.span);
+    if (e.op === "DEF" && e.span && e.span.length > 10) vecs[i] = await embed(e.span);
   }
-  // Phase 2 (sync): apply every event — no await, so the active scope
-  // cannot change between writes.
-  const results = { applied: 0, skipped: 0, ambigs: [], newEntities: [] };
+  return vecs;
+}
+
+/* Apply events — fully synchronous. `spanVecs` (from embedDefSpans) carries
+   the precomputed DEF-span vectors, so no await sits between setScope and
+   the writes and the active scope cannot change mid-apply. */
+export function applyEvents(events, sourceGivenId = null, spanVecs = []) {
+  const results = { applied: 0, skipped: 0, ambigs: [], newEntities: [], ruptures: [] };
   events.forEach((evt, i) => {
     const now = Date.now();
     if (evt.op === "INS") {
@@ -618,11 +651,16 @@ export async function applyEvents(events, sourceGivenId = null) {
         const conflict = prior && prior.value !== String(evt.value) && evt.field !== "kind";
         if (prior && !conflict) defs.retire(prior.id);
         const defId = "d_" + mintHash(`${eid}::${evt.field}::${now}::${Math.random()}`);
+        // Absorb the span into the centroid; the drift is the cosine
+        // distance the centroid moved — stored on the DEF as a signal.
+        const drift = spanVecs[i] ? vectors.foldClause(eid, spanVecs[i]) : null;
         defs.write(defId, eid, evt.field, evt.value, {
           span: evt.span || null, source: sourceGivenId || evt.source || null,
-          supersedes: prior ? prior.id : null,
+          supersedes: prior ? prior.id : null, drift,
         });
-        if (spanVecs[i]) vectors.foldClause(eid, spanVecs[i]);
+        if (drift !== null && drift > 0.30) {
+          results.ruptures.push({ entityId: eid, defId, drift, field: evt.field });
+        }
         results.applied++;
       } else results.skipped++;
     } else if (evt.op === "EVA") {
@@ -661,17 +699,61 @@ export async function getEntityFull(entityId) {
 /* ── Rebuild vectors from text (after a wipe or model change) ── */
 
 export async function rebuildVectors() {
-  db.exec({ sql: "DELETE FROM vec_clauses WHERE scope=?", bind: [scope] });
+  db.exec({ sql: "DELETE FROM vec_unwalked WHERE scope=?", bind: [scope] });
   db.exec({ sql: "DELETE FROM vec_centroids WHERE scope=?", bind: [scope] });
   db.exec({ sql: "DELETE FROM vec_hypotheses WHERE scope=?", bind: [scope] });
-  for (const d of defs.getAll()) {
-    if (d.span && d.span.length > 10) await vectors.addClause(d.id, d.entity_id, d.span);
+  // Re-embed DEF spans entity by entity, folding into centroids; record the
+  // drift back onto each DEF (approximate on rebuild — order is by created_at).
+  for (const e of entities.getAll()) {
+    for (const d of defs.getFor(e.id)) {
+      if (d.span && d.span.length > 10) {
+        const drift = await vectors.addClause(d.id, e.id, d.span);
+        db.exec({ sql: "UPDATE defs SET drift=? WHERE scope=? AND id=?", bind: [drift, scope, d.id] });
+      }
+    }
+    if (e.hypothesis) await vectors.updateHypothesisVec(e.id, e.hypothesis);
   }
   for (const g of given.getAll()) {
-    if (g.text && g.text.length > 20) await vectors.addGivenVector(g.id, g.text.slice(0, 500));
+    if (!g.document_id && g.text && g.text.length > 20) await vectors.addUnwalked(g.id, g.text);
   }
-  for (const e of entities.getAll()) {
-    if (e.hypothesis) await vectors.updateHypothesisVec(e.id, e.hypothesis);
+}
+
+/* ── Merge one entity into another ── */
+
+export function mergeEntities(keep, absorb) {
+  const k = entities.get(keep), a = entities.get(absorb);
+  if (!k || !a || keep === absorb) return;
+  db.exec({ sql: "UPDATE defs SET entity_id=? WHERE scope=? AND entity_id=?", bind: [keep, scope, absorb] });
+  db.exec({ sql: "UPDATE evals SET entity_id=? WHERE scope=? AND entity_id=?", bind: [keep, scope, absorb] });
+  edges.reTarget(absorb, keep);
+  if (a.canonical) entities.addAlias(keep, a.canonical);
+  for (const al of a.aliases) entities.addAlias(keep, al);
+  entities.remove(absorb);
+  db.exec({ sql: "DELETE FROM vec_centroids WHERE scope=? AND entity_id=?", bind: [scope, absorb] });
+  db.exec({ sql: "DELETE FROM vec_hypotheses WHERE scope=? AND entity_id=?", bind: [scope, absorb] });
+}
+
+/* ── Copy one chat's whole graph into another scope (used by fork) ── */
+
+const COPY_COLS = {
+  given: "id,agent,mode,text,document_id,passage_idx,session_id,turn,dossier_hash,created_at",
+  entities: "id,canonical,terrain,hypothesis,aliases,forked_from,created_at,updated_at",
+  edges: "id,from_id,to_id,type,source,created_at",
+  defs: "id,entity_id,field,value,span,source,supersedes,retired,drift,created_at",
+  evals: "id,entity_id,claim,status,span,source,created_at",
+  hypotheses: "level,target_id,text,revision,after_label,input_count,grounded_in,created_at",
+  mutations: "action,detail,reason,triggered_by,status,created_at",
+  vec_unwalked: "id,vector,created_at",
+  vec_centroids: "entity_id,vector,clause_count,updated_at",
+  vec_hypotheses: "entity_id,vector,updated_at",
+};
+
+export function copyScope(from, to) {
+  for (const [t, cols] of Object.entries(COPY_COLS)) {
+    db.exec({
+      sql: `INSERT INTO ${t} (scope,${cols}) SELECT ?,${cols} FROM ${t} WHERE scope=?`,
+      bind: [to, from],
+    });
   }
 }
 
@@ -679,7 +761,7 @@ export async function rebuildVectors() {
 
 export function dropScope(chatId) {
   const s = chatId || scope;
-  for (const t of ["given", "entities", "edges", "defs", "evals", "hypotheses", "mutations", "vec_clauses", "vec_centroids", "vec_hypotheses"]) {
+  for (const t of ["given", "entities", "edges", "defs", "evals", "hypotheses", "mutations", "vec_unwalked", "vec_centroids", "vec_hypotheses"]) {
     db.exec({ sql: `DELETE FROM ${t} WHERE scope=?`, bind: [s] });
   }
 }

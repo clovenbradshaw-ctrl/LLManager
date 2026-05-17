@@ -1,21 +1,22 @@
-/* v3 prompts, builders and graph operations.
+/* v3 prompts, builders and graph operations — over the SQLite local store.
 
-   Memory mode runs on the situated graph (see graph.js). A chat does not
+   Memory mode runs on the situated graph in local-store.js. A chat does not
    send its growing history to the model; every turn is projected into a
    fixed-size prompt and read back into the graph.
 
    Three model calls per knowledge-bearing turn:
      READ    — user-facing, answers from the projected [CTX]
      EXTRACT — background, reads the exchange into the graph as INS/CON/DEF/EVA
-     MUTATE  — background, fires only when a mechanical trigger flags an
-               ambiguity; produces one FORK/MERGE/CORRECT/RECLASSIFY/NONE
+     MUTATE  — background, fires only on a mechanical ambiguity trigger;
+               produces one FORK/MERGE/CORRECT/RECLASSIFY/NONE
 
-   SIG is mechanical only — the NER/keyword scan that produces retrieval
-   candidates before the graph is touched. It is never stored. INS creates
-   permanent identity; kind is carried as a revisable DEF; EVA records
-   judgments; REC is reserved for MUTATE. */
+   SIG is mechanical only — the NER/keyword scan plus embedding recall that
+   produces retrieval candidates before the graph is touched. INS creates
+   permanent identity; kind is a revisable DEF; EVA records judgments; REC is
+   reserved for MUTATE. All graph reads here run against the current scope —
+   the caller sets it with store.setScope(chatId). */
 
-import { Graph, mintGivenId } from "./graph.js";
+import * as store from "./local-store.js";
 
 export const INTERVALS = {
   ENTITY_HYPOTHESIS: 1,
@@ -88,8 +89,7 @@ produce exactly ONE action as JSON. ONLY valid JSON, no markdown.
 Actions:
 
 FORK — one entity is actually two:
-{"action":"FORK","source":"<hash>","new_canonical":"<name>","reason":"<why>",
- "reassign":[{"def_id":"<id>","reason":"<why this DEF belongs to the new entity>"}]}
+{"action":"FORK","source":"<hash>","new_canonical":"<name>","reason":"<why>"}
 
 MERGE — two entities are actually one:
 {"action":"MERGE","keep":"<hash>","absorb":"<hash>","reason":"<why>",
@@ -97,7 +97,7 @@ MERGE — two entities are actually one:
 
 CORRECT — a DEF is wrong:
 {"action":"CORRECT","entity":"<hash>","field":"<field>",
- "old_value":"<wrong>","new_value":"<right>","reason":"<why>","source":"<given_id>"}
+ "old_value":"<wrong>","new_value":"<right>","reason":"<why>"}
 
 RECLASSIFY — terrain assignment is wrong:
 {"action":"RECLASSIFY","entity":"<hash>","old_terrain":"<T>","new_terrain":"<T>","reason":"<why>"}
@@ -203,7 +203,7 @@ Ground every claim in context. Do not editorialize beyond evidence.
 
 export function logUserMessage(text, signalOut, sessionId, turnNumber) {
   return {
-    id: mintGivenId("user", text, Date.now()),
+    id: store.mintGivenId("user", text),
     type: "eo.given", agent: "user", mode: "conversation",
     text, ner: signalOut?.ner || null,
     session: sessionId, turn: turnNumber, timestamp: Date.now(),
@@ -212,7 +212,7 @@ export function logUserMessage(text, signalOut, sessionId, turnNumber) {
 
 export function logModelResponse(text, model, dossierHash, sessionId, turnNumber) {
   return {
-    id: mintGivenId("model", text, Date.now()),
+    id: store.mintGivenId("model", text),
     type: "eo.given", agent: `model:${model}`, mode: "response",
     text, dossierHash: dossierHash || null,
     session: sessionId, turn: turnNumber, timestamp: Date.now(),
@@ -221,7 +221,7 @@ export function logModelResponse(text, model, dossierHash, sessionId, turnNumber
 
 export function logPassage(text, documentId, passageIndex, source) {
   return {
-    id: mintGivenId("document", text, Date.now()),
+    id: store.mintGivenId("document", text),
     type: "eo.given", agent: "system:walker", mode: "document",
     text, source: source || null,
     documentId, passageIndex, timestamp: Date.now(),
@@ -319,50 +319,53 @@ export function signal(message) {
   return { ner: extractNER(message), keywords: extractKeywords(message) };
 }
 
-const slug = (s) => String(s || "").trim().toLowerCase().replace(/\s+/g, " ");
+/* ═══ The Reach — embedding recall + mechanical scoring ═══
 
-/* ═══ The Reach — rank graph entities against the signal ═══ */
+   The embedding phase runs prior to prompting: the message is matched
+   against entity centroids and hypothesis vectors. Mechanical NER/keyword
+   matches and a 1-hop edge expansion are blended in. */
 
-export function reach(sig, graph) {
+export async function reach(sig, message) {
   const cand = new Map();
-  const add = (id, score) => cand.set(id, (cand.get(id) || 0) + score);
+  const add = (id, s) => cand.set(id, (cand.get(id) || 0) + s);
+
   for (const name of sig.ner.names) {
-    const q = slug(name);
-    for (const e of graph.allEntities()) {
-      const c = slug(e.canonical);
-      if (c.includes(q) || q.includes(c)) add(e.id, 3);
-      else if ((e.aliases || []).some(a => slug(a).includes(q) || q.includes(slug(a)))) add(e.id, 2);
-    }
+    for (const e of store.entities.search(name)) add(e.id, 3);
   }
-  for (const kw of sig.keywords) {
-    for (const e of graph.allEntities()) {
-      if (slug(e.canonical).includes(kw) || (e.hypothesis || "").toLowerCase().includes(kw)) add(e.id, 1);
-    }
+  for (const kw of sig.keywords.slice(0, 12)) {
+    for (const e of store.entities.search(kw)) add(e.id, 1);
   }
+  try {
+    const [byCentroid, byHypothesis] = await Promise.all([
+      store.vectors.findSimilarEntities(message, 6),
+      store.vectors.findSimilarByHypothesis(message, 6),
+    ]);
+    for (const m of byCentroid) add(m.entityId, m.similarity * 4);
+    for (const m of byHypothesis) add(m.entityId, m.similarity * 3);
+  } catch { /* embedding model unavailable — mechanical signals stand */ }
+
   for (const id of [...cand.keys()]) {
-    for (const edge of graph.getEdges(id)) {
-      const other = edge.from === id ? edge.to : edge.from;
-      if (!cand.has(other)) add(other, 1);
-    }
+    for (const nid of store.edges.getNeighbors(id, 1)) if (!cand.has(nid)) add(nid, 0.5);
   }
+
   return [...cand.entries()]
     .sort((a, b) => b[1] - a[1])
     .slice(0, 6)
-    .map(([id, score]) => ({ entity: graph.getEntity(id), tier: score >= 3 ? 1 : score >= 1 ? 2 : 3 }))
+    .map(([id, score]) => ({ entity: store.entities.get(id), tier: score >= 3 ? 1 : score >= 1 ? 2 : 3 }))
     .filter(r => r.entity);
 }
 
 /* ═══ The Dossier — projected [CTX] block ═══ */
 
-export function buildDossier(rankedEntities, graph, maxTokens = 350) {
+export function buildDossier(rankedEntities, maxTokens = 350) {
   let budget = maxTokens;
   const blocks = [];
   for (const { entity, tier } of rankedEntities) {
     if (!entity) continue;
-    const stateHash = graph.stateHash(entity.id);
-    const edges = graph.getEdges(entity.id);
-    const defs = graph.getDefs(entity.id);
-    const conflicts = graph.getConflicts(entity.id);
+    const stateHash = store.computeStateHash(entity.id);
+    const edges = store.edges.getFor(entity.id);
+    const defs = store.defs.getFor(entity.id);
+    const conflicts = store.defs.getConflicts(entity.id);
     const aliases = entity.aliases?.length ? entity.aliases.join(", ") : null;
 
     if (tier === 1 && budget >= 65) {
@@ -370,8 +373,8 @@ export function buildDossier(rankedEntities, graph, maxTokens = 350) {
       b += `\n  ~ ${entity.canonical}${aliases ? ", aka " + aliases : ""}`;
       b += `\n  h: ${(entity.hypothesis || "?").slice(0, 130)}`;
       for (const edge of edges.slice(0, 3)) {
-        const dir = edge.from === entity.id ? "→" : "←";
-        const target = edge.from === entity.id ? edge.to : edge.from;
+        const dir = edge.from_id === entity.id ? "→" : "←";
+        const target = edge.from_id === entity.id ? edge.to_id : edge.from_id;
         b += `\n  ${dir} ${target} (${edge.type})`;
       }
       let spanDone = false;
@@ -379,9 +382,7 @@ export function buildDossier(rankedEntities, graph, maxTokens = 350) {
         b += `\n  = ${def.field}: "${def.value}"`;
         if (def.span && !spanDone) { b += ` @"${def.span.slice(0, 50)}"`; spanDone = true; }
       }
-      for (const c of conflicts.slice(0, 1)) {
-        b += `\n  ⚠ ${c.field}: "${c.existing}" vs "${c.incoming}"`;
-      }
+      for (const c of conflicts.slice(0, 1)) b += `\n  ⚠ ${c.field}: ${c.vals}`;
       blocks.push(b); budget -= 65;
     } else if (tier === 2 && budget >= 35) {
       let b = `E: ${entity.id}@${stateHash} | ${entity.terrain}`;
@@ -399,7 +400,6 @@ export function buildDossier(rankedEntities, graph, maxTokens = 350) {
     : "[CTX]\n(no matching entities)\n[/CTX]";
 }
 
-/* The dossier hash — identifies the projection that produced a response. */
 export function dossierHashOf(dossier) {
   let h = 0x811c9dc5;
   const s = String(dossier || "");
@@ -407,15 +407,15 @@ export function dossierHashOf(dossier) {
   return "d_" + h.toString(16).padStart(8, "0");
 }
 
-/* Source spans behind the projected dossier — DEF spans and edge sources. */
-export function collectSpans(rankedEntities, graph) {
+/* Source spans behind the projected dossier — DEF spans and EVA judgments. */
+export function collectSpans(rankedEntities) {
   const spans = [];
   for (const { entity } of rankedEntities) {
     if (!entity) continue;
-    for (const d of graph.getDefs(entity.id)) {
+    for (const d of store.defs.getFor(entity.id)) {
       spans.push({ entity: entity.id, kind: "def", text: `${d.field}: ${d.value}`, source: d.source || d.span || null });
     }
-    for (const v of graph.getEvals(entity.id)) {
+    for (const v of store.evals.getFor(entity.id)) {
       spans.push({ entity: entity.id, kind: "eva", text: `${v.claim} [${v.status}]`, source: v.source || null });
     }
   }
@@ -435,12 +435,12 @@ last: "${(lastTurn.userMessage || "").slice(0, 80)}"
 
 /* ═══ The Register — known entities, so EXTRACT does not re-INS ═══ */
 
-export function buildRegister(graph, cap = 20) {
-  const entities = graph.allEntities()
-    .sort((a, b) => (b.mentions || 0) - (a.mentions || 0)).slice(0, cap);
+export function buildRegister(cap = 20) {
+  const entities = store.entities.getAll()
+    .sort((a, b) => (b.created_at || 0) - (a.created_at || 0)).slice(0, cap);
   if (!entities.length) return "Entity register: (empty — first pass)";
   return "Entity register:\n" + entities.map(e =>
-    `${e.id}@${graph.stateHash(e.id)} | ${e.canonical}${e.aliases?.length ? " | aka: " + e.aliases.join(", ") : ""} | ${e.terrain}`
+    `${e.id}@${store.computeStateHash(e.id)} | ${e.canonical}${e.aliases?.length ? " | aka: " + e.aliases.join(", ") : ""} | ${e.terrain}`
   ).join("\n");
 }
 
@@ -451,31 +451,31 @@ export function buildReaderCursor(introduced) {
 
 /* ═══ EXTRACT / MUTATE prompt builders ═══ */
 
-export function buildExtractPrompt(userMessage, modelResponse, userGivenId, modelGivenId, graph) {
-  return `${buildRegister(graph)}
+export function buildExtractPrompt(userMessage, modelResponse, userGivenId, modelGivenId) {
+  return `${buildRegister()}
 
 EXCHANGE:
 User [${userGivenId}]: "${String(userMessage).slice(0, 4000)}"
 Model [${modelGivenId}]: "${String(modelResponse).slice(0, 4000)}"`;
 }
 
-export function buildMutatePrompt(trigger, graph) {
+export function buildMutatePrompt(trigger) {
   const { name, candidateHash, span, context } = trigger;
   let prompt = `Ambiguous reference: "${name || "(unnamed)"}"`;
   if (span) prompt += `\nSource span: "${span}"`;
   if (context) prompt += `\nContext: "${context}"`;
-  const candidate = candidateHash ? graph.getEntity(candidateHash) : null;
+  const candidate = candidateHash ? store.entities.get(candidateHash) : null;
   if (candidate) {
     prompt += `\n\nExisting entity that might match:`;
-    prompt += `\n  ${candidate.id}@${graph.stateHash(candidate.id)}`;
+    prompt += `\n  ${candidate.id}@${store.computeStateHash(candidate.id)}`;
     prompt += `\n  canonical: ${candidate.canonical}`;
     prompt += `\n  terrain: ${candidate.terrain}`;
     prompt += `\n  h: ${candidate.hypothesis || "?"}`;
-    for (const d of graph.getDefs(candidate.id).slice(0, 6)) {
-      prompt += `\n  [${d.id}] = ${d.field}: "${d.value}"`;
+    for (const d of store.defs.getFor(candidate.id).slice(0, 6)) {
+      prompt += `\n  = ${d.field}: "${d.value}"`;
     }
-    for (const c of graph.getConflicts(candidate.id)) {
-      prompt += `\n  ⚠ ${c.field}: "${c.existing}" vs "${c.incoming}"`;
+    for (const c of store.defs.getConflicts(candidate.id)) {
+      prompt += `\n  ⚠ ${c.field}: ${c.vals}`;
     }
   }
   prompt += `\n\nIs "${name || "this"}" the same entity as ${candidateHash || "an existing one"}, or different? Decide one action.`;
@@ -491,54 +491,54 @@ export function getHypothesisSystemPrompt(level) {
   }[level] || HYPOTHESIS_ENTITY;
 }
 
-function getChildInputs(level, id, graph) {
+function getChildInputs(level, id) {
   switch (level) {
     case "entity": {
-      const e = graph.getEntity(id);
+      const e = store.entities.get(id);
       if (!e) return [];
-      const defs = graph.getDefs(id), edges = graph.getEdges(id);
-      const lines = [`${id}@${graph.stateHash(id)} | ${e.canonical} | ${e.terrain}`];
+      const defs = store.defs.getFor(id), edges = store.edges.getFor(id);
+      const lines = [`${id}@${store.computeStateHash(id)} | ${e.canonical} | ${e.terrain}`];
       if (defs.length) lines.push(`Facts: ${defs.map(d => `${d.field}="${d.value}"`).join(", ")}`);
-      if (edges.length) lines.push(`Connections: ${edges.map(x => `→${x.to} (${x.type})`).join(", ")}`);
+      if (edges.length) lines.push(`Connections: ${edges.map(x => `→${x.to_id} (${x.type})`).join(", ")}`);
       return lines;
     }
     case "group":
-      return graph.getEntitiesInRange(id.start, id.end)
-        .map(e => `${e.id}@${graph.stateHash(e.id)} ${e.canonical}: "${e.hypothesis || "?"}"`);
+      return store.entities.getInRange(id.start, id.end)
+        .map(e => `${e.id}@${store.computeStateHash(e.id)} ${e.canonical}: "${e.hypothesis || "?"}"`);
     case "section":
-      return graph.getPassageGroupDEFs(id.start, id.end)
-        .map((g, i) => `group ${i + 1} (p${g.start + 1}-${g.end + 1}): "${g.hypothesis}"`);
+      return store.hypotheses.getByLevel("group")
+        .map((g, i) => `group ${i + 1}: "${g.text}"`);
     case "document":
-      return graph.getSectionDEFs(id.documentId)
-        .map((s, i) => `section ${i + 1}: "${s.hypothesis}"`);
+      return store.hypotheses.getByLevel("section")
+        .map((s, i) => `section ${i + 1}: "${s.text}"`);
     case "session":
-      return [
-        ...graph.getSessionDocumentDEFs().map(d => `doc "${d.title}": "${d.hypothesis}"`),
-        ...graph.getSessionTopics().map(t => `topic: "${t}"`),
-      ];
+      return store.hypotheses.getByLevel("document")
+        .map(d => `document: "${d.text}"`);
     case "corpus":
       return [
-        ...graph.getRecentDocumentDEFs(10).map(d => `"${d.title}": "${d.hypothesis}"`),
-        ...graph.getRecentSessionDEFs(5).map(s => `session: "${s.hypothesis}"`),
+        ...store.hypotheses.getByLevel("document").map(d => `document: "${d.text}"`),
+        ...store.hypotheses.getByLevel("session").map(s => `session: "${s.text}"`),
       ];
     default: return [];
   }
 }
 
-export function buildHypothesisPrompt(level, id, graph) {
-  const children = getChildInputs(level, id, graph);
-  const history = graph.getHypothesisHistory(level, id);
+export function buildHypothesisPrompt(level, id) {
+  const children = getChildInputs(level, id);
+  const targetKey = typeof id === "string" ? id
+    : id?.documentId || id?.sessionId || (id?.start != null ? `${id.start}-${id.end}` : "_");
+  const history = store.hypotheses.getHistory(level, targetKey);
   let prompt = children.join("\n");
   if (history.length) {
     prompt += "\n\nPrior hypotheses (oldest first):";
     history.forEach((h, i) => {
-      prompt += `\n  rev ${i + 1} (${h.after}, ${h.inputCount} inputs): "${h.text}"`;
+      prompt += `\n  rev ${i + 1} (${h.after_label || ""}, ${h.input_count || 0} inputs): "${h.text}"`;
     });
   }
   return prompt;
 }
 
-/* ═══ Apply EXTRACT / INGEST events to the graph ═══ */
+/* ═══ Parsing ═══ */
 
 export function parseEvents(out) {
   if (Array.isArray(out)) return out.filter(e => e && typeof e === "object" && e.op);
@@ -550,96 +550,6 @@ export function parseEvents(out) {
     const parsed = JSON.parse(raw);
     return Array.isArray(parsed) ? parsed.filter(e => e && typeof e === "object" && e.op) : [];
   } catch { return []; }
-}
-
-/* Apply parsed events. Conflicting DEFs are written without retiring the
-   prior value, so the dossier surfaces ⚠ and the next turn can flag it.
-   Returns { applied, ambigs, conflicts }. */
-export function applyEvents(graph, events, opts = {}) {
-  const source = opts.source || null;
-  let applied = 0;
-  const ambigs = [], conflicts = [];
-  for (const e of events) {
-    if (e.op === "AMBIG") {
-      ambigs.push({ name: String(e.name || "").trim(), candidateHash: String(e.candidate || "").trim(), span: String(e.span || "").trim() });
-    } else if (e.op === "INS") {
-      const ent = graph.ensureEntity(e.entity, { canonical: e.entity, terrain: e.terrain });
-      if (ent && opts.passageIndex != null && !ent.passages.includes(opts.passageIndex)) {
-        ent.passages.push(opts.passageIndex);
-      }
-      if (ent) applied++;
-    } else if (e.op === "DEF") {
-      const ent = graph.ensureEntity(e.entity, { canonical: e.entity });
-      if (ent && e.field && e.value != null) {
-        const prior = graph.getDef(ent.id, e.field);
-        const isConflict = prior && prior.value !== String(e.value) && e.field !== "kind";
-        if (isConflict) conflicts.push({ entity: ent.id, field: e.field, existing: prior.value, incoming: String(e.value) });
-        graph.writeDef(ent.id, e.field, e.value, { source: e.source || source, span: e.span || null, supersede: !isConflict });
-        applied++;
-      }
-    } else if (e.op === "CON") {
-      const from = graph.ensureEntity(e.from, { canonical: e.from });
-      const to = graph.ensureEntity(e.to, { canonical: e.to });
-      if (from && to && from.id !== to.id) {
-        graph.addEdge(from.id, to.id, e.type || "related to", { source: e.source || source });
-        applied++;
-      }
-    } else if (e.op === "EVA") {
-      const ent = graph.ensureEntity(e.entity, { canonical: e.entity });
-      if (ent && e.claim) {
-        graph.writeEval(ent.id, e.claim, e.status || "holds", { source: e.source || source, span: e.span || null });
-        applied++;
-      }
-    }
-  }
-  return { applied, ambigs, conflicts };
-}
-
-/* ═══ MUTATE: triggers, parse, apply ═══ */
-
-const REF_UNCERTAIN = [
-  /\bmay not be (?:the same|identical)(?: as)? (e_[0-9a-f]{8})/i,
-  /\bmight be (?:a )?different (?:from |than )?(e_[0-9a-f]{8})/i,
-  /\bnot (?:the same|identical) (?:as |to )(e_[0-9a-f]{8})/i,
-  /\b(e_[0-9a-f]{8})\b[^.?!]*?\b(?:may not|might not|not the same)\b/i,
-];
-const CORRECTION_RE = /\b(?:that(?:'s| is) not the same|those are the same|different (?:person|place|thing|one|entity)|you(?:'re| are) (?:confusing|mixing)|not who i meant|i meant (?:a )?different|wrong (?:person|entity|one)|mixed (?:them|it) up)\b/i;
-
-/* Detect ambiguities mechanically — zero tokens. */
-export function detectMutationTriggers(modelResponse, extractEvents, sig, graph) {
-  const triggers = [];
-  for (const re of REF_UNCERTAIN) {
-    const m = re.exec(modelResponse || "");
-    if (m && graph.getEntity(m[1])) {
-      triggers.push({ type: "model_flagged", candidateHash: m[1], span: m[0].trim() });
-    }
-  }
-  for (const evt of extractEvents || []) {
-    if (evt.op === "AMBIG") {
-      triggers.push({ type: "ingest_ambig", name: evt.name, candidateHash: evt.candidate, span: evt.span });
-    }
-  }
-  for (const name of sig?.ner?.names || []) {
-    const guessed = sig.ner.typed[name];
-    if (!guessed) continue;
-    const matches = graph.searchEntities(name);
-    if (matches.length === 1) {
-      const kindDef = graph.getDef(matches[0].id, "kind");
-      if (kindDef && kindDef.value !== guessed) {
-        triggers.push({
-          type: "type_mismatch", name, candidateHash: matches[0].id,
-          context: `reads as ${guessed} but recorded kind is ${kindDef.value}`,
-        });
-      }
-    }
-  }
-  return triggers;
-}
-
-export function userCorrectionTrigger(userMessage, graph, lastEntities = []) {
-  if (!CORRECTION_RE.test(userMessage || "")) return null;
-  const candidateHash = lastEntities.find(id => graph.getEntity(id)) || null;
-  return { type: "user_correction", candidateHash, context: String(userMessage).slice(0, 200) };
 }
 
 export function parseMutate(out) {
@@ -656,73 +566,97 @@ export function parseMutate(out) {
   return { ...obj, action, reason: String(obj.reason || "").trim() };
 }
 
-/* Apply a MUTATE action to the graph. Logs the mutation as an event. */
-export function applyMutation(action, graph, triggerId) {
-  const event = { timestamp: Date.now(), triggeredBy: triggerId || null, action: action.action, reason: action.reason };
+/* ═══ MUTATE: triggers and apply ═══ */
+
+const REF_UNCERTAIN = [
+  /\bmay not be (?:the same|identical)(?: as)? (e_[0-9a-f]{8})/i,
+  /\bmight be (?:a )?different (?:from |than )?(e_[0-9a-f]{8})/i,
+  /\bnot (?:the same|identical) (?:as |to )(e_[0-9a-f]{8})/i,
+  /\b(e_[0-9a-f]{8})\b[^.?!]*?\b(?:may not|might not|not the same)\b/i,
+];
+const CORRECTION_RE = /\b(?:that(?:'s| is) not the same|those are the same|different (?:person|place|thing|one|entity)|you(?:'re| are) (?:confusing|mixing)|not who i meant|i meant (?:a )?different|wrong (?:person|entity|one)|mixed (?:them|it) up)\b/i;
+
+export function detectMutationTriggers(modelResponse, extractEvents, sig) {
+  const triggers = [];
+  for (const re of REF_UNCERTAIN) {
+    const m = re.exec(modelResponse || "");
+    if (m && store.entities.get(m[1])) {
+      triggers.push({ type: "model_flagged", candidateHash: m[1], span: m[0].trim() });
+    }
+  }
+  for (const evt of extractEvents || []) {
+    if (evt.op === "AMBIG") {
+      triggers.push({ type: "ingest_ambig", name: evt.name, candidateHash: evt.candidate, span: evt.span });
+    }
+  }
+  for (const name of sig?.ner?.names || []) {
+    const guessed = sig.ner.typed[name];
+    if (!guessed) continue;
+    const matches = store.entities.search(name);
+    if (matches.length === 1) {
+      const kindDef = store.defs.get(matches[0].id, "kind");
+      if (kindDef && kindDef.value !== guessed) {
+        triggers.push({
+          type: "type_mismatch", name, candidateHash: matches[0].id,
+          context: `reads as ${guessed} but recorded kind is ${kindDef.value}`,
+        });
+      }
+    }
+  }
+  return triggers;
+}
+
+export function userCorrectionTrigger(userMessage, lastEntities = []) {
+  if (!CORRECTION_RE.test(userMessage || "")) return null;
+  const candidateHash = lastEntities.find(id => store.entities.get(id)) || null;
+  return { type: "user_correction", candidateHash, context: String(userMessage).slice(0, 200) };
+}
+
+/* Apply a MUTATE action to the graph. Logs the mutation. */
+export function applyMutation(action, triggerId) {
   switch (action.action) {
     case "FORK": {
-      const src = graph.getEntity(action.source);
+      const src = store.entities.get(action.source);
       if (src && action.new_canonical) {
-        const ne = graph.ensureEntity(action.new_canonical, { canonical: action.new_canonical, terrain: src.terrain });
-        ne.forkedFrom = action.source;
-        for (const r of action.reassign || []) graph.reassignDef(r.def_id, action.source, ne.id);
-        event.op = "SEG"; event.sourceEntity = action.source; event.newEntity = ne.id;
+        const id = store.mintEntityId(action.new_canonical);
+        store.entities.create(id, action.new_canonical, src.terrain, { forkedFrom: action.source });
       }
       break;
     }
     case "MERGE":
-      if (graph.getEntity(action.keep) && graph.getEntity(action.absorb)) {
-        graph.mergeEntities(action.keep, action.absorb);
-        for (const a of action.new_aliases || []) graph.addAlias(action.keep, a);
-        event.op = "CON"; event.type = "same_as"; event.keep = action.keep; event.absorb = action.absorb;
+      if (store.entities.get(action.keep) && store.entities.get(action.absorb)) {
+        store.mergeEntities(action.keep, action.absorb);
+        for (const a of action.new_aliases || []) store.entities.addAlias(action.keep, a);
       }
       break;
     case "CORRECT": {
-      const ent = graph.getEntity(action.entity);
+      const ent = store.entities.get(action.entity);
       if (ent && action.field) {
-        // Retire every live DEF on the field, then write the corrected one.
-        for (const d of graph.getDefs(action.entity)) if (d.field === action.field) d.retired = true;
-        graph.writeDef(action.entity, action.field, action.new_value, { source: action.source });
-        event.op = "DEF"; event.entity = action.entity; event.field = action.field;
-        event.oldValue = action.old_value; event.newValue = action.new_value;
+        for (const d of store.defs.getFor(action.entity)) if (d.field === action.field) store.defs.retire(d.id);
+        const defId = "d_" + store.mintHash(`${action.entity}::${action.field}::${Date.now()}::${Math.random()}`);
+        store.defs.write(defId, action.entity, action.field, action.new_value, { source: "mutate:correct" });
       }
       break;
     }
     case "RECLASSIFY":
-      if (graph.getEntity(action.entity)) {
-        graph.updateTerrain(action.entity, action.new_terrain);
-        event.op = "SEG"; event.entity = action.entity;
-        event.oldTerrain = action.old_terrain; event.newTerrain = action.new_terrain;
-      }
+      if (store.entities.get(action.entity)) store.entities.updateTerrain(action.entity, action.new_terrain);
       break;
     case "NONE":
-      event.op = "NUL";
+    default:
       break;
   }
-  graph.appendEvent(event);
-  return event;
+  store.mutations.log(action.action, action, action.reason, triggerId || null, "applied");
 }
 
 /* ═══ Auto-commit tiers ═══
 
    AUTO commits silently. PROMPT surfaces an inline consent pill. REQUIRE
-   blocks until the user acts. Forks, merges, reclassifications and
-   conflicting facts always need consent. */
-export function commitTier(event, graph) {
-  switch (event.op || event.action) {
-    case "CON": return event.type === "same_as" ? "PROMPT" : "AUTO";
-    case "SEG": return "PROMPT";
+   blocks until the user acts. */
+export function commitTier(action) {
+  switch (action) {
     case "FORK": case "MERGE": case "RECLASSIFY": return "PROMPT";
-    case "DEF": case "CORRECT": {
-      if (event.entity && event.field) {
-        const existing = graph.getDef(event.entity, event.field);
-        if (existing && event.newValue != null && existing.value !== event.newValue) return "PROMPT";
-      }
-      return "AUTO";
-    }
-    case "INS": return "AUTO";
-    case "EVA": return event.status === "contested" ? "PROMPT" : "AUTO";
-    case "REC": return "REQUIRE";
+    case "CORRECT": return "PROMPT";
+    case "NONE": return "AUTO";
     default: return "AUTO";
   }
 }
@@ -735,7 +669,3 @@ export function shouldConsolidate(state) {
   if (state.consolidationLock) return false;
   return true;
 }
-
-/* Re-export Graph helpers so Chat.jsx has one import surface. */
-export { Graph } from "./graph.js";
-export { mergeGraphs } from "./graph.js";
