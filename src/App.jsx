@@ -440,7 +440,7 @@ OLLAMA_ORIGINS="${pageOrigin || "https://myapp.com"},http://localhost:3000" olla
         </div>
       ) : tab === "chat2" ? (
         <div style={{ flex: 1, minHeight: 0 }}>
-          <Chat2 ollamaUrl={ollamaUrl} ollamaUp={ollamaUp} />
+          <Chat2 ollamaUrl={ollamaUrl} ollamaModels={ollamaModelList} browserModels={loadedBrowserList} ollamaUp={ollamaUp} />
         </div>
       ) : tab === "matrix" ? (
         <div style={{ flex: 1, minHeight: 0, overflowY: "auto" }}>
