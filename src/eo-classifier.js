@@ -789,7 +789,7 @@ export const GROUNDED_SYSTEM =
    generates rhetorical-function hypotheses, scored retroactively against
    the rest of the document. */
 
-export async function runSecondPass(register, llm, onProgress) {
+export async function runSecondPass(register, llm, onProgress, gate) {
   const triggers = register.triggerPoints || [];
   if (triggers.length === 0) return [];
 
@@ -799,6 +799,9 @@ export async function runSecondPass(register, llm, onProgress) {
   for (let t = 0; t < triggers.length; t++) {
     const tp = triggers[t];
     if (onProgress) onProgress(`Interpreting trigger ${t + 1}/${triggers.length} [${tp.trigger.reason}]…`);
+
+    // Yield the single LLM to anything with priority (a user question).
+    if (gate) await gate();
 
     let context = "ACTIVE FRAMES:\n";
     for (const f of register.frames.filter(f => f.generatedAt <= tp.clauseIndex)) {
@@ -877,7 +880,7 @@ export const RECLASSIFY_SYSTEM =
 /* llm is an async (system, user) => string. clauses is the local clause
    array for this block; graph/clauseBase are optional — when supplied, the
    functional operator is written back onto the cumulative graph's clause. */
-export async function reclassifyFlags(register, clauses, graph, clauseBase, llm, onProgress) {
+export async function reclassifyFlags(register, clauses, graph, clauseBase, llm, onProgress, gate) {
   const flags = register.flags || [];
   const validOps = new Set(Object.keys(OPERATORS));
   const changed = [];
@@ -886,6 +889,9 @@ export async function reclassifyFlags(register, clauses, graph, clauseBase, llm,
     const flag = flags[f];
     if (flag.functionalOp) continue; // already read
     if (onProgress) onProgress(`Reading flagged clause ${f + 1}/${flags.length} [${flag.reason}]…`);
+
+    // Yield the single LLM to anything with priority (a user question).
+    if (gate) await gate();
 
     const ci = flag.clauseIndex;
     const start = Math.max(0, ci - 2);

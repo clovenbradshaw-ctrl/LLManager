@@ -5,6 +5,7 @@ import {
   askAboutEntity, foldFrames,
 } from "./eo-classifier.js";
 import { getBrowserEngine } from "./webllm.js";
+import { logEvent } from "./event-log.js";
 
 /* Chat Mode 2.0 — the EO Classifier as a chat.
 
@@ -160,6 +161,7 @@ const C = {
 
 let msgSeq = 0;
 const nextId = () => `m${++msgSeq}`;
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
 /* ── Operator distribution bar for an analysis card ── */
 function OpSummary({ opCounts, total, inertCount }) {
@@ -379,6 +381,91 @@ function FlagPanel({ register }) {
   );
 }
 
+/* ── Reading log — how each hypothesis was defined, then redefined ──
+
+   The register's history is a chronological record of the read. Grouped per
+   frame it reads as a lifeline: the clause where a hypothesis was first
+   DEFINED, every later clause where it was REDEFINED, and how often it was
+   confirmed downstream. LLM frames from the deep-reading walk are the
+   aggregating hypotheses — second-pass readings layered over the mechanical
+   ones. Reclassifications close the log: where surface ≠ function. ── */
+function ReadingLog({ register }) {
+  const [open, setOpen] = useState(false);
+  const history = register.history || [];
+  const frameEvents = history.filter(h =>
+    h.frame && (h.event === "created" || h.event === "refined"));
+  const reclass = history.filter(h => h.event === "reclassified");
+  if (frameEvents.length === 0 && reclass.length === 0) return null;
+
+  const order = [];
+  const byFrame = {};
+  for (const h of frameEvents) {
+    if (!byFrame[h.frame]) { byFrame[h.frame] = []; order.push(h.frame); }
+    byFrame[h.frame].push(h);
+  }
+
+  return (
+    <div style={{ marginTop: 8 }}>
+      <button onClick={() => setOpen(o => !o)} style={btn(false)}>
+        {open ? "Hide" : "Show"} reading log ({order.length} hypothes{order.length !== 1 ? "es" : "is"}
+        {reclass.length > 0 ? `, ${reclass.length} reclassified` : ""})
+      </button>
+      {open && (
+        <div style={{ marginTop: 8 }}>
+          {order.map(fid => {
+            const evs = byFrame[fid];
+            const isLlm = evs.some(e => e.source === "llm");
+            const confirms = history.filter(h => h.frame === fid && h.event === "confirmed").length;
+            return (
+              <div key={fid} style={{
+                marginBottom: 8, paddingLeft: 10,
+                borderLeft: `2px solid ${isLlm ? C.accent : C.green}`,
+              }}>
+                <div style={{ fontSize: 9, fontFamily: mono, color: isLlm ? C.accent : C.green, marginBottom: 3 }}>
+                  {fid}{isLlm ? " · aggregating hypothesis (deep-read)" : ""}
+                </div>
+                {evs.map((e, i) => (
+                  <div key={i} style={{ fontSize: 11.5, lineHeight: 1.45, marginBottom: 3, color: C.text }}>
+                    <span style={{
+                      fontSize: 9, fontFamily: mono, padding: "1px 5px", borderRadius: 3, marginRight: 6,
+                      background: e.event === "refined" ? "rgba(251,191,36,0.15)" : "rgba(48,164,108,0.15)",
+                      color: e.event === "refined" ? C.amber : C.green,
+                    }}>
+                      {e.event === "refined" ? "REDEFINED" : "DEFINED"} c{e.at + 1}
+                    </span>
+                    {e.text}
+                  </div>
+                ))}
+                {confirms > 0 && (
+                  <div style={{ fontSize: 10, color: C.dim, fontFamily: mono }}>
+                    confirmed {confirms}× downstream
+                  </div>
+                )}
+              </div>
+            );
+          })}
+          {reclass.length > 0 && (
+            <div style={{ marginTop: 6 }}>
+              <div style={{ fontSize: 9, textTransform: "uppercase", letterSpacing: "0.1em", color: C.orange, marginBottom: 4 }}>
+                Reclassified — surface ≠ function
+              </div>
+              {reclass.map((h, i) => (
+                <div key={i} style={{ fontSize: 11, fontFamily: mono, color: C.text, marginBottom: 2 }}>
+                  <span style={{ color: C.dim }}>c{h.at + 1}</span>{" "}
+                  <s style={{ color: C.dim }}>{h.mechanicalOp}</s>
+                  {" → "}
+                  <strong style={{ color: C.orange }}>{h.functionalOp}</strong>
+                  <span style={{ color: C.dim }}> — {h.text}</span>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 /* ── A single analysis card (assistant turn for ingested material) ── */
 function AnalysisCard({ msg, onDeepRead, deepReadBusy, llmReady }) {
   const [showDetail, setShowDetail] = useState(false);
@@ -426,6 +513,7 @@ function AnalysisCard({ msg, onDeepRead, deepReadBusy, llmReady }) {
 
       <FramePanel register={register} />
       <FlagPanel register={register} />
+      <ReadingLog register={register} />
 
       <div style={{ display: "flex", gap: 8, marginTop: 10, flexWrap: "wrap" }}>
         <button onClick={() => setShowDetail(s => !s)} style={btn(false)}>
@@ -439,14 +527,14 @@ function AnalysisCard({ msg, onDeepRead, deepReadBusy, llmReady }) {
               : `${triggerCount} trigger point${triggerCount !== 1 ? "s" : ""}, ${flagCount} flagged clause${flagCount !== 1 ? "s" : ""}`}
             style={btn(true, deepReadBusy || !llmReady)}
           >
-            {deepReadBusy ? "Reading…"
+            {deepReadBusy ? "Walking…"
               : `Deep read (${triggerCount} trigger${triggerCount !== 1 ? "s" : ""}` +
                 (flagCount > 0 ? `, ${flagCount} flag${flagCount !== 1 ? "s" : ""}` : "") + ")"}
           </button>
         )}
         {msg.deepReadDone && (
           <span style={{ fontSize: 11, color: C.accent, alignSelf: "center" }}>
-            ⬡ deep read complete
+            ⬡ deep reading walk complete
           </span>
         )}
       </div>
@@ -706,6 +794,10 @@ export default function Chat2({ ollamaUrl, ollamaModels, browserModels }) {
   const graphRef = useRef(emptyGraph());
   const clauseBaseRef = useRef(0);
   const scrollRef = useRef(null);
+  // Single-LLM coordination — only one of {answering a question, deep-reading
+  // walk} may hold the model at a time, and a question always wins.
+  const questionBusyRef = useRef(false); // a user question is using the LLM
+  const walkBusyRef = useRef(false);     // an auto deep-reading walk is running
   const [graphTick, setGraphTick] = useState(0); // forces stat re-render
   const [showGraph, setShowGraph] = useState(false);
 
@@ -770,15 +862,17 @@ export default function Chat2({ ollamaUrl, ollamaModels, browserModels }) {
         && r.entity && !r.entity.startsWith("("))
       .map(r => r.entity))];
 
-    setMessages(m => [...m, {
+    const analysisMsg = {
       id: nextId(), role: "assistant", kind: "analysis",
       provenance: provenance || "pasted text",
       stats: { ...added, clauseRows: clauseRows.length, inertCount, revivedCount, entityNames },
       opCounts, results, clauses, register, clauseBase: base,
       triggerCount: register.triggerPoints?.length || 0,
       deepReadDone: false,
-    }]);
+    };
+    setMessages(m => [...m, analysisMsg]);
     setStatus(`Graph: ${Object.keys(graphRef.current.entities).length} entities, ${graphRef.current.claims.length} claims, ${graphRef.current.clauses.length} clauses.`);
+    return analysisMsg;
   }, []);
 
   const answerQuestion = useCallback(async (text) => {
@@ -896,6 +990,74 @@ export default function Chat2({ ollamaUrl, ollamaModels, browserModels }) {
     setStatus("Ready.");
   }, [messages, selectedModel, ollamaUrl, graphHasContent]);
 
+  /* The gate the deep-reading walk awaits before every LLM call: it blocks
+     while a user question holds the model, so the walk pauses the instant a
+     question is sent and resumes once the answer is delivered. */
+  const walkGate = useCallback(async () => {
+    let waited = false;
+    while (questionBusyRef.current) {
+      waited = true;
+      setStatus("Deep reading paused — answering your question first…");
+      await sleep(250);
+    }
+    if (waited) setStatus("Question answered — resuming the deep reading walk…");
+  }, []);
+
+  /* The deep-reading walk — interpret every trigger point and reclassify
+     every flagged clause with the LLM. Runs automatically after ingestion and
+     in the background; `walkGate` makes it yield the single LLM to questions.
+     Operates on the message object directly so it is closure-stable. */
+  const walkAnalysis = useCallback(async (analysisMsg) => {
+    if (!analysisMsg || walkBusyRef.current) return;
+    if (!selectedModel) return; // no model — the manual Deep read button remains
+    const flagCount = analysisMsg.register.flags?.length || 0;
+    if ((analysisMsg.triggerCount || 0) === 0 && flagCount === 0) return;
+
+    walkBusyRef.current = true;
+    setDeepReadBusy(true);
+    logEvent("info", "deep-read",
+      `Deep reading walk started — ${analysisMsg.triggerCount} trigger`
+      + `${analysisMsg.triggerCount !== 1 ? "s" : ""}, ${flagCount} flagged clause`
+      + `${flagCount !== 1 ? "s" : ""}`);
+    try {
+      const llm = (sys, user) => generate({
+        model: selectedModel.name, isBrowser: selectedModel.isBrowser, ollamaUrl,
+        system: sys, user,
+      });
+      const reg = analysisMsg.register;
+      const framesBefore = reg.frames.length;
+      await runSecondPass(reg, llm, setStatus, walkGate);
+      const changed = await reclassifyFlags(
+        reg, analysisMsg.clauses, graphRef.current, analysisMsg.clauseBase, llm, setStatus, walkGate);
+      // The walk added LLM frames — re-fold them so point-based folds see the
+      // aggregating hypotheses the deep read produced.
+      foldFrames(graphRef.current, reg, analysisMsg.clauseBase);
+      setGraphTick(t => t + 1);
+      setMessages(m => m.map(x => x.id === analysisMsg.id
+        ? { ...x, register: { ...reg }, deepReadDone: true } : x));
+
+      const newFrames = reg.frames.slice(framesBefore);
+      logEvent("ok", "deep-read",
+        `Deep reading walk complete — ${newFrames.length} aggregating hypothes`
+        + `${newFrames.length !== 1 ? "es" : "is"}, ${changed.length} reclassified`,
+        null,
+        [
+          ...newFrames.map(f => `hypothesis: ${f.text}`),
+          ...changed.map(f => `reclassified c${f.clauseIndex + 1}: ${f.mechanicalOp} → ${f.functionalOp}`),
+        ]);
+      setStatus(flagCount > 0
+        ? `Deep reading walk complete — ${changed.length}/${flagCount} flagged clause`
+          + `${flagCount !== 1 ? "s" : ""} reclassified.`
+        : "Deep reading walk complete — aggregating hypotheses added to the register.");
+    } catch (e) {
+      logEvent("error", "deep-read", `Deep reading walk failed: ${e?.message || e}`);
+      setStatus(`Deep reading walk failed: ${e?.message || e}`);
+    } finally {
+      walkBusyRef.current = false;
+      setDeepReadBusy(false);
+    }
+  }, [selectedModel, ollamaUrl, walkGate]);
+
   const handleSend = useCallback(async () => {
     const text = input.trim();
     if (!text || busy) return;
@@ -903,6 +1065,7 @@ export default function Chat2({ ollamaUrl, ollamaModels, browserModels }) {
     setMessages(m => [...m, { id: nextId(), role: "user", kind: "question", text }]);
     setInput("");
     setBusy(true);
+    questionBusyRef.current = true; // take LLM priority — pauses any walk
     try {
       await answerQuestion(text);
     } catch (e) {
@@ -910,6 +1073,7 @@ export default function Chat2({ ollamaUrl, ollamaModels, browserModels }) {
         text: e?.message || String(e) }]);
       setStatus("Error — see the message above.");
     } finally {
+      questionBusyRef.current = false; // release the LLM back to the walk
       setBusy(false);
     }
   }, [input, busy, answerQuestion]);
@@ -921,8 +1085,9 @@ export default function Chat2({ ollamaUrl, ollamaModels, browserModels }) {
     const prov = (provenance || "").trim() || "pasted text";
     setMessages(m => [...m, { id: nextId(), role: "user", kind: "source", text: clean, provenance: prov }]);
     setBusy(true);
+    let analysisMsg = null;
     try {
-      await ingestMaterial(clean, prov);
+      analysisMsg = await ingestMaterial(clean, prov);
     } catch (e) {
       setMessages(m => [...m, { id: nextId(), role: "assistant", kind: "error",
         text: e?.message || String(e) }]);
@@ -930,7 +1095,11 @@ export default function Chat2({ ollamaUrl, ollamaModels, browserModels }) {
     } finally {
       setBusy(false);
     }
-  }, [ingestMaterial]);
+    // Once ingestion is done, automatically run the deep-reading walk. It is
+    // not awaited — it runs in the background and yields the single LLM to
+    // any question the user sends in the meantime.
+    if (analysisMsg) walkAnalysis(analysisMsg);
+  }, [ingestMaterial, walkAnalysis]);
 
   const handlePasteSource = useCallback(async () => {
     if (!sourceText.trim() || busy) return;
@@ -957,41 +1126,19 @@ export default function Chat2({ ollamaUrl, ollamaModels, browserModels }) {
     }
   }, [addSource]);
 
-  const handleDeepRead = useCallback(async (msgId) => {
+  /* Manual trigger — the deep-reading walk normally runs automatically after
+     ingestion, but this re-arms it for a source whose walk was skipped (no
+     model loaded at ingest time, or another walk was already running). */
+  const handleDeepRead = useCallback((msgId) => {
+    if (deepReadBusy || walkBusyRef.current) return;
     const msg = messages.find(m => m.id === msgId);
-    if (!msg || deepReadBusy) return;
+    if (!msg) return;
     if (!selectedModel) {
       setStatus("No model available for the deep read — load one in the Chat or Settings tab.");
       return;
     }
-    setDeepReadBusy(true);
-    try {
-      const llm = (sys, user) => generate({
-        model: selectedModel.name, isBrowser: selectedModel.isBrowser, ollamaUrl,
-        system: sys, user,
-      });
-      await runSecondPass(msg.register, llm, setStatus);
-      // Functional reclassification of the flagged clauses — the LLM names
-      // the operator that is actually functioning where surface and function
-      // diverged. The result is written back into the cumulative graph.
-      const changed = await reclassifyFlags(
-        msg.register, msg.clauses, graphRef.current, msg.clauseBase, llm, setStatus);
-      // The deep read added LLM frames to the register — re-fold them into the
-      // graph so point-based folds see the active reading they produced.
-      foldFrames(graphRef.current, msg.register, msg.clauseBase);
-      setGraphTick(t => t + 1);
-      setMessages(m => m.map(x => x.id === msgId
-        ? { ...x, register: { ...msg.register }, deepReadDone: true } : x));
-      const flagCount = msg.register.flags?.length || 0;
-      setStatus(flagCount > 0
-        ? `Deep read complete — ${changed.length}/${flagCount} flagged clause${flagCount !== 1 ? "s" : ""} reclassified.`
-        : "Deep read complete — LLM hypotheses added to the register.");
-    } catch (e) {
-      setStatus(`Deep read failed: ${e?.message || e}`);
-    } finally {
-      setDeepReadBusy(false);
-    }
-  }, [messages, deepReadBusy, selectedModel, ollamaUrl]);
+    walkAnalysis(msg);
+  }, [messages, deepReadBusy, selectedModel, walkAnalysis]);
 
   const g = graphRef.current;
 
