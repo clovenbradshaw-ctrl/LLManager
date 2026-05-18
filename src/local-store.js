@@ -378,6 +378,9 @@ export const edges = {
   getFor(entityId) {
     return db.selectObjects("SELECT * FROM edges WHERE scope=? AND (from_id=? OR to_id=?)", [scope, entityId, entityId]);
   },
+  getAll() {
+    return db.selectObjects("SELECT * FROM edges WHERE scope=? ORDER BY created_at", [scope]);
+  },
   getNeighbors(entityId, hops = 2) {
     let frontier = new Set([entityId]);
     const visited = new Set([entityId]);

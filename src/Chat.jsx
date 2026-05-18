@@ -815,20 +815,75 @@ function EventRow({ e, levelColor }) {
   );
 }
 
+/* Snapshot the current chat's graph — every entity, edge and DEF the
+   reading walk has created in the active scope. */
+function graphSnapshot() {
+  if (!store.ready()) return null;
+  try {
+    return {
+      scope: store.getScope(),
+      entities: store.entities.getAll(),
+      edges: store.edges.getAll(),
+      defs: store.defs.getAll(),
+    };
+  } catch {
+    return null;
+  }
+}
+
+/* Download a JSON payload as a file. */
+function downloadJSON(data, name) {
+  const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = name;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}
+
 /* ── App-wide event-log panel — a live feed of what the app is doing ── */
 function EventLogPanel() {
   const [events, setEvents] = useState(getEvents);
   useEffect(() => subscribeEvents(setEvents), []);
   const levelColor = (l) => l === "error" ? C.red : l === "warn" ? C.orange : l === "ok" ? C.green : C.dim;
+
+  const graph = graphSnapshot();
+
+  const exportAll = () => {
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+    downloadJSON({
+      exportedAt: new Date().toISOString(),
+      eventCount: events.length,
+      events,
+      graph,
+    }, `llmanager-log-${stamp}.json`);
+  };
+
   return (
     <div>
       <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10 }}>
         <div style={{ fontSize: 11.5, color: C.dim, lineHeight: 1.6, flex: 1 }}>
           Everything the app does — passages read, chat turns, model and graph
-          errors — oldest first. A live feed for this browser session.
+          errors — oldest first. A live feed for this browser session. Export
+          writes the full untruncated log plus a snapshot of the graph objects
+          (entities, links and DEFs) read into the current chat.
         </div>
+        <button onClick={exportAll} style={{ ...pillBtn(true), flexShrink: 0 }}>Export</button>
         <button onClick={() => clearEvents()} style={{ ...pillBtn(false), flexShrink: 0 }}>Clear</button>
       </div>
+      {graph && (
+        <div style={{ display: "flex", gap: 12, marginBottom: 10, padding: "7px 11px",
+          background: C.bg, border: `1px solid ${C.border}`, borderRadius: 8,
+          fontFamily: mono, fontSize: 10.5, color: C.dim }}>
+          <span>graph <b style={{ color: C.text }}>{graph.scope}</b></span>
+          <span><b style={{ color: C.accent }}>{graph.entities.length}</b> entities</span>
+          <span><b style={{ color: C.accent }}>{graph.edges.length}</b> links</span>
+          <span><b style={{ color: C.accent }}>{graph.defs.length}</b> DEFs</span>
+        </div>
+      )}
       {events.length === 0 ? (
         <div style={{ fontSize: 11.5, color: C.dim, padding: "20px 0", textAlign: "center" }}>
           No events yet — read a document or send a message.
