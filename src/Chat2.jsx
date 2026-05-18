@@ -1,16 +1,91 @@
-import { useState, useEffect, useRef, useCallback } from "react";
+import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import {
   OPERATORS, OP_COLORS, processText, emptyGraph, appendToGraph,
   buildDossier, runSecondPass, reclassifyFlags, looksLikeQuestion, GROUNDED_SYSTEM,
 } from "./eo-classifier.js";
-import { initRouter, callModel } from "./model-router.js";
+import { getBrowserEngine } from "./webllm.js";
 
 /* Chat Mode 2.0 — the EO Classifier as a chat.
 
    The library-and-folders ingest flow is replaced by the chat itself:
    paste material and it is cleaned, split into clauses, classified against
-   the 27 EO centroids and folded into a cumulative in-memory graph. Ask a
-   question and it is answered, grounded, from that graph. */
+   the 27 EO centroids and folded into a cumulative in-memory graph.
+
+   Answering is graph-grounded, not conversation-grounded: a question is
+   never answered by replaying the chat or the raw pasted text. It is
+   answered from a dossier — entities, claims and passages retrieved from
+   the structured graph for that specific question — and nothing else. */
+
+const MODEL_KEY = "llmanager.chat2.model";
+
+/* Unified generation over both runtimes. Pass `onToken` to stream (it is
+   called with the full text so far); omit it for a blocking call. A `format`
+   JSON schema constrains Ollama output for the deep-read calls. */
+async function generate({ model, isBrowser, ollamaUrl, system, user, format, onToken }) {
+  const messages = [
+    { role: "system", content: system },
+    { role: "user", content: user },
+  ];
+
+  if (isBrowser) {
+    const engine = await getBrowserEngine(model, report => {
+      if (onToken) {
+        const pct = Math.round((report.progress || 0) * 100);
+        onToken(null, `Loading ${model} — ${report.text || pct + "%"}`);
+      }
+    });
+    if (onToken) {
+      const chunks = await engine.chat.completions.create({
+        messages, stream: true, temperature: format ? 0 : 0.3,
+      });
+      let raw = "";
+      for await (const ch of chunks) {
+        const d = ch.choices?.[0]?.delta?.content || "";
+        if (d) { raw += d; onToken(raw, null); }
+      }
+      return raw;
+    }
+    const reply = await engine.chat.completions.create({
+      messages, temperature: format ? 0 : 0.3,
+    });
+    return reply.choices?.[0]?.message?.content || "";
+  }
+
+  // Ollama
+  const body = {
+    model, messages, stream: !!onToken, keep_alive: "30m",
+    options: { temperature: format ? 0 : 0.3, num_ctx: 8192 },
+  };
+  if (format) body.format = format;
+  const r = await fetch(`${ollamaUrl}/api/chat`, {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!r.ok) throw new Error(`Ollama HTTP ${r.status} — is the server running and the model installed?`);
+  if (!onToken) {
+    const data = await r.json();
+    return data.message?.content || "";
+  }
+  const reader = r.body.getReader();
+  const dec = new TextDecoder();
+  let buf = "", raw = "";
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += dec.decode(value, { stream: true });
+    const lines = buf.split("\n");
+    buf = lines.pop();
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      let j;
+      try { j = JSON.parse(line); } catch { continue; }
+      if (j.error) throw new Error(j.error);
+      const c = j.message?.content || "";
+      if (c) { raw += c; onToken(raw, null); }
+    }
+  }
+  return raw;
+}
 
 const mono = `'SF Mono','Menlo','Consolas',monospace`;
 const C = {
@@ -280,7 +355,10 @@ function AnswerCard({ msg }) {
     }}>
       <div style={{
         fontSize: 14, lineHeight: 1.65, color: C.text, whiteSpace: "pre-wrap",
-      }}>{msg.text}</div>
+      }}>
+        {msg.text || (msg.streaming ? <span style={{ color: C.dim }}>Generating…</span> : "")}
+        {msg.streaming && msg.text && <span style={{ color: C.accent }}>▍</span>}
+      </div>
       {msg.spans.length > 0 && (
         <div>
           <div style={{ fontSize: 9, textTransform: "uppercase", letterSpacing: "0.08em", color: C.dim, marginBottom: 6, fontFamily: mono }}>
@@ -308,6 +386,12 @@ function AnswerCard({ msg }) {
   );
 }
 
+const selectStyle = {
+  background: C.s1, border: `1px solid ${C.border}`, color: C.text,
+  fontSize: 11, fontFamily: mono, padding: "5px 7px", borderRadius: 6,
+  maxWidth: 168,
+};
+
 function btn(primary, disabled) {
   return {
     padding: "5px 12px", fontSize: 11, fontFamily: mono, fontWeight: 600,
@@ -318,38 +402,49 @@ function btn(primary, disabled) {
   };
 }
 
-export default function Chat2({ ollamaUrl, ollamaUp }) {
+export default function Chat2({ ollamaUrl, ollamaModels, browserModels }) {
   const [messages, setMessages] = useState([]);
   const [input, setInput] = useState("");
   const [sendMode, setSendMode] = useState("auto"); // auto | material | question
   const [status, setStatus] = useState("Paste any text below — it is read straight into the graph.");
   const [busy, setBusy] = useState(false);
   const [deepReadBusy, setDeepReadBusy] = useState(false);
-  const [router, setRouter] = useState(null);
+  const [model, setModel] = useState(() => {
+    try { return localStorage.getItem(MODEL_KEY) || ""; } catch { return ""; }
+  });
 
   const graphRef = useRef(emptyGraph());
   const clauseBaseRef = useRef(0);
   const scrollRef = useRef(null);
   const [graphTick, setGraphTick] = useState(0); // forces stat re-render
 
+  // Every Ollama model and every loaded in-browser model — the same rosters
+  // the main Chat picker offers.
+  const modelOptions = useMemo(() => [
+    ...(ollamaModels || []).map(m => ({ name: m.name, isBrowser: false, label: m.name })),
+    ...(browserModels || []).map(m => ({ name: m.name, isBrowser: true, label: `${m.name} · in-browser` })),
+  ], [ollamaModels, browserModels]);
+
+  // Keep the selection valid as the rosters change.
   useEffect(() => {
-    let alive = true;
-    initRouter(ollamaUrl).then(r => { if (alive) setRouter(r); }).catch(() => {});
-    return () => { alive = false; };
-  }, [ollamaUrl, ollamaUp]);
+    if (modelOptions.length === 0) return;
+    if (!model || !modelOptions.some(o => o.name === model)) {
+      setModel(modelOptions[0].name);
+    }
+  }, [modelOptions]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  useEffect(() => {
+    if (model) { try { localStorage.setItem(MODEL_KEY, model); } catch { /* ignore */ } }
+  }, [model]);
 
   useEffect(() => {
     if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
   }, [messages]);
 
-  const llmReady = !!router?.assignments?.write;
+  const selectedModel = modelOptions.find(o => o.name === model) || null;
+  const llmReady = !!selectedModel;
   const graphHasContent = Object.keys(graphRef.current.entities).length > 0
     || graphRef.current.clauses.length > 0;
-
-  const askLLM = useCallback(async (assignment, system, user, options) => {
-    if (!assignment) throw new Error("No model available — start Ollama or load an in-browser model, then reopen this tab.");
-    return callModel(assignment, system, user, options);
-  }, []);
 
   const ingestMaterial = useCallback(async (text) => {
     setStatus("Loading embedding model (first run downloads ~25 MB)…");
@@ -389,12 +484,33 @@ export default function Chat2({ ollamaUrl, ollamaUp }) {
   }, []);
 
   const answerQuestion = useCallback(async (text) => {
+    if (!selectedModel) {
+      throw new Error("No model selected. Start Ollama, or load an in-browser model from the Chat or Settings tab, then pick it in the composer below.");
+    }
     setStatus("Retrieving context from the graph…");
-    const { ctx, docs, spans } = await buildDossier(graphRef.current, text);
-    const a = router?.assignments?.write;
-    setStatus("Generating grounded answer…");
-    const prompt = `${ctx}\n\n${docs}\n\n${text}`;
-    const answer = await askLLM(a, GROUNDED_SYSTEM, prompt, { temperature: 0.3, numCtx: 8192, maxTokens: 1024 });
+
+    // Short follow-ups ("why?", "and her brother?") carry little signal of
+    // their own — fold in the previous question so graph retrieval still
+    // lands on the right region.
+    const prevQ = [...messages].reverse().find(m => m.role === "user" && m.kind === "question");
+    const prevA = [...messages].reverse().find(m => m.role === "assistant" && m.kind === "answer");
+    const retrievalQuery = (text.split(/\s+/).length < 5 && prevQ)
+      ? `${prevQ.text} ${text}` : text;
+
+    // The dossier IS the context — entities, claims and passages pulled from
+    // the structured graph for this question. The chat history and the raw
+    // pasted text are never sent wholesale.
+    const { ctx, docs, spans } = await buildDossier(graphRef.current, retrievalQuery);
+
+    // Light continuity: the previous exchange only, marked explicitly as a
+    // reference for resolving pronouns — never treated as a source.
+    let convo = "";
+    if (prevQ && prevA && prevA.text) {
+      convo = "[EARLIER EXCHANGE — for resolving references only, NOT a source]\n"
+        + `Q: ${prevQ.text}\nA: ${prevA.text.slice(0, 400)}\n[/EARLIER EXCHANGE]\n\n`;
+    }
+
+    const prompt = `${ctx}\n\n${docs}\n\n${convo}QUESTION: ${text}`;
 
     // Dedup spans for the evidence column.
     const seen = new Set();
@@ -406,13 +522,29 @@ export default function Chat2({ ollamaUrl, ollamaUp }) {
       uniqueSpans.push(s);
     }
 
+    const answerId = nextId();
     setMessages(m => [...m, {
-      id: nextId(), role: "assistant", kind: "answer",
-      text: String(answer).trim() || "(empty response)",
-      spans: uniqueSpans.slice(0, 12),
+      id: answerId, role: "assistant", kind: "answer",
+      text: "", spans: uniqueSpans.slice(0, 12), streaming: true,
     }]);
+    setStatus("Generating grounded answer…");
+
+    let final = "";
+    await generate({
+      model: selectedModel.name, isBrowser: selectedModel.isBrowser, ollamaUrl,
+      system: GROUNDED_SYSTEM, user: prompt,
+      onToken: (raw, loading) => {
+        if (loading != null) { setStatus(loading); return; }
+        final = raw;
+        setMessages(m => m.map(x => x.id === answerId ? { ...x, text: raw } : x));
+      },
+    });
+
+    setMessages(m => m.map(x => x.id === answerId
+      ? { ...x, text: final.trim() || "(the model returned an empty response)", streaming: false }
+      : x));
     setStatus("Ready.");
-  }, [router, askLLM]);
+  }, [messages, selectedModel, ollamaUrl]);
 
   const handleSend = useCallback(async () => {
     const text = input.trim();
@@ -449,22 +581,22 @@ export default function Chat2({ ollamaUrl, ollamaUp }) {
   const handleDeepRead = useCallback(async (msgId) => {
     const msg = messages.find(m => m.id === msgId);
     if (!msg || deepReadBusy) return;
-    const a = router?.assignments?.hypothesis || router?.assignments?.read;
-    if (!a) {
-      setStatus("No model available for the deep read.");
+    if (!selectedModel) {
+      setStatus("No model selected for the deep read — pick one in the composer.");
       return;
     }
     setDeepReadBusy(true);
     try {
-      await runSecondPass(msg.register, (sys, user) =>
-        callModel(a, sys, user, { temperature: 0.4, maxTokens: 300 }), setStatus);
+      const llm = (sys, user) => generate({
+        model: selectedModel.name, isBrowser: selectedModel.isBrowser, ollamaUrl,
+        system: sys, user,
+      });
+      await runSecondPass(msg.register, llm, setStatus);
       // Functional reclassification of the flagged clauses — the LLM names
       // the operator that is actually functioning where surface and function
       // diverged. The result is written back into the cumulative graph.
       const changed = await reclassifyFlags(
-        msg.register, msg.clauses, graphRef.current, msg.clauseBase,
-        (sys, user) => callModel(a, sys, user, { temperature: 0.2, maxTokens: 200 }),
-        setStatus);
+        msg.register, msg.clauses, graphRef.current, msg.clauseBase, llm, setStatus);
       setGraphTick(t => t + 1);
       setMessages(m => m.map(x => x.id === msgId
         ? { ...x, register: { ...msg.register }, deepReadDone: true } : x));
@@ -477,7 +609,7 @@ export default function Chat2({ ollamaUrl, ollamaUp }) {
     } finally {
       setDeepReadBusy(false);
     }
-  }, [messages, deepReadBusy, router]);
+  }, [messages, deepReadBusy, selectedModel, ollamaUrl]);
 
   const g = graphRef.current;
 
@@ -493,8 +625,8 @@ export default function Chat2({ ollamaUrl, ollamaUp }) {
             <>{Object.keys(g.entities).length} entities · {g.claims.length} claims · {g.clauses.length} clauses · </>
           )}
           {llmReady
-            ? <span style={{ color: C.green }}>model ready</span>
-            : <span style={{ color: C.orange }}>no model — ingest works, answers need Ollama/in-browser</span>}
+            ? <span style={{ color: C.green }}>answering with {selectedModel.name}{selectedModel.isBrowser ? " (in-browser)" : ""}</span>
+            : <span style={{ color: C.orange }}>no model — ingest works; load one in the Chat or Settings tab to ask questions</span>}
         </div>
       </div>
 
@@ -582,11 +714,20 @@ export default function Chat2({ ollamaUrl, ollamaUp }) {
               fontSize: 13, lineHeight: 1.5, padding: 10, fontFamily: "inherit",
             }}
           />
-          <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-            <select value={sendMode} onChange={e => setSendMode(e.target.value)} style={{
-              background: C.s1, border: `1px solid ${C.border}`, color: C.text,
-              fontSize: 11, fontFamily: mono, padding: "5px 7px", borderRadius: 6,
-            }}>
+          <div style={{ display: "flex", flexDirection: "column", gap: 6, minWidth: 168 }}>
+            <select
+              value={model}
+              onChange={e => setModel(e.target.value)}
+              disabled={modelOptions.length === 0}
+              title="Model used for grounded answers and the deep read"
+              style={selectStyle}
+            >
+              {modelOptions.length === 0 && <option value="">no model loaded</option>}
+              {modelOptions.map(o => (
+                <option key={o.name} value={o.name}>{o.label}</option>
+              ))}
+            </select>
+            <select value={sendMode} onChange={e => setSendMode(e.target.value)} style={selectStyle}>
               <option value="auto">Auto-detect</option>
               <option value="material">As material</option>
               <option value="question">As question</option>
