@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from "react";
 import Chat from "./Chat.jsx";
+import Chat2 from "./Chat2.jsx";
 import RoutingPanel from "./RoutingPanel.jsx";
 import MatrixGate from "./MatrixGate.jsx";
 import MatrixChat from "./MatrixChat.jsx";
@@ -424,11 +425,11 @@ OLLAMA_ORIGINS="${pageOrigin || "https://myapp.com"},http://localhost:3000" olla
           ))}
         </div>
         <div style={{ display: "flex", gap: 6 }}>
-          {["chat", "matrix", "settings"].map(t => (
+          {[["chat", "Chat"], ["chat2", "Chat 2.0"], ["matrix", "Matrix"], ["settings", "Settings"]].map(([t, label]) => (
             <button key={t} onClick={() => setTab(t)} style={{
-              padding: "7px 16px", fontSize: 12, fontWeight: 600, borderRadius: 8, cursor: "pointer", textTransform: "capitalize",
+              padding: "7px 16px", fontSize: 12, fontWeight: 600, borderRadius: 8, cursor: "pointer",
               border: `1px solid ${tab === t ? C.accent : C.border}`, background: tab === t ? C.accent : "transparent", color: tab === t ? "#fff" : C.dim,
-            }}>{t}</button>
+            }}>{label}</button>
           ))}
         </div>
       </div>
@@ -436,6 +437,10 @@ OLLAMA_ORIGINS="${pageOrigin || "https://myapp.com"},http://localhost:3000" olla
       {tab === "chat" ? (
         <div style={{ flex: 1, minHeight: 0 }}>
           <Chat ollamaUrl={ollamaUrl} ollamaModels={ollamaModelList} browserModels={loadedBrowserList} ollamaUp={ollamaUp} />
+        </div>
+      ) : tab === "chat2" ? (
+        <div style={{ flex: 1, minHeight: 0 }}>
+          <Chat2 ollamaUrl={ollamaUrl} ollamaUp={ollamaUp} />
         </div>
       ) : tab === "matrix" ? (
         <div style={{ flex: 1, minHeight: 0, overflowY: "auto" }}>
