@@ -35,6 +35,24 @@ If the material covers the question, answer from it.
 If it only partly covers it, say what you can see and what is still being read.
 If it doesn't cover it at all, just answer normally.
 
+The material is graded by how well it has been read — state your confidence
+to match it:
+  - Grounded entities (E:) and their facts have been read closely — answer
+    with confidence.
+  - PARTIAL entities and [partial] passages come from a document still being
+    read — answer provisionally and say the reading is in progress.
+  - UNREAD passages and [skim] passages are a quick embedding match from a
+    document not yet read closely — flag the answer as a first impression.
+When you are not working from a confident, grounded answer, say so plainly.
+
+[READING] is your running understanding of the documents being read. When
+the user asks what a document is about or what you have learned, answer from
+[READING]: give its understanding and the key threads, and state how much
+has been read. Do not just list raw passages back.
+A "skim" line is a first-pass guess from a glance — say so, and treat it as
+provisional. A "document" line is a synthesis from a full read — answer it
+with confidence.
+
 When the user asks what the material says or what you have, give a summary
 of the key points — not just "yes" or a one-liner.
 
@@ -43,6 +61,30 @@ Never narrate your process. Just answer the question.`;
 
 export const READ_CASUAL = `You are a helpful assistant. Be concise and natural.
 Your messages are recorded in a knowledge graph.`;
+
+/* ═══ Prompt: GROUNDED (ask-with-documents) ═══
+   The model interprets; the code supplies and presents the evidence. The
+   numbered sources are the ONLY material it may draw facts from. */
+
+export const GROUNDED_SYSTEM = `Answer the question using ONLY the numbered sources in [DOCS].
+
+Return a single JSON object: { "runs": [ ... ] }.
+Each run is an object: { "text": "...", "cites": [n], "ungrounded": true }.
+
+Rules:
+- Concatenated, every run's "text" forms the full answer. Split the answer so
+  each factual claim is its own run, immediately followed by the source
+  number(s) that support it in "cites".
+- Every number in "cites" MUST be a source number shown in [DOCS]. Never
+  invent a number and never cite a source that is not listed.
+- Do NOT add facts that are not in the numbered sources. If the sources do
+  not answer the question, say so plainly.
+- If a sentence is your own inference and not supported by any source, put it
+  in its own run with "ungrounded": true and no "cites". Use this sparingly.
+- Paraphrase — do not quote the sources at length; the user sees them already.
+- Keep the whole answer concise. Never restate these instructions or tags.
+
+Return ONLY the JSON object. No prose outside it, no code fences.`;
 
 /* ═══ Prompt: EXTRACT (background) ═══ */
 
@@ -217,6 +259,11 @@ Write ONLY the sentence.`;
 export const HYPOTHESIS_CORPUS = `Write a one-sentence hypothesis for what this body of work is about.
 You see ONLY document and session hypotheses.
 Under 200 characters. Capture the overarching inquiry.
+Write ONLY the sentence.`;
+
+export const HYPOTHESIS_SKIM = `You are skimming a document for the first time — only its opening lines and the names that jump out, not a close reading.
+Write a one-sentence hypothesis for what this document is probably about.
+Under 200 characters. A first impression: specific but provisional, the kind a reader forms in a few seconds.
 Write ONLY the sentence.`;
 
 /* ═══ Prompts: Write mode ═══ */
@@ -428,6 +475,29 @@ export function resolveFollowUpReferences(message, position) {
   return null;
 }
 
+/* Zoom — how far out is this question pitched? The hypothesis hierarchy
+   (entity → group → section → document) is a stack of zoom levels; the
+   question selects which one to project into [READING]:
+
+     entity   — names an entity the graph knows; wants its facts (from [CTX])
+     group    — asks how things connect/relate; wants the threads
+     document — asks what something is overall about; wants the synthesis
+     section  — the default middle zoom
+
+   This is the availability function over the hypothesis hierarchy. */
+const ZOOM_THEME_RE = /\b(how|why|connects?|connection|relates?|related|relationship|themes?|patterns?|links?|tie|ties)\b/i;
+const ZOOM_OVERVIEW_RE = /\b(summar(?:y|ise|ize)|overview|gist|overall|tell me about|what have you learned|what(?:'s| is| are| is this|'s this)|main (?:point|idea))\b/i;
+
+export function selectZoom(message) {
+  const q = String(message || "");
+  const names = signal(q).ner.names;
+  if (names.some(n => store.entities.search(n).length > 0)) return "entity";
+  if (ZOOM_THEME_RE.test(q)) return "group";
+  if (ZOOM_OVERVIEW_RE.test(q) || /\bwhat\b[^?]*\b(about|says?|covers?|discuss|learned)\b/i.test(q))
+    return "document";
+  return "section";
+}
+
 /* ═══ The Signal — mechanical NER + keywords (SIG: candidates only) ═══ */
 
 const COMMON_CAPS = new Set([
@@ -581,35 +651,14 @@ export async function retrieve(query, { topK = 6, position = null } = {}) {
   return deduped.slice(0, topK);
 }
 
-/* Mechanical document lookup — no model, no embeddings. Splits each opted-in
-   document back into passages and scores every passage against the query by
-   keyword and entity-name overlap, returning the top matches as a [DOCS]
-   block to inject straight into the prompt. This backs the composer's
-   "ask with documents" trigger: a deterministic pull of source text, separate
-   from the graph projection. When nothing overlaps (a general question), it
-   falls back to each document's opening passages so the block is never empty.
-   Identical passage text is deduplicated, so the same document imported twice
-   never lands the same passage in the block more than once. */
-export function lookupDocuments(query, docs, { topK = 6 } = {}) {
+/* Keyword fallback — entity-name and keyword overlap, no embeddings. Used
+   only when a document has no stored passage vectors to score against
+   (opted in from another chat's scope, or never embedded). */
+function scorePassagesByKeyword(query, passages) {
   const qSig = signal(query || "");
   const qKw = qSig.keywords;
   const qNames = qSig.ner.names.map(n => n.toLowerCase());
-
-  const passages = [];
-  const seenText = new Set();
-  for (const doc of docs || []) {
-    const text = (doc?.text || "").trim();
-    if (!text) continue;
-    splitPassages(text).forEach((p, i) => {
-      const key = p.trim().toLowerCase();
-      if (seenText.has(key)) return;
-      seenText.add(key);
-      passages.push({ text: p, index: i });
-    });
-  }
-  if (!passages.length) return "";
-
-  const scored = passages.map(p => {
+  return passages.map(p => {
     const pSig = signal(p.text);
     const pl = p.text.toLowerCase();
     const kwHits = qKw.filter(k => pSig.keywords.includes(k) || pl.includes(k)).length;
@@ -618,12 +667,91 @@ export function lookupDocuments(query, docs, { topK = 6 } = {}) {
     const nameScore = qNames.length ? nameHits / qNames.length : 0;
     return { ...p, score: kwScore * 0.6 + nameScore * 0.4 };
   });
+}
 
-  let top = scored.filter(p => p.score > 0).sort((a, b) => b.score - a.score).slice(0, topK);
-  if (!top.length) top = passages.slice(0, topK); // general question — show the openings
+/* Document lookup — embedding-based RAG over opted-in library documents,
+   backing the composer's "ask with documents" trigger.
 
-  const lines = top.map((r, i) => `${i + 1}: "${r.text.trim()}"`);
-  return `[DOCS]\n${lines.join("\n")}\n[/DOCS]`;
+   Standard embedding similarity: the query is embedded once, then scored by
+   cosine against each document's precomputed passage vectors (written into
+   this chat's scope by the first pass — see ensureDocEmbedded) — no
+   per-query re-embedding, so the pull is fast. A document is only pulled
+   here until it has been fully read; once its walk completes the graph
+   projection ([CTX] entities) carries it instead, so a read document is
+   skipped. Each passage is tagged with the document's reading confidence —
+   [skim] (not yet read) or [partial] (walk in progress) — so the model can
+   state how provisional its answer is. Documents with no stored vectors
+   fall back to keyword overlap. Identical passage text is deduplicated.
+
+   Returns { text, spans }: the [DOCS] block for the prompt, and one source
+   span per pulled passage so the chunk it came from stays auditable. */
+export async function lookupDocuments(query, docs, { topK = 6 } = {}) {
+  const myScope = store.getScope();
+  let queryVec = null;
+  try { queryVec = await store.embed(query || ""); } catch { /* embeddings optional */ }
+  store.setScope(myScope);
+  const allUnwalked = store.vectors.dumpUnwalked();
+
+  const scored = [];
+  for (const doc of docs || []) {
+    const text = (doc?.text || "").trim();
+    if (!text) continue;
+    const docPassages = splitPassages(text);
+
+    const reg = store.documents.get(doc.id);
+    const walked = reg?.walked || 0;
+    const total = reg?.total || docPassages.length;
+    // Fully read — the [CTX] graph projection carries it with confidence.
+    if (total > 0 && walked >= total) continue;
+    const confidence = walked > 0 ? "partial" : "skim";
+
+    const vecRows = allUnwalked.filter(r => r.documentId === doc.id);
+    if (queryVec && vecRows.length) {
+      for (const r of vecRows) {
+        scored.push({
+          docId: doc.id, docTitle: doc.title, text: r.text,
+          index: r.passageIdx ?? 0, confidence,
+          score: store.cosineSim(queryVec, r.vec),
+        });
+      }
+    } else {
+      // No stored vectors — keyword fallback over the raw passages.
+      for (const s of scorePassagesByKeyword(query,
+        docPassages.map((p, i) => ({ text: p, index: i })))) {
+        scored.push({ docId: doc.id, docTitle: doc.title, ...s, confidence });
+      }
+    }
+  }
+  if (!scored.length) return { text: "", spans: [] };
+
+  const seen = new Set();
+  const dedup = (rows) => rows.filter(r => {
+    const k = r.text.trim().toLowerCase();
+    if (seen.has(k)) return false;
+    seen.add(k);
+    return true;
+  });
+  let top = dedup(scored.filter(r => r.score > 0).sort((a, b) => b.score - a.score))
+    .slice(0, topK);
+  if (!top.length) top = dedup(scored).slice(0, topK); // general question — openings
+
+  const lines = top.map((r, i) => `${i + 1}: [${r.confidence}] "${r.text.trim()}"`);
+  // Spans are first-class evidence — numbered, code-built, displayed beside the
+  // answer. The model cites these numbers; it never mints span text.
+  const spans = top.map((r, i) => {
+    const t = r.text.trim();
+    return {
+      index: i + 1,
+      entity: r.docTitle || r.docId,   // back-compat for PromptView
+      kind: "passage",
+      text: t.length > 400 ? t.slice(0, 400) + "…" : t,
+      source: r.docTitle || "document",
+      passageIndex: r.index,
+      status: r.confidence === "partial" ? "walking" : "sig",
+      similarity: r.score || 0,
+    };
+  });
+  return { text: lines.length ? `[DOCS]\n${lines.join("\n")}\n[/DOCS]` : "", spans };
 }
 
 /* The first pass — mechanical NER, no model. Mints SIG entities the instant
@@ -719,6 +847,55 @@ function originLine(entityId) {
   return parts.length ? parts.join(" + ") : null;
 }
 
+/* ═══ Adaptive scale — compression activates only when the window overflows ═══
+
+   A hypothesis is lossy compression of facts, forced by a finite prompt
+   window. If the evidence already fits, compressing it is pure overhead and
+   loses fidelity for nothing. Every layer — the walk, entity hypotheses,
+   group/section/document hypotheses — exists to fit an unbounded document
+   into a bounded window, and each activates only when the layer below
+   overflows its budget. Below the window the system is plain RAG with
+   provenance; above it, it compresses progressively up the hierarchy. */
+export const DOSSIER_BUDGET = 350;   // tokens for the whole [CTX] dossier
+const TIER_1_BUDGET = 65;            // tokens for one walked entity's slot
+
+export function estimateTokens(text) {
+  return Math.ceil(String(text || "").length / 4);
+}
+
+/* Tokens to show an entity's evidence raw — every DEF and edge, uncompressed. */
+function entityEvidenceTokens(entityId) {
+  return store.defs.getFor(entityId).length * 12 + store.edges.getFor(entityId).length * 8;
+}
+
+/* Does this entity's evidence overflow its dossier slot? Below the slot the
+   DEFs are shown directly — more faithful than any hypothesis of them. */
+export function shouldHypothesizeEntity(entityId) {
+  return entityEvidenceTokens(entityId) > TIER_1_BUDGET;
+}
+
+/* Do the entity hypotheses in a passage range overflow the digest budget?
+   Below it, the entity hypotheses are shown directly — no group needed. */
+export function shouldHypothesizeGroup(start, end) {
+  return store.entities.getInRange(start, end).length * 20 > 100;
+}
+
+/* Do the accumulated group hypotheses overflow — time to roll them up? */
+export function shouldRollUpSection() {
+  return store.hypotheses.getByLevel("group").length > 3;
+}
+
+/* The ingest strategy for a document, decided by its size against the window:
+     raw       — fits the dossier whole; do not walk, read it directly
+     defs-only — walk to DEFs, which still fit; no hypotheses
+     full      — walk and compress through the hypothesis hierarchy */
+export function shouldWalk(text) {
+  const tokens = estimateTokens(text);
+  if (tokens <= DOSSIER_BUDGET) return { strategy: "raw", hypothesize: false };
+  if (tokens <= DOSSIER_BUDGET * 3) return { strategy: "defs-only", hypothesize: false };
+  return { strategy: "full", hypothesize: true };
+}
+
 /* A grounded (walked) entity block — structured and provenanced. */
 function formatWalked(entity, full = true) {
   const stateHash = store.computeStateHash(entity.id);
@@ -728,21 +905,31 @@ function formatWalked(entity, full = true) {
   let b = `E: ${entity.id}@${stateHash} | ${entity.terrain} | ${edges.length}`;
   b += `\n  ~ ${entity.canonical}${entity.aliases?.length ? ", aka " + entity.aliases.join(", ") : ""}`;
   if (from) b += `\n  from: ${from}`;
-  b += `\n  h: ${(entity.hypothesis || "?").slice(0, 130)}`;
-  if (full) {
+
+  if (shouldHypothesizeEntity(entity.id)) {
+    // Evidence overflows the slot — show the compressed hypothesis + top DEFs.
+    b += `\n  h: ${(entity.hypothesis || "?").slice(0, 130)}`;
+    let spanDone = false;
+    for (const def of defs.slice(0, full ? 3 : 2)) {
+      b += `\n  = ${def.field}: "${def.value}"`;
+      if (def.span && !spanDone && full) { b += ` @"${def.span.slice(0, 50)}"`; spanDone = true; }
+    }
+    if (full) {
+      for (const c of store.defs.getConflicts(entity.id).slice(0, 1)) b += `\n  ⚠ ${c.field}: ${c.vals}`;
+    }
+  } else {
+    // Evidence fits the slot — show every DEF and edge raw. The facts
+    // themselves are more faithful than any hypothesis compressing them.
     for (const edge of edges.slice(0, 3)) {
       const dir = edge.from_id === entity.id ? "→" : "←";
       const target = edge.from_id === entity.id ? edge.to_id : edge.from_id;
       b += `\n  ${dir} ${target} (${edge.type})`;
     }
     let spanDone = false;
-    for (const def of defs.slice(0, 3)) {
+    for (const def of defs) {
       b += `\n  = ${def.field}: "${def.value}"`;
       if (def.span && !spanDone) { b += ` @"${def.span.slice(0, 50)}"`; spanDone = true; }
     }
-    for (const c of store.defs.getConflicts(entity.id).slice(0, 1)) b += `\n  ⚠ ${c.field}: ${c.vals}`;
-  } else {
-    for (const def of defs.slice(0, 2)) b += `\n  = ${def.field}: "${def.value}"`;
   }
   return b;
 }
@@ -822,6 +1009,60 @@ export function collectSpans(results) {
     }
   }
   return spans;
+}
+
+/* ═══ The Reading Digest — projected running understanding ═══
+
+   The walk produces a hierarchy of hypotheses as it reads: group (every few
+   passages), section (every dozen), document (the whole). They are the
+   system's own synthesis — exactly what a "what have you learned / what is
+   this about" question wants — but the Reach only retrieves entities and raw
+   passages, so they were never shown to the model.
+
+   This projects them at the zoom the question calls for (see selectZoom).
+   The document hypothesis is the headline, marked honestly: a SKIM is the
+   first-pass guess from NER and embeddings before the walk; a walked
+   DOCUMENT hypothesis is situated understanding synthesised up through the
+   hierarchy. Every group/section hypothesis is written for a completed
+   passage range, so the set already covers exactly what the reading cursor
+   has reached. */
+export function buildReadingDigest(query = "") {
+  const sectionHyps = store.hypotheses.getByLevel("section");
+  const groupHyps = store.hypotheses.getByLevel("group");
+  const docs = store.documents.all();
+  if (!docs.length && !sectionHyps.length && !groupHyps.length) return "";
+
+  const zoom = selectZoom(query);
+  const lines = [];
+
+  // Per-document headline — title, reading cursor, and the document
+  // hypothesis marked as a skim guess or a walked synthesis.
+  for (const d of docs) {
+    const total = d.total || 0, walked = d.walked || 0;
+    const docHyp = store.hypotheses.getCurrent("document", d.id);
+    const fully = total > 0 && walked >= total;
+    const progress = !total ? ""
+      : fully ? ` — fully read (${total} passages)`
+      : ` — ${Math.round((walked / total) * 100)}% read (${walked}/${total} passages)`;
+    if (docHyp) {
+      const skim = docHyp.after_label === "skim" || !fully;
+      lines.push(skim
+        ? `skim of "${d.title || "document"}"${progress} — a first-pass guess, not yet fully read: "${docHyp.text}"`
+        : `document "${d.title || "document"}"${progress}: "${docHyp.text}"`);
+    }
+  }
+
+  // Detail layer at the selected zoom. An entity-zoom question is answered
+  // from [CTX]; the others get the threads (group) or sections.
+  if (zoom !== "entity") {
+    const detail = zoom === "group"
+      ? (groupHyps.length ? groupHyps : sectionHyps)
+      : (sectionHyps.length ? sectionHyps : groupHyps);
+    const label = detail === groupHyps ? "thread" : "section";
+    detail.slice(0, 10).forEach((h, i) => lines.push(`  ${label} ${i + 1}: "${h.text}"`));
+  }
+
+  return lines.length ? `[READING]\n${lines.join("\n")}\n[/READING]` : "";
 }
 
 /* ═══ The Position Marker ═══ */
@@ -925,6 +1166,17 @@ function getChildInputs(level, id) {
   }
 }
 
+/* A skim prompt — passage openings plus the names NER caught, the way a
+   reader glances over a document before reading it closely. */
+export function buildSkimPrompt(passages) {
+  const skim = passages.slice(0, 12).map(p => p.slice(0, 200).trim()).join("\n---\n");
+  const names = [...new Set(passages.flatMap(p => signal(p).ner.names))].slice(0, 20);
+  let prompt = "";
+  if (names.length) prompt += `Names that jump out: ${names.join(", ")}\n\n`;
+  prompt += `Skim (passage openings):\n${skim}`;
+  return prompt;
+}
+
 export function buildHypothesisPrompt(level, id) {
   const children = getChildInputs(level, id);
   const targetKey = typeof id === "string" ? id
@@ -952,6 +1204,38 @@ export function parseEvents(out) {
     const parsed = JSON.parse(raw);
     return Array.isArray(parsed) ? parsed.filter(e => e && typeof e === "object" && e.op) : [];
   } catch { return []; }
+}
+
+/* Parse a grounded answer into runs. `spanCount` bounds valid citation
+   numbers — any cite outside [1, spanCount] is dropped. On malformed output
+   the whole reply collapses into one uncited run so the answer still renders. */
+export function parseRuns(out, spanCount = 0) {
+  const raw = typeof out === "string" ? out : "";
+  let obj = out;
+  if (typeof out === "string") {
+    let s = out.replace(/```json/gi, "").replace(/```/g, "").trim();
+    const a = s.indexOf("{"), b = s.lastIndexOf("}");
+    if (a !== -1 && b !== -1) s = s.slice(a, b + 1);
+    try { obj = JSON.parse(s); } catch { obj = null; }
+  }
+  const list = Array.isArray(obj) ? obj : (obj && Array.isArray(obj.runs) ? obj.runs : null);
+  if (!list) return [{ text: raw.trim() || "(no answer)" }];
+
+  const runs = [];
+  for (const r of list) {
+    if (!r || typeof r.text !== "string" || !r.text) continue;
+    const run = { text: r.text };
+    if (r.ungrounded === true) {
+      run.ungrounded = true;
+    } else if (Array.isArray(r.cites)) {
+      const cites = r.cites
+        .map(n => Number(n))
+        .filter(n => Number.isInteger(n) && n >= 1 && n <= spanCount);
+      if (cites.length) run.cites = cites;
+    }
+    runs.push(run);
+  }
+  return runs.length ? runs : [{ text: raw.trim() || "(no answer)" }];
 }
 
 export function parseMutate(out) {

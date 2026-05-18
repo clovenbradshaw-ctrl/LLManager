@@ -75,11 +75,25 @@ function withTimeout(promise, ms, label) {
   ]);
 }
 
+/* Embedding cache — the model call is the expensive part of the first pass.
+   The same passage embedded into a second chat (a document opted in from
+   elsewhere) is a cache hit, so the embedding work happens once no matter
+   how many chats reason over the document. Vectors are treated as
+   immutable, so the cached Float32Array is shared by reference. */
+const embedCache = new Map();
+const EMBED_CACHE_MAX = 800;
+
 export async function embed(text) {
+  const key = String(text || "");
+  const hit = embedCache.get(key);
+  if (hit) { embedCache.delete(key); embedCache.set(key, hit); return hit; }
   const model = await withTimeout(getEmbedder(), 120000, "embedding model load");
   const out = await withTimeout(
-    model(String(text || ""), { pooling: "mean", normalize: true }), 30000, "embed");
-  return new Float32Array(out.data);
+    model(key, { pooling: "mean", normalize: true }), 30000, "embed");
+  const vec = new Float32Array(out.data);
+  embedCache.set(key, vec);
+  if (embedCache.size > EMBED_CACHE_MAX) embedCache.delete(embedCache.keys().next().value);
+  return vec;
 }
 
 /* ── Schema ── */
@@ -528,6 +542,9 @@ export const documents = {
   },
   get(id) {
     return db.selectObject("SELECT * FROM documents WHERE scope=? AND id=?", [scope, id]);
+  },
+  all() {
+    return db.selectObjects("SELECT * FROM documents WHERE scope=? ORDER BY created_at", [scope]);
   },
 };
 
