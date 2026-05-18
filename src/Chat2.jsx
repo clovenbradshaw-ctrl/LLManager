@@ -153,6 +153,28 @@ async function generate({ model, isBrowser, ollamaUrl, system, user, format, onT
   return raw;
 }
 
+/* Split a model reply into its hidden <think> reasoning and the visible
+   answer. Reasoning models (Qwen3 and friends) emit a <think>…</think>
+   block that should not appear inline in the answer. Handles partial
+   streaming: an unclosed <think> means the model is still reasoning. */
+function splitThinking(text) {
+  if (!text) return { thinking: "", answer: "", reasoning: false };
+  let thinking = "", answer = text, reasoning = false;
+  const open = answer.indexOf("<think>");
+  if (open !== -1) {
+    const close = answer.indexOf("</think>", open);
+    if (close === -1) {
+      thinking = answer.slice(open + 7);
+      answer = answer.slice(0, open);
+      reasoning = true;
+    } else {
+      thinking = answer.slice(open + 7, close);
+      answer = answer.slice(0, open) + answer.slice(close + 8);
+    }
+  }
+  return { thinking: thinking.trim(), answer: answer.trim(), reasoning };
+}
+
 const mono = `'SF Mono','Menlo','Consolas',monospace`;
 const C = {
   bg: "#0b0b0f", s1: "#131318", s2: "#1b1b22", s3: "#232330",
@@ -489,6 +511,9 @@ function FoldColumn({ msg }) {
 
 /* ── A grounded answer card ── */
 function AnswerCard({ msg }) {
+  const [showThink, setShowThink] = useState(false);
+  const { thinking, answer, reasoning } = splitThinking(msg.text);
+  const thinkingOnly = reasoning && !answer;
   return (
     <div style={{
       display: "grid",
@@ -505,8 +530,32 @@ function AnswerCard({ msg }) {
             ◆ {msg.foldEntity} folded at clause {msg.foldAt + 1}
           </div>
         )}
-        {msg.text || (msg.streaming ? <span style={{ color: C.dim }}>Generating…</span> : "")}
-        {msg.streaming && msg.text && <span style={{ color: C.accent }}>▍</span>}
+        {thinking && (
+          <div style={{ marginBottom: answer ? 8 : 0 }}>
+            <button
+              onClick={() => setShowThink(s => !s)}
+              style={{
+                fontSize: 10, fontFamily: mono, color: C.dim,
+                background: "none", border: "none", padding: 0, cursor: "pointer",
+              }}
+            >
+              {showThink ? "▾" : "▸"} {msg.streaming && thinkingOnly ? "Thinking…" : "Reasoning"}
+            </button>
+            {showThink && (
+              <div style={{
+                marginTop: 4, padding: "6px 8px", fontSize: 12, lineHeight: 1.55,
+                color: C.dim, background: C.s2, borderRadius: 4,
+                borderLeft: `2px solid ${C.border}`,
+              }}>
+                {thinking}
+              </div>
+            )}
+          </div>
+        )}
+        {answer || (msg.streaming
+          ? <span style={{ color: C.dim }}>{thinkingOnly ? "" : "Generating…"}</span>
+          : "")}
+        {msg.streaming && (answer || thinkingOnly) && <span style={{ color: C.accent }}>▍</span>}
       </div>
       {msg.foldMode ? (msg.spans.length >= 0 && <FoldColumn msg={msg} />) : (
       msg.spans.length > 0 && (
@@ -749,8 +798,9 @@ export default function Chat2({ ollamaUrl, ollamaModels, browserModels }) {
       },
     });
 
+    const hasAnswer = splitThinking(final).answer || final.trim();
     setMessages(m => m.map(x => x.id === answerId
-      ? { ...x, text: final.trim() || "(the model returned an empty response)", streaming: false }
+      ? { ...x, text: hasAnswer ? final.trim() : "(the model returned an empty response)", streaming: false }
       : x));
     setStatus("Ready.");
   }, [messages, selectedModel, ollamaUrl, graphHasContent]);
