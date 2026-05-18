@@ -118,12 +118,17 @@ function trimLoopTail(text) {
   return text;
 }
 
+function ordinal(n) {
+  const s = ["th", "st", "nd", "rd"], v = n % 100;
+  return n + (s[(v - 20) % 10] || s[v] || s[0]);
+}
+
 const MAX_TOKENS = 1024;
 
 /* A chat post longer than this is material, not a question — it is
    ingested as a source so the classifier can build a graph from it and
    answers can be grounded in it, rather than stuffed into one prompt. */
-const LONG_POST_CHARS = 1500;
+const LONG_POST_CHARS = 2500;
 
 /* Unified generation over both runtimes. Pass `onToken` to stream (it is
    called with the full text so far); omit it for a blocking call. A `format`
@@ -674,6 +679,7 @@ export default function Chat2({ ollamaUrl, ollamaModels, browserModels }) {
 
   const graphRef = useRef(emptyGraph());
   const clauseBaseRef = useRef(0);
+  const postSeqRef = useRef(0); // ordinal for chat posts ingested as sources
   const scrollRef = useRef(null);
   const [graphTick, setGraphTick] = useState(0); // forces stat re-render
 
@@ -829,7 +835,10 @@ export default function Chat2({ ollamaUrl, ollamaModels, browserModels }) {
       }
 
       system = GROUNDED_SYSTEM;
-      prompt = `${ctx}\n\n${docs}\n\n${convo}QUESTION: ${text}`;
+      prompt = `${ctx}\n\n${docs}\n\n`
+        + `[NOTE] The numbered [DOCS] passages are listed in the order they `
+        + `were received in this conversation — lower numbers came first.\n\n`
+        + `${convo}QUESTION: ${text}`;
     } else {
       // No sources yet — answer as an ordinary assistant.
       system = CHAT_SYSTEM;
@@ -873,11 +882,16 @@ export default function Chat2({ ollamaUrl, ollamaModels, browserModels }) {
       if (text.length > LONG_POST_CHARS) {
         // Too long to be a question — treat the paste as a source. It is
         // ingested into the graph so later questions are grounded in it.
+        // The ordinal records where in the conversation it arrived.
+        const seq = ++postSeqRef.current;
+        const prov = `chat post #${seq}`;
         setMessages(m => [...m, { id: nextId(), role: "user", kind: "source",
-          text, provenance: "pasted in chat" }]);
+          text, provenance: prov }]);
         setMessages(m => [...m, { id: nextId(), role: "assistant", kind: "note",
-          text: "That was long, so it was added as a source — ask a question about it below." }]);
-        await ingestMaterial(text, "pasted in chat");
+          text: `That was long, so it was added as a source — "${prov}", `
+            + `the ${ordinal(seq)} post received in this conversation. `
+            + `Ask a question about it below.` }]);
+        await ingestMaterial(text, prov);
       } else {
         setMessages(m => [...m, { id: nextId(), role: "user", kind: "question", text }]);
         await answerQuestion(text);
