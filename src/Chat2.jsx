@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import {
   OPERATORS, OP_COLORS, processText, emptyGraph, appendToGraph,
-  buildDossier, runSecondPass, reclassifyFlags, looksLikeQuestion, GROUNDED_SYSTEM,
+  buildDossier, runSecondPass, reclassifyFlags, GROUNDED_SYSTEM,
 } from "./eo-classifier.js";
 import { getBrowserEngine } from "./webllm.js";
 
@@ -17,6 +17,35 @@ import { getBrowserEngine } from "./webllm.js";
    the structured graph for that specific question — and nothing else. */
 
 const MODEL_KEY = "llmanager.chat2.model";
+const AUTO = "__auto__";
+
+/* Ollama model base names in rough quality order — used by the Auto picker. */
+const AUTO_PREFS = [
+  "qwen3:30b-a3b", "qwen2.5:14b", "phi3:medium", "qwen3:8b", "deepseek-r1:8b",
+  "llama3.1:8b", "gemma2:9b", "qwen2.5:7b", "mistral", "phi3:mini",
+  "llama3.2:3b", "gemma2:2b",
+];
+
+/* Pick the strongest available model: prefer Ollama over in-browser, then
+   rank by AUTO_PREFS. An unranked model sorts last but still beats nothing. */
+function autoPick(options) {
+  if (options.length === 0) return null;
+  const ollama = options.filter(o => !o.isBrowser);
+  const pool = ollama.length ? ollama : options;
+  const rank = o => {
+    const base = o.name.split(":")[0];
+    const i = AUTO_PREFS.findIndex(p => o.name === p || p.split(":")[0] === base);
+    return i < 0 ? AUTO_PREFS.length : i;
+  };
+  return [...pool].sort((a, b) => rank(a) - rank(b))[0];
+}
+
+/* Ungrounded chat — used while no source has been added to the graph. */
+const CHAT_SYSTEM =
+  "You are a helpful, concise assistant. Answer the user's question directly. "
+  + "No sources have been added yet, so answer from general knowledge. When it "
+  + "would help, mention that the user can add a source — a text file or pasted "
+  + "text — to get answers grounded in their own material.";
 
 /* Unified generation over both runtimes. Pass `onToken` to stream (it is
    called with the full text so far); omit it for a blocking call. A `format`
@@ -293,8 +322,13 @@ function AnalysisCard({ msg, onDeepRead, deepReadBusy, llmReady }) {
       padding: 14, fontFamily: mono,
     }}>
       <div style={{ fontSize: 11, color: C.green, fontWeight: 600, marginBottom: 2 }}>
-        ◆ Material read into the graph
+        ◆ Source read into the graph
       </div>
+      {msg.provenance && (
+        <div style={{ fontSize: 10, color: C.dim, marginBottom: 4 }}>
+          from: <span style={{ color: C.text }}>{msg.provenance}</span>
+        </div>
+      )}
       <div style={{ fontSize: 12, color: C.text }}>
         {stats.newClauses} clause{stats.newClauses !== 1 ? "s" : ""} ·{" "}
         {stats.newClaims} claim{stats.newClaims !== 1 ? "s" : ""} ·{" "}
@@ -405,13 +439,17 @@ function btn(primary, disabled) {
 export default function Chat2({ ollamaUrl, ollamaModels, browserModels }) {
   const [messages, setMessages] = useState([]);
   const [input, setInput] = useState("");
-  const [sendMode, setSendMode] = useState("auto"); // auto | material | question
-  const [status, setStatus] = useState("Paste any text below — it is read straight into the graph.");
+  const [status, setStatus] = useState("Ask anything below. Add sources to ground the answers in your own material.");
   const [busy, setBusy] = useState(false);
   const [deepReadBusy, setDeepReadBusy] = useState(false);
   const [model, setModel] = useState(() => {
-    try { return localStorage.getItem(MODEL_KEY) || ""; } catch { return ""; }
+    try { return localStorage.getItem(MODEL_KEY) || AUTO; } catch { return AUTO; }
   });
+  // Source composer — paste text with a provenance label, or attach files.
+  const [showSources, setShowSources] = useState(false);
+  const [sourceText, setSourceText] = useState("");
+  const [sourceProv, setSourceProv] = useState("");
+  const fileRef = useRef(null);
 
   const graphRef = useRef(emptyGraph());
   const clauseBaseRef = useRef(0);
@@ -425,11 +463,12 @@ export default function Chat2({ ollamaUrl, ollamaModels, browserModels }) {
     ...(browserModels || []).map(m => ({ name: m.name, isBrowser: true, label: `${m.name} · in-browser` })),
   ], [ollamaModels, browserModels]);
 
-  // Keep the selection valid as the rosters change.
+  // Keep the selection valid as the rosters change — fall back to Auto if a
+  // pinned model disappears.
   useEffect(() => {
-    if (modelOptions.length === 0) return;
-    if (!model || !modelOptions.some(o => o.name === model)) {
-      setModel(modelOptions[0].name);
+    if (model !== AUTO && modelOptions.length > 0
+        && !modelOptions.some(o => o.name === model)) {
+      setModel(AUTO);
     }
   }, [modelOptions]); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -441,19 +480,22 @@ export default function Chat2({ ollamaUrl, ollamaModels, browserModels }) {
     if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
   }, [messages]);
 
-  const selectedModel = modelOptions.find(o => o.name === model) || null;
+  const autoMode = model === AUTO;
+  const selectedModel = autoMode
+    ? autoPick(modelOptions)
+    : modelOptions.find(o => o.name === model) || null;
   const llmReady = !!selectedModel;
   const graphHasContent = Object.keys(graphRef.current.entities).length > 0
     || graphRef.current.clauses.length > 0;
 
-  const ingestMaterial = useCallback(async (text) => {
+  const ingestMaterial = useCallback(async (text, provenance) => {
     setStatus("Loading embedding model (first run downloads ~25 MB)…");
     const { results, clauses, register } = await processText(text, setStatus);
 
     if (clauses.length === 0) {
       setMessages(m => [...m, {
         id: nextId(), role: "assistant", kind: "note",
-        text: "Nothing extractable in that text — no clauses found.",
+        text: "Nothing extractable in that source — no clauses found.",
       }]);
       setStatus("Ready.");
       return;
@@ -475,6 +517,7 @@ export default function Chat2({ ollamaUrl, ollamaModels, browserModels }) {
 
     setMessages(m => [...m, {
       id: nextId(), role: "assistant", kind: "analysis",
+      provenance: provenance || "pasted text",
       stats: { ...added, clauseRows: clauseRows.length, chromeCount, entityNames },
       opCounts, results, clauses, register, clauseBase: base,
       triggerCount: register.triggerPoints?.length || 0,
@@ -485,22 +528,14 @@ export default function Chat2({ ollamaUrl, ollamaModels, browserModels }) {
 
   const answerQuestion = useCallback(async (text) => {
     if (!selectedModel) {
-      throw new Error("No model selected. Start Ollama, or load an in-browser model from the Chat or Settings tab, then pick it in the composer below.");
+      throw new Error("No model available. Start Ollama, or load an in-browser model from the Chat or Settings tab.");
     }
-    setStatus("Retrieving context from the graph…");
 
     // Short follow-ups ("why?", "and her brother?") carry little signal of
-    // their own — fold in the previous question so graph retrieval still
-    // lands on the right region.
+    // their own — fold in the previous question so retrieval still lands on
+    // the right region.
     const prevQ = [...messages].reverse().find(m => m.role === "user" && m.kind === "question");
     const prevA = [...messages].reverse().find(m => m.role === "assistant" && m.kind === "answer");
-    const retrievalQuery = (text.split(/\s+/).length < 5 && prevQ)
-      ? `${prevQ.text} ${text}` : text;
-
-    // The dossier IS the context — entities, claims and passages pulled from
-    // the structured graph for this question. The chat history and the raw
-    // pasted text are never sent wholesale.
-    const { ctx, docs, spans } = await buildDossier(graphRef.current, retrievalQuery);
 
     // Light continuity: the previous exchange only, marked explicitly as a
     // reference for resolving pronouns — never treated as a source.
@@ -510,16 +545,34 @@ export default function Chat2({ ollamaUrl, ollamaModels, browserModels }) {
         + `Q: ${prevQ.text}\nA: ${prevA.text.slice(0, 400)}\n[/EARLIER EXCHANGE]\n\n`;
     }
 
-    const prompt = `${ctx}\n\n${docs}\n\n${convo}QUESTION: ${text}`;
-
-    // Dedup spans for the evidence column.
-    const seen = new Set();
+    let system, prompt;
     const uniqueSpans = [];
-    for (const s of spans) {
-      const k = s.text.slice(0, 60);
-      if (seen.has(k)) continue;
-      seen.add(k);
-      uniqueSpans.push(s);
+
+    if (graphHasContent) {
+      setStatus("Retrieving context from the graph…");
+      const retrievalQuery = (text.split(/\s+/).length < 5 && prevQ)
+        ? `${prevQ.text} ${text}` : text;
+
+      // The dossier IS the context — entities, claims and passages pulled from
+      // the structured graph for this question. The chat history and the raw
+      // source text are never sent wholesale.
+      const { ctx, docs, spans } = await buildDossier(graphRef.current, retrievalQuery);
+
+      // Dedup spans for the evidence column.
+      const seen = new Set();
+      for (const s of spans) {
+        const k = s.text.slice(0, 60);
+        if (seen.has(k)) continue;
+        seen.add(k);
+        uniqueSpans.push(s);
+      }
+
+      system = GROUNDED_SYSTEM;
+      prompt = `${ctx}\n\n${docs}\n\n${convo}QUESTION: ${text}`;
+    } else {
+      // No sources yet — answer as an ordinary assistant.
+      system = CHAT_SYSTEM;
+      prompt = `${convo}QUESTION: ${text}`;
     }
 
     const answerId = nextId();
@@ -527,12 +580,12 @@ export default function Chat2({ ollamaUrl, ollamaModels, browserModels }) {
       id: answerId, role: "assistant", kind: "answer",
       text: "", spans: uniqueSpans.slice(0, 12), streaming: true,
     }]);
-    setStatus("Generating grounded answer…");
+    setStatus(graphHasContent ? "Generating grounded answer…" : "Generating answer…");
 
     let final = "";
     await generate({
       model: selectedModel.name, isBrowser: selectedModel.isBrowser, ollamaUrl,
-      system: GROUNDED_SYSTEM, user: prompt,
+      system, user: prompt,
       onToken: (raw, loading) => {
         if (loading != null) { setStatus(loading); return; }
         final = raw;
@@ -544,31 +597,17 @@ export default function Chat2({ ollamaUrl, ollamaModels, browserModels }) {
       ? { ...x, text: final.trim() || "(the model returned an empty response)", streaming: false }
       : x));
     setStatus("Ready.");
-  }, [messages, selectedModel, ollamaUrl]);
+  }, [messages, selectedModel, ollamaUrl, graphHasContent]);
 
   const handleSend = useCallback(async () => {
     const text = input.trim();
     if (!text || busy) return;
 
-    let asQuestion;
-    if (sendMode === "material") asQuestion = false;
-    else if (sendMode === "question") asQuestion = true;
-    else asQuestion = looksLikeQuestion(text, graphHasContent);
-
-    if (asQuestion && !graphHasContent) {
-      setMessages(m => [...m, { id: nextId(), role: "assistant", kind: "note",
-        text: "The graph is empty — paste some material first, then ask questions about it." }]);
-      return;
-    }
-
-    setMessages(m => [...m, {
-      id: nextId(), role: "user", kind: asQuestion ? "question" : "material", text,
-    }]);
+    setMessages(m => [...m, { id: nextId(), role: "user", kind: "question", text }]);
     setInput("");
     setBusy(true);
     try {
-      if (asQuestion) await answerQuestion(text);
-      else await ingestMaterial(text);
+      await answerQuestion(text);
     } catch (e) {
       setMessages(m => [...m, { id: nextId(), role: "assistant", kind: "error",
         text: e?.message || String(e) }]);
@@ -576,13 +615,56 @@ export default function Chat2({ ollamaUrl, ollamaModels, browserModels }) {
     } finally {
       setBusy(false);
     }
-  }, [input, busy, sendMode, graphHasContent, answerQuestion, ingestMaterial]);
+  }, [input, busy, answerQuestion]);
+
+  // ── Sources — ingest a file or pasted text, tagged with its provenance ──
+  const addSource = useCallback(async (text, provenance) => {
+    const clean = (text || "").trim();
+    if (!clean) return;
+    const prov = (provenance || "").trim() || "pasted text";
+    setMessages(m => [...m, { id: nextId(), role: "user", kind: "source", text: clean, provenance: prov }]);
+    setBusy(true);
+    try {
+      await ingestMaterial(clean, prov);
+    } catch (e) {
+      setMessages(m => [...m, { id: nextId(), role: "assistant", kind: "error",
+        text: e?.message || String(e) }]);
+      setStatus("Error — see the message above.");
+    } finally {
+      setBusy(false);
+    }
+  }, [ingestMaterial]);
+
+  const handlePasteSource = useCallback(async () => {
+    if (!sourceText.trim() || busy) return;
+    const text = sourceText;
+    const prov = sourceProv;
+    setSourceText("");
+    setSourceProv("");
+    await addSource(text, prov);
+  }, [sourceText, sourceProv, busy, addSource]);
+
+  const handleFiles = useCallback(async (fileList) => {
+    const files = [...(fileList || [])];
+    if (fileRef.current) fileRef.current.value = "";
+    for (const file of files) {
+      try {
+        const text = await file.text();
+        if (text.trim()) await addSource(text, file.name);
+        else setMessages(m => [...m, { id: nextId(), role: "assistant", kind: "note",
+          text: `${file.name} is empty — nothing to read.` }]);
+      } catch (e) {
+        setMessages(m => [...m, { id: nextId(), role: "assistant", kind: "error",
+          text: `Could not read ${file.name}: ${e?.message || e}` }]);
+      }
+    }
+  }, [addSource]);
 
   const handleDeepRead = useCallback(async (msgId) => {
     const msg = messages.find(m => m.id === msgId);
     if (!msg || deepReadBusy) return;
     if (!selectedModel) {
-      setStatus("No model selected for the deep read — pick one in the composer.");
+      setStatus("No model available for the deep read — load one in the Chat or Settings tab.");
       return;
     }
     setDeepReadBusy(true);
@@ -625,8 +707,10 @@ export default function Chat2({ ollamaUrl, ollamaModels, browserModels }) {
             <>{Object.keys(g.entities).length} entities · {g.claims.length} claims · {g.clauses.length} clauses · </>
           )}
           {llmReady
-            ? <span style={{ color: C.green }}>answering with {selectedModel.name}{selectedModel.isBrowser ? " (in-browser)" : ""}</span>
-            : <span style={{ color: C.orange }}>no model — ingest works; load one in the Chat or Settings tab to ask questions</span>}
+            ? <span style={{ color: C.green }}>
+                {autoMode ? "auto · " : ""}answering with {selectedModel.name}{selectedModel.isBrowser ? " (in-browser)" : ""}
+              </span>
+            : <span style={{ color: C.orange }}>no model available — load one in the Chat or Settings tab</span>}
         </div>
       </div>
 
@@ -641,32 +725,34 @@ export default function Chat2({ ollamaUrl, ollamaModels, browserModels }) {
         {messages.length === 0 && (
           <div style={{ color: C.dim, fontSize: 13, lineHeight: 1.6, maxWidth: 620 }}>
             <p style={{ marginBottom: 8 }}>
-              This is the 2.0 chat. There are no folders or library to load — whatever you
-              paste here is read straight into a knowledge graph.
+              This is the 2.0 chat. <strong style={{ color: C.text }}>Just start asking</strong> —
+              type a question below and it is answered right away.
             </p>
             <p style={{ marginBottom: 8 }}>
-              <strong style={{ color: C.text }}>Paste material</strong> — an article, notes, a transcript —
-              and it is cleaned, split into clauses, and each clause is classified against the 27 EO
-              centroids (operator × terrain × stance), building up a graph of entities and claims.
+              <strong style={{ color: C.text }}>Add sources</strong> with the “+ Add source” button:
+              attach any text file, or paste text and label where it came from. Each source is
+              cleaned, split into clauses, and classified against the 27 EO centroids
+              (operator × terrain × stance), building up a graph of entities and claims.
             </p>
             <p>
-              <strong style={{ color: C.text }}>Ask a question</strong> and it is answered, grounded,
-              from everything you have pasted so far. Questions are detected automatically; use the
-              selector to force a mode.
+              Once you have added sources, your questions are answered <strong style={{ color: C.text }}>grounded</strong>{" "}
+              in them — with the retrieved passages shown alongside the answer. Pick a model below,
+              or leave it on <strong style={{ color: C.text }}>Auto</strong> to use the strongest one available.
             </p>
           </div>
         )}
         <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
           {messages.map(m => {
             if (m.role === "user") {
+              const isQ = m.kind === "question";
               return (
                 <div key={m.id} style={{ alignSelf: "flex-end", maxWidth: "82%" }}>
                   <div style={{ fontSize: 9, fontFamily: mono, color: C.dim, textAlign: "right", marginBottom: 3, textTransform: "uppercase", letterSpacing: "0.08em" }}>
-                    {m.kind === "question" ? "Question" : "Material"}
+                    {isQ ? "Question" : `Source · ${m.provenance || "pasted text"}`}
                   </div>
                   <div style={{
-                    background: m.kind === "question" ? C.accent : C.s3,
-                    color: m.kind === "question" ? "#fff" : C.text,
+                    background: isQ ? C.accent : C.s3,
+                    color: isQ ? "#fff" : C.text,
                     padding: "9px 13px", borderRadius: 10, fontSize: 13, lineHeight: 1.5,
                     whiteSpace: "pre-wrap", wordBreak: "break-word",
                   }}>
@@ -699,6 +785,61 @@ export default function Chat2({ ollamaUrl, ollamaModels, browserModels }) {
 
       {/* Composer */}
       <div style={{ borderTop: `1px solid ${C.border}`, padding: 14, flexShrink: 0 }}>
+        {showSources && (
+          <div style={{
+            background: C.s1, border: `1px solid ${C.border}`, borderRadius: 8,
+            padding: 12, marginBottom: 10,
+          }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
+              <div style={{ fontSize: 11, fontFamily: mono, color: C.text, fontWeight: 600 }}>Add a source</div>
+              <button onClick={() => setShowSources(false)} style={{
+                background: "none", border: "none", color: C.dim, cursor: "pointer", fontSize: 13,
+              }}>✕</button>
+            </div>
+            <div style={{ fontSize: 11, color: C.dim, lineHeight: 1.5, marginBottom: 9 }}>
+              Attach a text file, or paste text and label where it came from. Each source is read
+              into the graph and grounds your answers.
+            </div>
+            <input
+              ref={fileRef}
+              type="file"
+              multiple
+              accept=".txt,.md,.markdown,.csv,.tsv,.json,.log,.rtf,.html,.htm,.xml,.yaml,.yml,text/*"
+              onChange={e => handleFiles(e.target.files)}
+              disabled={busy}
+              style={{ fontSize: 11, fontFamily: mono, color: C.dim, marginBottom: 10, display: "block" }}
+            />
+            <textarea
+              value={sourceText}
+              onChange={e => setSourceText(e.target.value)}
+              placeholder="…or paste source text here"
+              rows={3}
+              style={{
+                width: "100%", boxSizing: "border-box", resize: "vertical", background: C.bg,
+                border: `1px solid ${C.border}`, borderRadius: 6, color: C.text,
+                fontSize: 12, lineHeight: 1.5, padding: 8, fontFamily: "inherit", marginBottom: 8,
+              }}
+            />
+            <div style={{ display: "flex", gap: 8 }}>
+              <input
+                value={sourceProv}
+                onChange={e => setSourceProv(e.target.value)}
+                placeholder="Provenance — e.g. NYT article, meeting notes, my email"
+                style={{
+                  flex: 1, background: C.bg, border: `1px solid ${C.border}`, borderRadius: 6,
+                  color: C.text, fontSize: 12, padding: "7px 9px", fontFamily: mono,
+                }}
+              />
+              <button
+                onClick={handlePasteSource}
+                disabled={busy || !sourceText.trim()}
+                style={btn(true, busy || !sourceText.trim())}
+              >
+                {busy ? "Reading…" : "Add source"}
+              </button>
+            </div>
+          </div>
+        )}
         <div style={{ display: "flex", gap: 8, alignItems: "flex-end" }}>
           <textarea
             value={input}
@@ -706,7 +847,7 @@ export default function Chat2({ ollamaUrl, ollamaModels, browserModels }) {
             onKeyDown={e => {
               if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) { e.preventDefault(); handleSend(); }
             }}
-            placeholder="Paste material to read into the graph, or ask a question about it… (Cmd/Ctrl+Enter to send)"
+            placeholder="Ask a question… (Cmd/Ctrl+Enter to send)"
             rows={3}
             style={{
               flex: 1, resize: "vertical", minHeight: 60, background: C.s1,
@@ -715,22 +856,24 @@ export default function Chat2({ ollamaUrl, ollamaModels, browserModels }) {
             }}
           />
           <div style={{ display: "flex", flexDirection: "column", gap: 6, minWidth: 168 }}>
+            <button
+              onClick={() => setShowSources(s => !s)}
+              style={btn(showSources)}
+            >
+              {showSources ? "Hide sources" : "+ Add source"}
+            </button>
             <select
               value={model}
               onChange={e => setModel(e.target.value)}
-              disabled={modelOptions.length === 0}
-              title="Model used for grounded answers and the deep read"
+              title="Model used for answers and the deep read"
               style={selectStyle}
             >
-              {modelOptions.length === 0 && <option value="">no model loaded</option>}
+              <option value={AUTO}>
+                Auto{selectedModel ? ` · ${selectedModel.name}` : ""}
+              </option>
               {modelOptions.map(o => (
                 <option key={o.name} value={o.name}>{o.label}</option>
               ))}
-            </select>
-            <select value={sendMode} onChange={e => setSendMode(e.target.value)} style={selectStyle}>
-              <option value="auto">Auto-detect</option>
-              <option value="material">As material</option>
-              <option value="question">As question</option>
             </select>
             <button onClick={handleSend} disabled={busy || !input.trim()} style={{
               padding: "9px 18px", fontSize: 12, fontWeight: 600, borderRadius: 8,
