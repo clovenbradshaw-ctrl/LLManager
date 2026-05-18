@@ -476,13 +476,15 @@ export async function processText(rawText, onProgress) {
 /* ── Cumulative graph — accumulates material across chat turns ── */
 
 export function emptyGraph() {
-  return { entities: {}, claims: [], clauses: [], vectors: {} };
+  return { entities: {}, claims: [], clauses: [], vectors: {}, frames: [] };
 }
 
 /* Fold one processed block into the cumulative graph. clauseBase keeps
-   clause indices globally unique across messages. Returns the count of
-   new entities/claims/clauses added, for the turn summary. */
-export async function appendToGraph(graph, results, clauseBase) {
+   clause indices globally unique across messages. When the block's register
+   is supplied, its interpretive frames are folded in too (with globalised
+   clause indices), so point-based folds can reconstruct the active reading at
+   any clause. Returns the count of new entities/claims/clauses added. */
+export async function appendToGraph(graph, results, clauseBase, register) {
   let newEntities = 0;
   const before = graph.claims.length;
   const seenClauses = new Set();
@@ -533,11 +535,35 @@ export async function appendToGraph(graph, results, clauseBase) {
     graph.vectors[key] = await embed(text.slice(0, 200));
   }
 
+  if (register) foldFrames(graph, register, clauseBase);
+
   return {
     newEntities,
     newClaims: graph.claims.length - before,
     newClauses: seenClauses.size,
   };
+}
+
+/* Fold a block's register frames into the cumulative graph. Frame clause
+   indices are local to the block; they are offset by clauseBase so a fold can
+   ask "which frames were active up to global clause N". Idempotent — calling
+   it again after a deep read (which adds LLM frames) updates in place. */
+export function foldFrames(graph, register, clauseBase) {
+  if (!graph.frames) graph.frames = [];
+  for (const f of register.frames || []) {
+    const id = `${clauseBase}:${f.id}`;
+    const record = {
+      id,
+      text: f.text,
+      strength: f.strength || 0,
+      generatedAt: clauseBase + f.generatedAt,
+      source: f.source || "mechanical",
+      trigger: f.trigger || null,
+    };
+    const existing = graph.frames.find(x => x.id === id);
+    if (existing) Object.assign(existing, record);
+    else graph.frames.push(record);
+  }
 }
 
 /* ── Retrieval — build a grounded dossier for a question ── */
@@ -785,4 +811,136 @@ export function looksLikeQuestion(text, graphHasContent) {
     return true;
   }
   return false;
+}
+
+/* ── Point-based entity folds — situated, windowed compression ──
+
+   A fold is never global. foldEntityAt compresses an entity's claims UP TO a
+   point in the text, from one site's perspective, into a single committed
+   reading — what the entity SEEMS TO BE at that moment, not what it is overall.
+
+   The same entity folded at the same site at successive points is a reading
+   diary: the sequence is the arc. The same entity folded at different sites at
+   one point produces readings that disagree, and that disagreement is where
+   the text is doing its most interesting work.
+
+   llm is an async (system, user) => string. */
+
+export async function foldEntityAt(graph, entityKey, site, upToClause, llm) {
+  const entity = graph.entities[entityKey];
+  if (!entity) return null;
+
+  // Only claims from clauses up to this point, at this site.
+  const windowedClaims = entity.claims
+    .filter(c => c.clauseIndex <= upToClause && c.site === site);
+  if (windowedClaims.length < 2) return null;
+
+  // The interpretive frames active at this point.
+  const activeFrames = (graph.frames || [])
+    .filter(f => f.generatedAt <= upToClause && f.strength > 0.2);
+
+  // The ambient operator distribution up to this point.
+  const opDist = {};
+  for (const c of windowedClaims) {
+    opDist[c.operator] = (opDist[c.operator] || 0) + 1;
+  }
+
+  const claimText = windowedClaims
+    .map(c => `[c${c.clauseIndex + 1}] ${c.operator}: ${c.value} @"${c.span.slice(0, 60)}"`)
+    .join("\n");
+
+  const frameText = activeFrames.length > 0
+    ? "\nACTIVE READING:\n" + activeFrames.map(f => `- ${f.text}`).join("\n")
+    : "";
+
+  const siteDefinition = TERRAINS[site] || site;
+
+  const system =
+    "Compress these claims into understanding FROM THIS SITE'S PERSPECTIVE "
+    + "at this point in the text.\n\n"
+    + `SITE: ${site} — ${siteDefinition}\n\n`
+    + "This is what the text has revealed SO FAR. Not what is true overall. "
+    + "What does this entity SEEM TO BE at this moment, read from this site?\n\n"
+    + "One sentence. Under 30 words. Present tense. No hedging, no \"seems to\" "
+    + "— commit to the reading the text has earned at this point.";
+
+  const response = await llm(system, `Entity: ${entity.name}\n\n${claimText}${frameText}`);
+  const text = String(response || "").trim();
+
+  return {
+    entity: entity.name,
+    site,
+    atClause: upToClause,
+    text,
+    vec: text ? await embed(text) : null,
+    claimCount: windowedClaims.length,
+    sources: windowedClaims.map(c => c.clauseIndex),
+    opDistribution: opDist,
+  };
+}
+
+/* Answer a question about one entity from its situated folds at a point in the
+   text. Folds the entity at every site it occupies up to upToClause, then
+   answers from those folds plus the raw windowed evidence — never from later
+   text or outside knowledge. Returns { entity, atClause, answer, folds } or
+   null when the entity is unknown or has no claims in the window. */
+export async function askAboutEntity(graph, entityName, question, upToClause, llm, onProgress) {
+  const entityKey = String(entityName || "").toLowerCase();
+  const entity = graph.entities[entityKey];
+  if (!entity) return null;
+
+  const windowed = entity.claims.filter(c => c.clauseIndex <= upToClause);
+  if (windowed.length === 0) return null;
+
+  // Fold at every site occupied up to this point.
+  const occupiedSites = [...new Set(windowed.map(c => c.site))];
+  if (onProgress) {
+    onProgress(`Folding ${entity.name} at ${occupiedSites.length} site${occupiedSites.length !== 1 ? "s" : ""}…`);
+  }
+  const folds = (await Promise.all(
+    occupiedSites.map(site => foldEntityAt(graph, entityKey, site, upToClause, llm))
+  )).filter(Boolean);
+
+  const entityHypotheses = (graph.frames || [])
+    .filter(f => f.generatedAt <= upToClause
+      && f.text.toLowerCase().includes(entityKey)
+      && f.strength > 0.2);
+
+  const foldText = folds.length > 0
+    ? folds.map(f => `@${f.site}: ${f.text}`).join("\n")
+    : "(too few claims to fold — answer from the evidence below)";
+
+  const hypText = entityHypotheses.length > 0
+    ? "\nHYPOTHESES:\n" + entityHypotheses.map(h => `- ${h.text}`).join("\n")
+    : "";
+
+  const rawClaims = windowed
+    .map(c => `[c${c.clauseIndex + 1}] "${c.span.slice(0, 80)}"`)
+    .join("\n");
+
+  if (onProgress) onProgress("Answering from the situated folds…");
+
+  const system =
+    "Answer from the situated understandings below. They represent what the "
+    + `text has established AT THIS POINT (up to clause ${upToClause + 1}). Do `
+    + "not use knowledge from later in the text, or outside knowledge about the "
+    + "subject.\n\n"
+    + "Each @Site line is a reading from a different perspective. Use whichever "
+    + "perspectives best address the question. Note tensions between them when "
+    + "relevant.\n\nGround your answer in the raw evidence. Be direct. 2-4 sentences.";
+
+  const prompt =
+    `ENTITY: ${entity.name}\n\n`
+    + `SITUATED UNDERSTANDING:\n${foldText}${hypText}\n\n`
+    + `EVIDENCE:\n${rawClaims}\n\n`
+    + `QUESTION: ${question}`;
+
+  const answer = await llm(system, prompt);
+
+  return {
+    entity: entity.name,
+    atClause: upToClause,
+    answer: String(answer || "").trim(),
+    folds,
+  };
 }

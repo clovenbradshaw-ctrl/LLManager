@@ -2,6 +2,7 @@ import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import {
   OPERATORS, OP_COLORS, processText, emptyGraph, appendToGraph,
   buildDossier, runSecondPass, reclassifyFlags, GROUNDED_SYSTEM,
+  askAboutEntity, foldFrames,
 } from "./eo-classifier.js";
 import { getBrowserEngine } from "./webllm.js";
 
@@ -38,6 +39,42 @@ function autoPick(options) {
     return i < 0 ? AUTO_PREFS.length : i;
   };
   return [...pool].sort((a, b) => rank(a) - rank(b))[0];
+}
+
+/* ── Point-based fold routing ──
+
+   An entity question can be answered globally (the dossier path) or as a
+   situated fold AT A POINT in the text. The fold path is taken when the
+   question names a known entity and either pins a clause window ("up to
+   clause 40") or asks something interpretive ("what does X seem to be"). */
+
+const INTERPRETIVE = /\b(seem|seems|seemed|think|thinks|thinking|thought|feel|feels|feeling|really|actually|become|becomes|becoming|became|change|changes|changing|changed|arc|impression|portrayed|come across|like at this point|so far)\b/i;
+
+/* Parse an explicit clause window — "up to clause 40", "at clause 12", "c12".
+   Returns a 0-based clause index, or null when no window is named. */
+function parseClauseWindow(text) {
+  const m = text.match(/\bclause\s*c?(\d+)/i) || text.match(/\bc(\d+)\b/i);
+  if (!m) return null;
+  const n = parseInt(m[1], 10);
+  return Number.isFinite(n) && n > 0 ? n - 1 : null;
+}
+
+/* Find the single known entity a question is about. Matches the full entity
+   name or any distinctive token of it; the longest match wins. */
+function findFocusEntity(graph, text) {
+  const q = text.toLowerCase();
+  let best = null;
+  for (const [key, entity] of Object.entries(graph.entities)) {
+    const name = entity.name.toLowerCase();
+    const candidates = [name, ...name.split(/\s+/).filter(t => t.length > 2)];
+    for (const cand of candidates) {
+      const re = new RegExp(`\\b${cand.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`, "i");
+      if (re.test(q) && (!best || cand.length > best.matchLen)) {
+        best = { key, name: entity.name, matchLen: cand.length };
+      }
+    }
+  }
+  return best;
 }
 
 /* Ungrounded chat — used while no source has been added to the graph. */
@@ -380,20 +417,58 @@ function AnalysisCard({ msg, onDeepRead, deepReadBusy, llmReady }) {
   );
 }
 
+/* ── Situated folds — the per-site readings behind a point-based answer ── */
+function FoldColumn({ msg }) {
+  return (
+    <div>
+      <div style={{ fontSize: 9, textTransform: "uppercase", letterSpacing: "0.08em", color: C.green, marginBottom: 6, fontFamily: mono }}>
+        Situated folds{Number.isFinite(msg.foldAt) ? ` · up to c${msg.foldAt + 1}` : ""}
+      </div>
+      {msg.spans.length === 0 && (
+        <div style={{ fontSize: 11, color: C.dim, fontStyle: "italic" }}>
+          Too few claims to fold — answered from raw evidence.
+        </div>
+      )}
+      {msg.spans.map((s, i) => (
+        <div key={i} style={{
+          padding: "6px 9px", borderLeft: `3px solid ${C.green}`,
+          background: C.s2, borderRadius: "0 3px 3px 0", marginBottom: 5,
+        }}>
+          <div style={{ fontSize: 9, color: C.dim, fontFamily: mono }}>
+            @{s.site} · {s.claimCount} claim{s.claimCount !== 1 ? "s" : ""}
+          </div>
+          <div style={{ fontSize: 11.5, color: C.text, lineHeight: 1.45, marginTop: 2 }}>
+            {s.text}
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 /* ── A grounded answer card ── */
 function AnswerCard({ msg }) {
   return (
     <div style={{
-      display: "grid", gridTemplateColumns: msg.spans.length ? "1fr 220px" : "1fr",
+      display: "grid",
+      gridTemplateColumns: msg.spans.length ? (msg.foldMode ? "1fr 280px" : "1fr 220px") : "1fr",
       gap: 12, alignItems: "start",
     }}>
       <div style={{
         fontSize: 14, lineHeight: 1.65, color: C.text, whiteSpace: "pre-wrap",
       }}>
+        {msg.foldMode && msg.foldEntity && (
+          <div style={{
+            fontSize: 10, fontFamily: mono, color: C.green, marginBottom: 6,
+          }}>
+            ◆ {msg.foldEntity} folded at clause {msg.foldAt + 1}
+          </div>
+        )}
         {msg.text || (msg.streaming ? <span style={{ color: C.dim }}>Generating…</span> : "")}
         {msg.streaming && msg.text && <span style={{ color: C.accent }}>▍</span>}
       </div>
-      {msg.spans.length > 0 && (
+      {msg.foldMode ? (msg.spans.length >= 0 && <FoldColumn msg={msg} />) : (
+      msg.spans.length > 0 && (
         <div>
           <div style={{ fontSize: 9, textTransform: "uppercase", letterSpacing: "0.08em", color: C.dim, marginBottom: 6, fontFamily: mono }}>
             Retrieved context
@@ -415,7 +490,7 @@ function AnswerCard({ msg }) {
             );
           })}
         </div>
-      )}
+      ))}
     </div>
   );
 }
@@ -502,7 +577,7 @@ export default function Chat2({ ollamaUrl, ollamaModels, browserModels }) {
     }
 
     const base = clauseBaseRef.current;
-    const added = await appendToGraph(graphRef.current, results, base);
+    const added = await appendToGraph(graphRef.current, results, base, register);
     clauseBaseRef.current = base + clauses.length;
     setGraphTick(t => t + 1);
 
@@ -529,6 +604,44 @@ export default function Chat2({ ollamaUrl, ollamaModels, browserModels }) {
   const answerQuestion = useCallback(async (text) => {
     if (!selectedModel) {
       throw new Error("No model available. Start Ollama, or load an in-browser model from the Chat or Settings tab.");
+    }
+
+    // ── Point-based fold path ──
+    // A question about one known entity, pinned to a clause window or asking
+    // something interpretive, is answered from situated folds at that point —
+    // not the global dossier. The fold at clause N is what a reader holds in
+    // mind at clause N: provisional, committed, superseded as the text moves.
+    if (graphHasContent) {
+      const focus = findFocusEntity(graphRef.current, text);
+      const clauseWindow = parseClauseWindow(text);
+      if (focus && (clauseWindow !== null || INTERPRETIVE.test(text))) {
+        const lastClause = graphRef.current.clauses.reduce(
+          (mx, c) => Math.max(mx, c.index), 0);
+        const upTo = clauseWindow !== null ? clauseWindow : lastClause;
+        const foldLlm = (sys, user) => generate({
+          model: selectedModel.name, isBrowser: selectedModel.isBrowser, ollamaUrl,
+          system: sys, user,
+        });
+        const result = await askAboutEntity(
+          graphRef.current, focus.key, text, upTo, foldLlm, setStatus);
+        if (result) {
+          setMessages(m => [...m, {
+            id: nextId(), role: "assistant", kind: "answer",
+            text: result.answer || "(the model returned an empty response)",
+            spans: result.folds.map(f => ({
+              entity: f.site, operator: "fold", site: f.site,
+              text: f.text, claimCount: f.claimCount,
+            })),
+            streaming: false, foldMode: true, foldAt: result.atClause,
+            foldEntity: result.entity,
+          }]);
+          setStatus(`Answered from ${result.folds.length} situated fold`
+            + `${result.folds.length !== 1 ? "s" : ""} of ${result.entity}`
+            + ` up to clause ${result.atClause + 1}.`);
+          return;
+        }
+        // No claims for this entity in the window — fall through to the dossier.
+      }
     }
 
     // Short follow-ups ("why?", "and her brother?") carry little signal of
@@ -679,6 +792,9 @@ export default function Chat2({ ollamaUrl, ollamaModels, browserModels }) {
       // diverged. The result is written back into the cumulative graph.
       const changed = await reclassifyFlags(
         msg.register, msg.clauses, graphRef.current, msg.clauseBase, llm, setStatus);
+      // The deep read added LLM frames to the register — re-fold them into the
+      // graph so point-based folds see the active reading they produced.
+      foldFrames(graphRef.current, msg.register, msg.clauseBase);
       setGraphTick(t => t + 1);
       setMessages(m => m.map(x => x.id === msgId
         ? { ...x, register: { ...msg.register }, deepReadDone: true } : x));
