@@ -19,6 +19,12 @@
    cannot handle (see shouldFallback). */
 
 import nlp from "compromise";
+import { cosineSim } from "./local-store.js";
+
+/* Cosine margin below which the nearest two terrains count as a tie — only
+   then does a referent's terrain go to the LLM. MiniLM cosine spreads are
+   narrow, so this is deliberately small. */
+const TIE_MARGIN = 0.04;
 
 /* Split text into clauses — the minimal unit of extraction. Sentence-ending
    punctuation, semicolons, and colons before a capital or quote. Shorter
@@ -91,6 +97,50 @@ function trimLeadingCommonNoun(name) {
   return words.slice(start).join(" ");
 }
 
+/* Common-noun referents — phrases like "drought", "the political climate",
+   "dark comedy" that are NOT named entities but DO name something the graph
+   should hold (an ambient condition, an interpretive frame, a relational
+   field). compromise's doc.nouns() surfaces them; the filter below is the
+   anti-spam gate. */
+const REFERENT_STOPS = new Set([
+  "the", "a", "an", "this", "that", "these", "those", "it", "its",
+  "thing", "things", "way", "ways", "time", "times", "year", "years",
+  "day", "days", "lot", "lots", "part", "parts", "case", "fact", "point",
+  "number", "sort", "one", "ones", "something", "someone", "anyone",
+  "everyone", "nothing", "everything", "anything", "he", "she", "they",
+  "we", "you", "what", "who", "how", "why", "when", "where", "side",
+]);
+const LEADING_DET = /^(?:the|a|an|this|that|these|those|his|her|their|its|our|my|your|some|any|no)\s+/i;
+
+export function extractReferents(doc, result) {
+  const named = new Set();
+  for (const list of [result.people, result.places, result.orgs, result.titles]) {
+    for (const n of list) for (const tok of n.toLowerCase().split(/\s+/)) named.add(tok);
+  }
+  const seen = new Set();
+  const out = [];
+  for (const rawPhrase of doc.nouns().out("array")) {
+    const trimmed = String(rawPhrase || "")
+      .replace(/^[“”"',.;:\s]+/, "").replace(/[“”"',.;:\s]+$/, "").trim();
+    if (!trimmed) continue;
+    const rawTokens = trimmed.split(/\s+/);
+    // A proper-noun-headed phrase is NER's job — skip it here.
+    if (/^[A-Z]/.test(rawTokens[rawTokens.length - 1])) continue;
+    const phrase = trimmed.replace(LEADING_DET, "").toLowerCase().trim();
+    if (phrase.length < 4 || seen.has(phrase)) continue;
+    const tokens = phrase.split(/\s+/);
+    if (tokens.some(t => named.has(t))) continue;            // already a named entity
+    if (tokens.every(t => REFERENT_STOPS.has(t) || NON_NAMES.has(t))) continue;
+    if (/^\d/.test(phrase) || /^(year|day|month|week|hour)s?$/.test(phrase)) continue;
+    seen.add(phrase);
+    out.push({ phrase, headNoun: tokens[tokens.length - 1], words: tokens.length });
+  }
+  // Prefer multi-word phrases; cap per clause so a passage cannot spam the graph.
+  out.sort((a, b) => b.words - a.words);
+  result.referents = out.slice(0, 3).map(({ phrase, headNoun }) => ({ phrase, headNoun }));
+  return result.referents;
+}
+
 /* Extract structured features from one clause. corefStack is shared across
    the document, most-recent-first, and is mutated here. */
 export function extractClause(text, clauseIndex, allTitles, corefStack) {
@@ -98,7 +148,7 @@ export function extractClause(text, clauseIndex, allTitles, corefStack) {
   const result = {
     people: [], places: [], orgs: [], titles: [],
     deaths: [], relationships: [], temporals: [],
-    numbers: [], quotes: [], coreferences: [],
+    numbers: [], quotes: [], coreferences: [], referents: [],
   };
   const titleNames = new Set((allTitles || []).map(t => t.title.toLowerCase()));
 
@@ -199,6 +249,9 @@ export function extractClause(text, clauseIndex, allTitles, corefStack) {
     if (titleNames.has(quoteText.toLowerCase())) continue;
     if (quoteText.length > 10) result.quotes.push({ text: quoteText, speaker: referent });
   }
+
+  // ── Common-noun referents — runs after NER so it can skip named entities ──
+  extractReferents(doc, result);
 
   return result;
 }
