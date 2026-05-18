@@ -44,11 +44,9 @@ function autoPick(options) {
 /* ── Point-based fold routing ──
 
    An entity question can be answered globally (the dossier path) or as a
-   situated fold AT A POINT in the text. The fold path is taken when the
-   question names a known entity and either pins a clause window ("up to
-   clause 40") or asks something interpretive ("what does X seem to be"). */
-
-const INTERPRETIVE = /\b(seem|seems|seemed|think|thinks|thinking|thought|feel|feels|feeling|really|actually|become|becomes|becoming|became|change|changes|changing|changed|arc|impression|portrayed|come across|like at this point|so far)\b/i;
+   situated fold AT A POINT in the text. The fold path is taken whenever the
+   question names a known entity; it pins a clause window ("up to clause 40")
+   when one is given, otherwise it folds at the latest clause. */
 
 /* Parse an explicit clause window — "up to clause 40", "at clause 12", "c12".
    Returns a 0-based clause index, or null when no window is named. */
@@ -542,6 +540,144 @@ const selectStyle = {
   maxWidth: 168,
 };
 
+/* Download a JSON payload as a file. */
+function downloadJSON(data, name) {
+  const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = name;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}
+
+/* ── One entity row in the graph table — expands to show its claims ── */
+function GraphEntityRow({ entity }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <div style={{ borderBottom: `1px solid ${C.border}` }}>
+      <div onClick={() => setOpen(o => !o)} style={{
+        display: "flex", gap: 8, alignItems: "center", padding: "7px 4px", cursor: "pointer",
+      }}>
+        <span style={{ color: C.dim, fontSize: 10, width: 12, flexShrink: 0 }}>{open ? "▾" : "▸"}</span>
+        <span style={{ flex: 1, fontSize: 12, fontWeight: 600, color: C.text, minWidth: 0,
+          overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{entity.name}</span>
+        <span style={{ fontSize: 10, fontFamily: mono, color: C.dim, flexShrink: 0 }}>{entity.terrain}</span>
+        <span style={{ fontSize: 10, fontFamily: mono, color: C.accent, flexShrink: 0 }}>
+          {entity.claims.length} claim{entity.claims.length !== 1 ? "s" : ""}
+        </span>
+        {entity.edges.length > 0 && (
+          <span style={{ fontSize: 10, fontFamily: mono, color: C.dim, flexShrink: 0 }}>
+            {entity.edges.length} edge{entity.edges.length !== 1 ? "s" : ""}
+          </span>
+        )}
+      </div>
+      {open && (
+        <div style={{ padding: "0 4px 8px 24px" }}>
+          {entity.claims.length === 0 && (
+            <div style={{ fontSize: 11, color: C.dim, fontStyle: "italic" }}>No claims.</div>
+          )}
+          {entity.claims.map((c, i) => (
+            <div key={i} style={{ marginBottom: 4, fontSize: 11, fontFamily: mono, lineHeight: 1.5 }}>
+              <span style={{ color: OP_COLORS[c.operator] || C.dim }}>{c.notation}</span>{" "}
+              <span style={{ color: C.dim }}>c{c.clauseIndex + 1}</span>{" — "}
+              <span style={{ color: C.text }}>{c.value || c.span}</span>
+            </div>
+          ))}
+          {entity.edges.map((e, i) => (
+            <div key={`e${i}`} style={{ fontSize: 11, fontFamily: mono, color: C.dim }}>
+              → {e.to} ({e.type})
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ── Graph panel — the full table of every node the import has built ── */
+function GraphPanel({ graph, onClose }) {
+  const entities = Object.values(graph.entities)
+    .sort((a, b) => b.claims.length - a.claims.length);
+  const clauses = [...graph.clauses].sort((a, b) => a.index - b.index);
+  const frames = graph.frames || [];
+
+  const exportGraph = () => {
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+    downloadJSON({
+      exportedAt: new Date().toISOString(),
+      counts: { entities: entities.length, claims: graph.claims.length,
+        clauses: clauses.length, frames: frames.length },
+      entities: graph.entities,
+      claims: graph.claims,
+      clauses: clauses.map(c => ({ index: c.index, text: c.text, salience: c.salience })),
+      frames,
+    }, `llmanager-graph-${stamp}.json`);
+  };
+
+  return (
+    <div onClick={onClose} style={{
+      position: "fixed", inset: 0, background: "rgba(0,0,0,.62)", zIndex: 60,
+      display: "flex", alignItems: "center", justifyContent: "center", padding: 24,
+    }}>
+      <div onClick={e => e.stopPropagation()} style={{
+        width: "min(720px, 100%)", maxHeight: "86vh", display: "flex", flexDirection: "column",
+        background: C.s1, border: `1px solid ${C.border}`, borderRadius: 12,
+        boxShadow: "0 20px 56px rgba(0,0,0,.55)",
+      }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "13px 16px",
+          borderBottom: `1px solid ${C.border}` }}>
+          <div style={{ fontSize: 13, fontWeight: 700, flex: 1 }}>Graph objects</div>
+          <button onClick={exportGraph} style={btn(true)}>Export JSON</button>
+          <button onClick={onClose} style={{ background: "transparent", border: "none",
+            color: C.dim, cursor: "pointer", fontSize: 15 }}>✕</button>
+        </div>
+        <div style={{ padding: "8px 16px", borderBottom: `1px solid ${C.border}`,
+          fontFamily: mono, fontSize: 11, color: C.dim, display: "flex", gap: 14 }}>
+          <span><b style={{ color: C.accent }}>{entities.length}</b> entities</span>
+          <span><b style={{ color: C.accent }}>{graph.claims.length}</b> claims</span>
+          <span><b style={{ color: C.accent }}>{clauses.length}</b> clauses</span>
+          <span><b style={{ color: C.accent }}>{frames.length}</b> frames</span>
+        </div>
+        <div style={{ padding: "10px 16px", overflowY: "auto" }}>
+          {entities.length === 0 && clauses.length === 0 ? (
+            <div style={{ fontSize: 12, color: C.dim, padding: "20px 0", textAlign: "center" }}>
+              No nodes yet — add a source and it will be read into the graph here.
+            </div>
+          ) : (<>
+            <div style={{ fontSize: 11, fontWeight: 700, color: C.dim, fontFamily: mono,
+              textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 4 }}>
+              Entities
+            </div>
+            {entities.length === 0 ? (
+              <div style={{ fontSize: 11, color: C.dim, fontStyle: "italic", marginBottom: 10 }}>
+                No entities — the import found clauses but no named entities.
+              </div>
+            ) : (
+              <div style={{ marginBottom: 14 }}>
+                {entities.map((e, i) => <GraphEntityRow key={i} entity={e} />)}
+              </div>
+            )}
+            <div style={{ fontSize: 11, fontWeight: 700, color: C.dim, fontFamily: mono,
+              textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 6 }}>
+              Clauses
+            </div>
+            {clauses.map((c, i) => (
+              <div key={i} style={{ display: "flex", gap: 8, marginBottom: 3, fontSize: 11,
+                fontFamily: mono, lineHeight: 1.5 }}>
+                <span style={{ color: C.dim, flexShrink: 0 }}>c{c.index + 1}</span>
+                <span style={{ color: C.text }}>{c.text}</span>
+              </div>
+            ))}
+          </>)}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function btn(primary, disabled) {
   return {
     padding: "5px 12px", fontSize: 11, fontFamily: mono, fontWeight: 600,
@@ -571,6 +707,7 @@ export default function Chat2({ ollamaUrl, ollamaModels, browserModels }) {
   const clauseBaseRef = useRef(0);
   const scrollRef = useRef(null);
   const [graphTick, setGraphTick] = useState(0); // forces stat re-render
+  const [showGraph, setShowGraph] = useState(false);
 
   // Every Ollama model and every loaded in-browser model — the same rosters
   // the main Chat picker offers.
@@ -657,7 +794,11 @@ export default function Chat2({ ollamaUrl, ollamaModels, browserModels }) {
     if (graphHasContent) {
       const focus = findFocusEntity(graphRef.current, text);
       const clauseWindow = parseClauseWindow(text);
-      if (focus && (clauseWindow !== null || INTERPRETIVE.test(text))) {
+      // Whenever the question lands on a known entity, walk the graph and
+      // answer from situated folds at the clause cursor — the dossier is only
+      // a fallback (askAboutEntity returns null when the entity has no claims
+      // in the window).
+      if (focus) {
         const lastClause = graphRef.current.clauses.reduce(
           (mx, c) => Math.max(mx, c.index), 0);
         const upTo = clauseWindow !== null ? clauseWindow : lastClause;
@@ -857,21 +998,28 @@ export default function Chat2({ ollamaUrl, ollamaModels, browserModels }) {
   return (
     <div style={{ display: "flex", flexDirection: "column", height: "100%", background: C.bg, color: C.text }}>
       {/* Header */}
-      <div style={{ padding: "12px 18px", borderBottom: `1px solid ${C.border}`, flexShrink: 0 }}>
-        <div style={{ fontSize: 14, fontWeight: 700 }}>
-          Chat 2.0 <span style={{ color: C.dim, fontWeight: 400, fontSize: 12 }}>· EO Classifier</span>
+      <div style={{ padding: "12px 18px", borderBottom: `1px solid ${C.border}`, flexShrink: 0,
+        display: "flex", alignItems: "center", gap: 12 }}>
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div style={{ fontSize: 14, fontWeight: 700 }}>
+            Chat 2.0 <span style={{ color: C.dim, fontWeight: 400, fontSize: 12 }}>· EO Classifier</span>
+          </div>
+          <div style={{ fontSize: 11, fontFamily: mono, color: C.dim, marginTop: 3 }}>
+            {graphTick >= 0 && (
+              <>{Object.keys(g.entities).length} entities · {g.claims.length} claims · {g.clauses.length} clauses · </>
+            )}
+            {llmReady
+              ? <span style={{ color: C.green }}>
+                  {autoMode ? "auto · " : ""}answering with {selectedModel.name}{selectedModel.isBrowser ? " (in-browser)" : ""}
+                </span>
+              : <span style={{ color: C.orange }}>no model available — load one in the Chat or Settings tab</span>}
+          </div>
         </div>
-        <div style={{ fontSize: 11, fontFamily: mono, color: C.dim, marginTop: 3 }}>
-          {graphTick >= 0 && (
-            <>{Object.keys(g.entities).length} entities · {g.claims.length} claims · {g.clauses.length} clauses · </>
-          )}
-          {llmReady
-            ? <span style={{ color: C.green }}>
-                {autoMode ? "auto · " : ""}answering with {selectedModel.name}{selectedModel.isBrowser ? " (in-browser)" : ""}
-              </span>
-            : <span style={{ color: C.orange }}>no model available — load one in the Chat or Settings tab</span>}
-        </div>
+        <button onClick={() => setShowGraph(true)} style={btn(false)}>
+          Graph ({Object.keys(g.entities).length})
+        </button>
       </div>
+      {showGraph && <GraphPanel graph={g} onClose={() => setShowGraph(false)} />}
 
       {/* Status */}
       <div style={{ padding: "6px 18px", fontSize: 11, fontFamily: mono, color: C.amber, flexShrink: 0,

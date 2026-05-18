@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from "react";
-import Chat from "./Chat.jsx";
+import Chat2 from "./Chat2.jsx";
 import RoutingPanel from "./RoutingPanel.jsx";
 import MatrixGate from "./MatrixGate.jsx";
 import MatrixChat from "./MatrixChat.jsx";
@@ -435,7 +435,7 @@ OLLAMA_ORIGINS="${pageOrigin || "https://myapp.com"},http://localhost:3000" olla
 
       {tab === "chat" ? (
         <div style={{ flex: 1, minHeight: 0 }}>
-          <Chat ollamaUrl={ollamaUrl} ollamaModels={ollamaModelList} browserModels={loadedBrowserList} ollamaUp={ollamaUp} />
+          <Chat2 ollamaUrl={ollamaUrl} ollamaModels={ollamaModelList} browserModels={loadedBrowserList} ollamaUp={ollamaUp} />
         </div>
       ) : tab === "matrix" ? (
         <div style={{ flex: 1, minHeight: 0, overflowY: "auto" }}>
