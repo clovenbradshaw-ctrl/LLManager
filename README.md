@@ -50,6 +50,34 @@ If you start Ollama from a terminal instead, pass it inline:
 if the desktop app is running, the terminal server won't bind. The **Status**
 tab detects this case and shows the exact fix.
 
+## Chat 2.0 — the EO Classifier
+
+The **Chat 2.0** tab replaces the library-and-folders ingest flow: there is
+nothing to upload. Whatever you paste into the chat is read straight into an
+in-memory knowledge graph.
+
+Paste material — an article, notes, a transcript — and it is cleaned, split
+into clauses, and each clause is classified against the 27 EO reference
+centroids (operator × terrain × stance) using on-device embeddings. Entities
+and claims accumulate into a graph, and a hypothesis register tracks the
+interpretive frames the text builds. Ask a question and it is answered,
+grounded, from everything pasted so far, with the retrieved passages shown
+beside the answer.
+
+Classification is split into a mechanical and a functional layer. The
+mechanical layer is the centroid score of the clause's surface. When the
+register's trigger machinery notices a mismatch the centroid cannot explain
+— a factual-looking clause that lands at a surprise point, a drift with no
+operator change, an unanchored region — the clause is **flagged** amber. The
+flags are useful on their own: they point at the clauses worth reading
+closely. An optional **Deep read** then runs the model over the trigger
+points and the flagged clauses; at each flag it names the operator that is
+actually functioning, writes the reclassification back into the graph, and
+records the disagreement (`~~DEF~~ → REC`) in the register.
+
+Ingestion is fully local (NLP + embeddings, no model calls); only the
+grounded answers and the deep read use the configured LLM.
+
 ## Matrix login & remote LLM bridge
 
 The app opens to a **Matrix sign-in gate**. Sign in with any Matrix account
