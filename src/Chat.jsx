@@ -1650,7 +1650,8 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
     }
     // A background call must never hang the walk: abort after 2 minutes.
     const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), 120000);
+    let timedOut = false;
+    const timer = setTimeout(() => { timedOut = true; ctrl.abort(); }, 120000);
     let r;
     try {
       r = await fetch(`${ollamaUrl}/api/chat`, {
@@ -1663,10 +1664,15 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
         }),
         signal: ctrl.signal,
       });
+    } catch (e) {
+      if (timedOut) {
+        throw new Error(`${model} did not respond within 120s — the model may be loading, too large for this machine, or running on CPU. Try a smaller background model or pre-load it.`);
+      }
+      throw e;
     } finally {
       clearTimeout(timer);
     }
-    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    if (!r.ok) throw new Error(`HTTP ${r.status} from Ollama for ${model}`);
     const j = await r.json();
     return j.message?.content || "";
   };
