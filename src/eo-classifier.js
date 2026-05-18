@@ -109,6 +109,22 @@ function averageVec(vecs) {
   return avg;
 }
 
+/* The text's own volatility — the average clause-to-clause drift, measured
+   over sliding windows. The trigger machinery calibrates against this so a
+   naturally restless text is not flagged on every clause. */
+function computeBaselineDrift(clauseVecs) {
+  if (clauseVecs.length < 8) return 0.10;
+  let totalDrift = 0, count = 0;
+  for (let i = 4; i < clauseVecs.length; i++) {
+    const recent = clauseVecs.slice(i - 4, i).map(c => c.vec);
+    const prior = clauseVecs.slice(Math.max(0, i - 8), i - 4).map(c => c.vec);
+    if (prior.length < 2) continue;
+    totalDrift += 1 - cosineSim(averageVec(recent), averageVec(prior));
+    count++;
+  }
+  return count > 0 ? totalDrift / count : 0.10;
+}
+
 /* ── Text pre-cleaning ── */
 
 function stripWebChrome(text) {
@@ -190,32 +206,6 @@ function isRealName(name) {
   return true;
 }
 
-function isChrome(text, nextClause) {
-  const words = text.split(/\s+/).length;
-  const trimmed = text.trim();
-
-  if (nextClause) {
-    const nextTrimmed = nextClause.trim();
-    const nextStartsWithQuote = /^[“"‘']/.test(nextTrimmed);
-    const hasAttribution = /\b(said|says|told|asked|spoke|added|replied|responded|noted|observed|argued|declared|explained|recalled|continued|insisted|warned|suggested|acknowledged|admitted)\b/i.test(trimmed);
-    const hasName = /[A-Z][a-z]+(?:\s[A-Z][a-z]+)?/.test(trimmed);
-    if (nextStartsWithQuote && hasAttribution && hasName) return false;
-    if (/:\s*$/.test(trimmed) && nextStartsWithQuote) return false;
-  }
-
-  const containsNameAndSpeech = /[A-Z][a-z]+/.test(trimmed) &&
-    /\b(said|says|told|asked|spoke|added|replied|responded|attended.*spoke)\b/i.test(trimmed);
-  if (containsNameAndSpeech && words < 12) return false;
-
-  if (words < 4) return true;
-  if (/^\w+\s+\d{1,2},\s+\d{4}/.test(trimmed) && words < 8) return true;
-  if (/^Image\b/i.test(trimmed)) return true;
-  if (/^(Politics|Related|Quiz|Wait,)/i.test(trimmed) && words < 10) return true;
-  if (/^(he|she|they)\s+(said|added|replied)\.?$/i.test(trimmed)) return true;
-  if (/^For\s+Mr\.?\s*$/.test(trimmed)) return true;
-  return false;
-}
-
 /* ── Per-clause extraction (compromise NLP + domain regex) ── */
 
 function extractClause(text, corefStack) {
@@ -282,50 +272,108 @@ function extractClause(text, corefStack) {
   return { people, places, orgs, claims, clause: text };
 }
 
-/* ── Hypothesis register — when to pause and read interpretively ── */
+/* ── Hypothesis register — when to pause and read interpretively ──
 
-function shouldRead(register, clauseIndex, frameEvents, claimCount) {
-  if (clauseIndex < 3) return null;
+   The trigger replaces the old metronome: a clause is read interpretively
+   only when something demands it — drift past the text's own baseline
+   volatility, a clause that surprises an active frame, a long silence with
+   no frame confirmed, a dense claim cluster, or two frames converging.
+   Returns an array of reason objects, or null. */
+function shouldRead(register, clauseIndex, clauseVec, extraction) {
+  const reasons = [];
 
-  if (claimCount !== undefined && claimCount >= 4) {
-    return { reason: "density", claims: claimCount };
-  }
-
-  const recent = register.clauseVecs.slice(-4);
-  if (recent.length >= 4) {
-    const rc = averageVec(recent.map(c => c.vec));
+  if (register.clauseVecs.length >= 8) {
+    const rc = averageVec(register.clauseVecs.slice(-4).map(c => c.vec));
     const dc = averageVec(register.clauseVecs.map(c => c.vec));
     const drift = 1 - cosineSim(rc, dc);
-    if (drift > 0.12) return { reason: "drift", drift };
+    const baseline = register.baselineDrift || 0.10;
+    if (drift > baseline * 1.5) reasons.push({ type: "drift", drift, baseline });
   }
 
-  if (frameEvents.some(e => e.type === "surprise")) return { reason: "surprise" };
-
-  for (let a = 0; a < register.frames.length; a++) {
-    for (let b = a + 1; b < register.frames.length; b++) {
-      const overlap = register.frames[a].confirmedBy
-        .filter(c => c >= clauseIndex - 4 && register.frames[b].confirmedBy.includes(c));
-      if (overlap.length >= 2)
-        return { reason: "convergence", frames: [register.frames[a].id, register.frames[b].id] };
-    }
+  for (const frame of register.frames) {
+    if (frame.strength < 0.3) continue;
+    const sim = cosineSim(clauseVec, frame.vec);
+    if (sim < 0.18) reasons.push({ type: "surprise", frame: frame.id, sim });
   }
 
   if (register.frames.length > 0) {
-    const lastConfirm = Math.max(...register.frames.map(f =>
-      f.confirmedBy.length > 0 ? Math.max(...f.confirmedBy) : -1));
-    if (clauseIndex - lastConfirm > 6) return { reason: "silence", gap: clauseIndex - lastConfirm };
+    const lastConfirm = Math.max(
+      ...register.frames.map(f =>
+        f.confirmedBy.length > 0 ? Math.max(...f.confirmedBy) : f.generatedAt)
+    );
+    if (clauseIndex - lastConfirm > 6) reasons.push({ type: "silence", gap: clauseIndex - lastConfirm });
   }
 
-  return null;
+  if (extraction && extraction.claims.length > 0) {
+    const words = extraction.clause.split(/\s+/).length;
+    const density = extraction.claims.length / words;
+    if (density > 0.12) reasons.push({ type: "density", density, claims: extraction.claims.length, words });
+  }
+
+  for (let i = 0; i < register.frames.length; i++) {
+    for (let j = i + 1; j < register.frames.length; j++) {
+      const recentI = register.frames[i].confirmedBy.filter(c => c >= clauseIndex - 3);
+      const recentJ = register.frames[j].confirmedBy.filter(c => c >= clauseIndex - 3);
+      if (recentI.filter(c => recentJ.includes(c)).length >= 2) {
+        reasons.push({ type: "convergence", frames: [register.frames[i].id, register.frames[j].id] });
+      }
+    }
+  }
+
+  return reasons.length > 0 ? reasons : null;
+}
+
+/* ── Salience — how much a clause matters, scored without the LLM ──
+
+   A continuous score over claim count, proximity to known entities, proximity
+   to active frames, and lexical density, penalised for very short clauses.
+   `entityVecs` is the set of entity/claim vectors known so far (this block
+   plus any prior graph) — the clause is salient if it lands near them. */
+function salience(clause, clauseVec, extraction, register, entityVecs) {
+  let score = 0;
+
+  score += extraction.claims.length * 0.2;
+
+  let bestEntitySim = 0;
+  for (const vec of entityVecs) {
+    const sim = cosineSim(clauseVec, vec);
+    if (sim > bestEntitySim) bestEntitySim = sim;
+  }
+  score += bestEntitySim * 0.3;
+
+  let bestFrameSim = 0;
+  for (const frame of register.frames) {
+    const sim = cosineSim(clauseVec, frame.vec);
+    if (sim > bestFrameSim) bestFrameSim = sim;
+  }
+  score += bestFrameSim * 0.25;
+
+  const words = clause.split(/\s+/);
+  const stops = /^(the|this|that|with|from|have|been|will|would|could|should|they|their|them|these|those|into|onto|upon|also|just|than|then|when|what|which|where|who|whom|whose|more|most|some|such|each|every|both|were|does|done|here|there|about|after|before|under|over|between|through|during|without|within|along|among|against|toward|across|behind|beyond|above|below)$/i;
+  const contentWords = words.filter(w => w.length > 3 && !stops.test(w));
+  score += (words.length > 0 ? contentWords.length / words.length : 0) * 0.15;
+
+  if (words.length < 6) score *= 0.5;
+  if (words.length < 3) score *= 0.3;
+
+  return score;
 }
 
 /* ── Main pipeline — process one block of pasted material ──
 
    Returns { results, clauses, register }. Clause indices are local (0-based)
-   to this block; appendToGraph offsets them into the cumulative graph. */
+   to this block; appendToGraph offsets them into the cumulative graph.
 
-export async function processText(rawText, onProgress) {
+   Every clause is embedded and scored for salience against the live entity
+   set and the hypothesis register. A clause below the salience floor is
+   logged inert — not classified — and revisited retroactively once the rest
+   of the block is in. Interpretive reading is driven by the trigger, not a
+   metronome. No LLM calls. `priorGraph`, when supplied, seeds the entity
+   set so salience can see what earlier turns established. */
+
+export async function processText(rawText, onProgress, priorGraph) {
   await ensureCentroids(onProgress);
+  const t0 = Date.now();
 
   let text = stripWebChrome(String(rawText || ""));
   text = cleanArticleText(text);
@@ -333,19 +381,34 @@ export async function processText(rawText, onProgress) {
   const clauses = splitClauses(text);
   const corefStack = [];
   const results = [];
-  const register = { frames: [], history: [], clauseVecs: [], triggerPoints: [], flags: [] };
+  const register = {
+    frames: [], history: [], clauseVecs: [], triggerPoints: [], flags: [],
+    baselineDrift: 0.10,
+  };
   let frameCounter = 0;
-  let prevWholeOp = null;
+  // The entity vectors salience scores proximity against — seeded from the
+  // cumulative graph, then grown with each claim span found in this block.
+  const entityVecs = priorGraph && priorGraph.vectors
+    ? Object.values(priorGraph.vectors).slice() : [];
 
   for (let i = 0; i < clauses.length; i++) {
-    if (onProgress) onProgress(`Reading clause ${i + 1}/${clauses.length}…`);
+    if (onProgress) onProgress(`Clause ${i + 1}/${clauses.length}…`);
     const clause = clauses[i];
-    const nextClause = i < clauses.length - 1 ? clauses[i + 1] : null;
 
-    if (isChrome(clause, nextClause)) {
+    // Embed every clause first — salience needs the vector.
+    const clauseVec = await embed(clause);
+    register.clauseVecs.push({ index: i, vec: clauseVec });
+
+    // Extract claims (cheap NLP).
+    const extraction = extractClause(clause, corefStack);
+
+    // Score salience against the live entity set + register.
+    const sal = salience(clause, clauseVec, extraction, register, entityVecs);
+
+    if (sal < 0.15) {
       results.push({
-        clauseIndex: i, clause, entity: "(chrome — skipped)", value: "", span: clause,
-        rawType: "chrome",
+        clauseIndex: i, clause, entity: "(inert)", value: "",
+        span: clause, rawType: "inert", salience: sal, vec: clauseVec,
         operator: { name: "—", score: 0, runnerUp: "", margin: 1 },
         terrain: { name: "—", score: 0, runnerUp: "", margin: 1 },
         stance: { name: "—", score: 0, runnerUp: "", margin: 1 },
@@ -354,13 +417,14 @@ export async function processText(rawText, onProgress) {
       continue;
     }
 
-    const extraction = extractClause(clause, corefStack);
-
+    // Classify each claim.
     for (const claim of extraction.claims) {
       const spanVec = await embed(claim.span);
+      entityVecs.push(spanVec);
       results.push({
         clauseIndex: i, clause: extraction.clause, entity: claim.entity,
-        value: claim.value, span: claim.span, rawType: claim.rawType, relType: claim.relType,
+        value: claim.value, span: claim.span, rawType: claim.rawType,
+        relType: claim.relType, salience: sal,
         operator: nearestCentroid(spanVec, refVecs.operators),
         terrain: nearestCentroid(spanVec, refVecs.terrains),
         stance: nearestCentroid(spanVec, refVecs.stances),
@@ -368,67 +432,83 @@ export async function processText(rawText, onProgress) {
       });
     }
 
-    const clauseVec = await embed(clause);
-    register.clauseVecs.push({ index: i, vec: clauseVec });
+    // Classify whole clause.
     const op = nearestCentroid(clauseVec, refVecs.operators);
     const te = nearestCentroid(clauseVec, refVecs.terrains);
     const st = nearestCentroid(clauseVec, refVecs.stances);
 
-    // Score the clause against active frames.
+    // ── Score clause against active frames ──
     const frameEvents = [];
     for (const frame of register.frames) {
-      const simContent = cosineSim(clauseVec, frame.vec);
-      if (simContent > 0.50) {
+      const sim = cosineSim(clauseVec, frame.vec);
+      if (sim > 0.50) {
         frame.confirmedBy.push(i);
         frame.strength = frame.confirmedBy.length / (i - frame.generatedAt + 1);
-        frameEvents.push({ type: "confirm", frameId: frame.id, sim: simContent.toFixed(2), text: frame.text });
-        register.history.push({ event: "confirmed", frame: frame.id, at: i, sim: simContent });
-      } else if (simContent < 0.18 && frame.strength > 0.3) {
-        if (!frame.surprisedBy) frame.surprisedBy = [];
-        frame.surprisedBy.push(i);
-        frameEvents.push({ type: "surprise", frameId: frame.id, sim: simContent.toFixed(2), text: frame.text });
-        register.history.push({ event: "surprised", frame: frame.id, at: i, sim: simContent });
+        frameEvents.push({ type: "confirm", frameId: frame.id, sim: sim.toFixed(2), text: frame.text });
+        register.history.push({ event: "confirmed", frame: frame.id, at: i, sim });
+      } else if (sim < 0.20 && frame.strength > 0.3) {
+        frameEvents.push({ type: "surprise", frameId: frame.id, sim: sim.toFixed(2), text: frame.text });
+        register.history.push({ event: "surprised", frame: frame.id, at: i, sim });
       }
     }
 
-    const claimCount = results.filter(r => r.clauseIndex === i && r.rawType !== "clause" && r.rawType !== "chrome").length;
-    const trigger = shouldRead(register, i, frameEvents, claimCount);
+    // ── Update baseline drift periodically ──
+    if (i === 20 || (i > 20 && i % 30 === 0)) {
+      register.baselineDrift = computeBaselineDrift(register.clauseVecs);
+    }
 
-    if (trigger && register.clauseVecs.length >= 2) {
+    // ── Trigger function replaces metronome ──
+    const triggers = shouldRead(register, i, clauseVec, extraction);
+
+    if (triggers) {
       const recentVecs = register.clauseVecs.slice(-4).map(c => c.vec);
       const rc = averageVec(recentVecs);
-      const dc = averageVec(register.clauseVecs.map(c => c.vec));
+      const allV = register.clauseVecs.map(c => c.vec);
+      const dc = averageVec(allV);
       const drift = 1 - cosineSim(rc, dc);
+
       const secT = nearestCentroid(rc, refVecs.terrains);
       const secO = nearestCentroid(rc, refVecs.operators);
-      const secEnt = [...new Set(results
-        .filter(r => r.clauseIndex >= i - 3 && r.clauseIndex <= i && r.entity && !r.entity.startsWith("("))
-        .map(r => r.entity))].slice(0, 4);
-      const mechText = (secEnt.length > 0 ? secEnt.join(", ") + ": " : "")
-        + secO.name + " at " + secT.name + (drift > 0.12 ? " [SHIFT]" : "");
+      const secEnt = [...new Set(
+        results.filter(r =>
+          r.clauseIndex >= i - 3 && r.clauseIndex <= i
+          && r.entity && !r.entity.startsWith("("))
+        .map(r => r.entity)
+      )].slice(0, 4);
 
-      register.triggerPoints.push({ clauseIndex: i, trigger, drift, mechText });
+      const triggerLabel = triggers.map(t => t.type).join("+");
+      const hypText = (secEnt.length > 0 ? secEnt.join(", ") + ": " : "")
+        + secO.name + " at " + secT.name
+        + " [" + triggerLabel + "]"
+        + (drift > (register.baselineDrift || 0.10) * 1.5 ? " SHIFT" : "");
+
+      // Keep a trigger point so the optional deep read can interpret it.
+      register.triggerPoints.push({
+        clauseIndex: i, trigger: { reason: triggerLabel, reasons: triggers },
+        drift, mechText: hypText,
+      });
 
       let matched = false;
       for (const ex of register.frames) {
         if (cosineSim(rc, ex.vec) > 0.55) {
-          ex.text = mechText; ex.vec = rc; ex.revisedAt = i; ex.revision++; ex.drift = drift;
-          register.history.push({ event: "refined", frame: ex.id, at: i, text: mechText });
-          frameEvents.push({ type: "refine", frameId: ex.id, text: mechText });
-          matched = true;
-          break;
+          ex.text = hypText; ex.vec = rc; ex.revisedAt = i;
+          ex.revision++; ex.drift = drift; ex.triggers = triggers;
+          register.history.push({ event: "refined", frame: ex.id, at: i, text: hypText, triggers });
+          frameEvents.push({ type: "refine", frameId: ex.id, text: hypText });
+          matched = true; break;
         }
       }
       if (!matched) {
         const nf = {
-          id: `hyp_${frameCounter++}`, text: mechText, vec: rc, confirmedBy: [], surprisedBy: [],
-          strength: 0.5, generatedAt: i, revisedAt: i, revision: 0, drift,
-          source: "mechanical", trigger: trigger.reason,
+          id: `hyp_${frameCounter++}`, text: hypText, vec: rc,
+          confirmedBy: [], surprisedBy: [], strength: 0.5, generatedAt: i,
+          revisedAt: i, revision: 0, drift, triggers, source: "mechanical",
         };
         register.frames.push(nf);
-        register.history.push({ event: "created", frame: nf.id, at: i, text: mechText, trigger: trigger.reason });
-        frameEvents.push({ type: "new_frame", frameId: nf.id, text: `[${trigger.reason}] ${mechText}` });
+        register.history.push({ event: "created", frame: nf.id, at: i, text: hypText, triggers });
+        frameEvents.push({ type: "new_frame", frameId: nf.id, text: hypText });
       }
+
       for (const f of register.frames) {
         const last = f.confirmedBy.length > 0 ? Math.max(...f.confirmedBy) : f.generatedAt;
         if (i - last > 8) f.strength *= 0.7;
@@ -436,38 +516,99 @@ export async function processText(rawText, onProgress) {
       register.frames = register.frames.filter(f => f.strength > 0.1 || i - f.generatedAt < 4);
     }
 
-    // ── Flag clauses where the mechanical surface and the function diverge ──
-    // The centroid scores the surface; the trigger machinery (the "shadow")
-    // notices a mismatch the centroid cannot explain. A flag marks the spot
-    // for closer reading — no LLM call yet.
-    let flagReason = null;
-    if (frameEvents.some(e => e.type === "surprise") && op.name === "DEF") {
-      // DEF at a surprise point: a clause scoring as a plain factual report
-      // while it actually reframes everything.
-      flagReason = "surprise+DEF";
-    } else if (trigger && trigger.reason === "drift" && op.name === prevWholeOp) {
-      // The text drifted but the operator did not — surface held, function moved.
-      flagReason = "drift+static";
-    } else if (trigger && trigger.reason === "silence") {
-      // No frame is tracking this region; the classification may be unanchored.
-      flagReason = "silence";
+    // ── Flag where surface ≠ function ──
+    const flagReasons = [];
+    if (triggers) {
+      const recentOps = results.slice(-8)
+        .filter(r => r.rawType === "clause")
+        .map(r => r.operator.name);
+      const modeOp = recentOps.sort((a, b) =>
+        recentOps.filter(v => v === b).length - recentOps.filter(v => v === a).length
+      )[0];
+      if (op.name === modeOp) flagReasons.push("drift+static");
+      if (triggers.some(t => t.type === "surprise") && op.name === "DEF") flagReasons.push("surprise+DEF");
+      if (triggers.some(t => t.type === "density")) flagReasons.push("density");
+      if (triggers.some(t => t.type === "silence")) flagReasons.push("silence");
     }
-    if (flagReason) {
+    const needsReading = flagReasons.length > 0;
+    if (needsReading) {
       register.flags.push({
-        clauseIndex: i, mechanicalOp: op.name, reason: flagReason, text: clause,
-        functionalOp: null, functionalReason: null,
+        clauseIndex: i, mechanicalOp: op.name, reason: flagReasons.join("+"),
+        text: clause, functionalOp: null, functionalReason: null,
       });
-      register.history.push({ event: "flagged", at: i, text: `${op.name} · ${flagReason}` });
+      register.history.push({ event: "flagged", at: i, text: `${op.name} · ${flagReasons.join("+")}` });
     }
-    prevWholeOp = op.name;
 
     results.push({
       clauseIndex: i, clause: extraction.clause, entity: "(whole clause)",
       value: clause.slice(0, 60) + (clause.length > 60 ? "…" : ""),
-      span: clause, rawType: "clause", operator: op, terrain: te, stance: st,
-      vec: clauseVec, frameEvents,
-      needsReading: !!flagReason, flagReason, mechanicalOp: op.name,
+      span: clause, rawType: "clause", salience: sal,
+      operator: op, terrain: te, stance: st,
+      vec: clauseVec, frameEvents, needsReading, flagReasons,
+      mechanicalOp: op.name, triggers,
     });
+  }
+
+  // ── Retroactive salience revision ──
+  // Recompute salience for inert clauses using the FINAL entity set + register.
+  // A clause inert at position 5 may matter once entities appear later.
+  if (onProgress) onProgress("Revising salience…");
+  const inertIndices = [];
+  for (let j = 0; j < results.length; j++) {
+    if (results[j].rawType === "inert") inertIndices.push(j);
+  }
+
+  let revived = 0;
+  for (const j of inertIndices) {
+    const r = results[j];
+    const cv = register.clauseVecs.find(c => c.index === r.clauseIndex);
+    if (!cv) continue;
+
+    // Re-extract (coref stack is stale but claims are structural).
+    const reExtraction = extractClause(r.clause, []);
+    const newSal = salience(r.clause, cv.vec, reExtraction, register, entityVecs);
+
+    // Update the stored salience regardless — a clause that stays inert still
+    // gets its final judgment, so the display fades it by what it became.
+    r.salience = newSal;
+
+    if (newSal >= 0.15) {
+      // Revive: classify it now.
+      r.rawType = "revived";
+      r.entity = "(whole clause)";
+      r.value = r.clause.slice(0, 60) + (r.clause.length > 60 ? "…" : "");
+
+      r.operator = nearestCentroid(cv.vec, refVecs.operators);
+      r.terrain = nearestCentroid(cv.vec, refVecs.terrains);
+      r.stance = nearestCentroid(cv.vec, refVecs.stances);
+      r.mechanicalOp = r.operator.name;
+      r.vec = cv.vec;
+
+      // Also insert any claims we missed.
+      for (const claim of reExtraction.claims) {
+        const spanVec = await embed(claim.span);
+        entityVecs.push(spanVec);
+        results.splice(j, 0, {
+          clauseIndex: r.clauseIndex, clause: r.clause,
+          entity: claim.entity, value: claim.value,
+          span: claim.span, rawType: claim.rawType,
+          relType: claim.relType, salience: newSal,
+          operator: nearestCentroid(spanVec, refVecs.operators),
+          terrain: nearestCentroid(spanVec, refVecs.terrains),
+          stance: nearestCentroid(spanVec, refVecs.stances),
+          frameEvents: [],
+        });
+      }
+      revived++;
+    }
+  }
+
+  if (onProgress) {
+    const inertCount = results.filter(r => r.rawType === "inert").length;
+    const flaggedCount = results.filter(r => r.needsReading).length;
+    onProgress(`Done. ${results.length} classifications, ${register.frames.length} active frames, `
+      + `${inertCount} inert, ${revived} revived, ${flaggedCount} flagged `
+      + `in ${Date.now() - t0}ms.`);
   }
 
   return { results, clauses, register };
@@ -493,18 +634,20 @@ export async function appendToGraph(graph, results, clauseBase, register) {
     const globalIndex = clauseBase + r.clauseIndex;
 
     if (!seenClauses.has(r.clauseIndex) &&
-        (r.rawType === "clause" || r.rawType === "chrome")) {
+        (r.rawType === "clause" || r.rawType === "revived" || r.rawType === "inert")) {
       if (!graph.clauses.some(c => c.index === globalIndex)) {
         graph.clauses.push({
           index: globalIndex, text: r.clause, vec: r.vec || null,
-          needsReading: !!r.needsReading, flagReason: r.flagReason || null,
+          needsReading: !!r.needsReading,
+          flagReason: (r.flagReasons && r.flagReasons.join("+")) || null,
           mechanicalOp: r.mechanicalOp || null, functionalOp: null,
+          salience: r.salience != null ? r.salience : null,
         });
       }
       seenClauses.add(r.clauseIndex);
     }
 
-    if (r.rawType === "chrome" || r.rawType === "clause") continue;
+    if (r.rawType === "clause" || r.rawType === "revived" || r.rawType === "inert") continue;
 
     const key = r.entity.toLowerCase();
     if (!key || key === "?" || key.startsWith("(")) continue;

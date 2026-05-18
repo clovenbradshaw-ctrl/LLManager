@@ -164,7 +164,7 @@ let msgSeq = 0;
 const nextId = () => `m${++msgSeq}`;
 
 /* ── Operator distribution bar for an analysis card ── */
-function OpSummary({ opCounts, total, chromeCount }) {
+function OpSummary({ opCounts, total, inertCount }) {
   return (
     <div style={{ display: "flex", flexWrap: "wrap", gap: 6, margin: "10px 0" }}>
       {Object.keys(OPERATORS).map(op => {
@@ -181,12 +181,102 @@ function OpSummary({ opCounts, total, chromeCount }) {
           </div>
         );
       })}
-      {chromeCount > 0 && (
+      {inertCount > 0 && (
         <div style={{
           padding: "5px 9px", background: C.s2, borderRadius: "0 4px 4px 0",
           borderLeft: "3px solid #333", fontSize: 11, fontFamily: mono, color: C.dim,
-        }}>CHROME {chromeCount} skipped</div>
+        }}>INERT {inertCount} not classified</div>
       )}
+    </div>
+  );
+}
+
+/* ── A single clause's classification rows. Salience drives the block's
+   opacity — a low-salience clause fades, and lifts to full on hover. ── */
+function ClauseCard({ ci, rows }) {
+  const [hover, setHover] = useState(false);
+  const head = rows[0];
+  const wholeRow = rows.find(r =>
+    r.rawType === "clause" || r.rawType === "revived" || r.rawType === "inert");
+  const sal = (wholeRow && wholeRow.salience != null) ? wholeRow.salience
+    : (head && head.salience != null ? head.salience : 0.5);
+  const opacity = hover ? 1 : Math.max(0.2, Math.min(1, sal * 2.5));
+
+  return (
+    <div
+      onMouseEnter={() => setHover(true)}
+      onMouseLeave={() => setHover(false)}
+      style={{
+        background: C.s2, border: `1px solid ${C.border}`, borderRadius: 6,
+        marginBottom: 8, overflow: "hidden", opacity, transition: "opacity 0.2s",
+      }}>
+      <div style={{
+        padding: "6px 10px", fontSize: 9, textTransform: "uppercase",
+        letterSpacing: "0.1em", color: C.dim, borderBottom: `1px solid ${C.border}`,
+      }}>Clause {Number(ci) + 1}</div>
+      <div style={{
+        padding: "8px 10px", fontSize: 13, lineHeight: 1.5, color: C.text,
+        borderBottom: `1px solid ${C.border}`,
+      }}>{head.clause}</div>
+      <div style={{ padding: 8 }}>
+        {rows.map((r, i) => {
+          const isWholeClause = r.rawType === "clause";
+          const isInert = r.rawType === "inert";
+          const isRevived = r.rawType === "revived";
+          const isWhole = isWholeClause || isInert || isRevived;
+          const opColor = OP_COLORS[r.operator.name] || "#666";
+          return (
+            <div key={i} style={{
+              padding: 6, marginBottom: 4, borderRadius: 4,
+              borderLeft: isRevived ? `2px solid ${C.green}` : undefined,
+              fontStyle: isInert ? "italic" : undefined,
+              opacity: isInert ? 0.5 : 1,
+              background: isRevived ? "rgba(48,164,108,0.07)"
+                : isWholeClause ? "rgba(110,86,207,0.07)" : "rgba(255,255,255,0.02)",
+            }}>
+              <div style={{ fontSize: 11, marginBottom: isWhole && !isInert ? 4 : 0 }}>
+                {isInert
+                  ? <em style={{ color: C.dim }}>inert ({(r.salience || 0).toFixed(2)})</em>
+                  : isRevived
+                    ? <em style={{ color: C.green }}>revived ({(r.salience || 0).toFixed(2)})</em>
+                    : isWholeClause
+                      ? <em style={{ color: C.dim }}>whole clause</em>
+                      : <><strong style={{ color: "#fff" }}>{r.entity}</strong>
+                        <span style={{ color: C.dim }}> → "{r.value}"</span></>}
+                {!isWhole && <span style={{
+                  fontSize: 9, marginLeft: 6, padding: "1px 5px", borderRadius: 3,
+                  background: C.border, color: C.dim, textTransform: "uppercase",
+                }}>{r.rawType}</span>}
+              </div>
+              {!isInert && (
+                <div style={{ display: "flex", gap: 6, flexWrap: "wrap", fontFamily: mono }}>
+                  <span style={{ fontSize: 10, padding: "1px 7px", borderRadius: 3, border: `1px solid ${opColor}`, color: opColor }}>{r.operator.name}</span>
+                  <span style={{ fontSize: 10, padding: "1px 7px", borderRadius: 3, border: `1px solid ${C.border}`, color: C.green }}>{r.terrain.name}</span>
+                  <span style={{ fontSize: 10, padding: "1px 7px", borderRadius: 3, border: `1px solid ${C.border}`, color: C.dim }}>{r.stance.name}</span>
+                  <span style={{ fontSize: 10, color: C.dim, fontStyle: "italic" }}>
+                    {r.operator.name}({r.terrain.name}, {r.stance.name})
+                  </span>
+                </div>
+              )}
+              {isWhole && r.needsReading && r.flagReasons && r.flagReasons.length > 0 && (
+                <div style={{ marginTop: 4, display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap", fontSize: 10 }}>
+                  <span style={{ color: C.amber }}>⚑</span>
+                  {r.flagReasons.map((reason, k) => (
+                    <span key={k} style={{
+                      padding: "1px 5px", borderRadius: 3, fontSize: 9,
+                      background: "rgba(251,191,36,0.12)", color: C.amber,
+                      textTransform: "uppercase", letterSpacing: "0.05em",
+                    }}>{reason}</span>
+                  ))}
+                  <span style={{ color: C.dim, fontStyle: "italic" }}>
+                    {r.mechanicalOp} — flagged for deep read
+                  </span>
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
     </div>
   );
 }
@@ -199,65 +289,9 @@ function ClauseDetail({ results }) {
   }
   return (
     <div style={{ marginTop: 8 }}>
-      {Object.keys(byClause).map(ci => {
-        const rows = byClause[ci];
-        const head = rows[0];
-        return (
-          <div key={ci} style={{
-            background: C.s2, border: `1px solid ${C.border}`, borderRadius: 6,
-            marginBottom: 8, overflow: "hidden",
-          }}>
-            <div style={{
-              padding: "6px 10px", fontSize: 9, textTransform: "uppercase",
-              letterSpacing: "0.1em", color: C.dim, borderBottom: `1px solid ${C.border}`,
-            }}>Clause {Number(ci) + 1}</div>
-            <div style={{
-              padding: "8px 10px", fontSize: 13, lineHeight: 1.5, color: C.text,
-              borderBottom: `1px solid ${C.border}`,
-            }}>{head.clause}</div>
-            <div style={{ padding: 8 }}>
-              {rows.map((r, i) => {
-                if (r.rawType === "chrome") {
-                  return <div key={i} style={{ fontSize: 11, fontStyle: "italic", color: C.dim, padding: 4 }}>chrome — skipped</div>;
-                }
-                const opColor = OP_COLORS[r.operator.name] || "#666";
-                const whole = r.rawType === "clause";
-                return (
-                  <div key={i} style={{
-                    padding: 6, marginBottom: 4, borderRadius: 4,
-                    background: whole ? "rgba(110,86,207,0.07)" : "rgba(255,255,255,0.02)",
-                  }}>
-                    <div style={{ fontSize: 11, marginBottom: 4 }}>
-                      {whole ? <em style={{ color: C.dim }}>whole clause</em>
-                        : <><strong style={{ color: "#fff" }}>{r.entity}</strong>
-                          <span style={{ color: C.dim }}> → "{r.value}"</span></>}
-                      {whole && r.needsReading && (
-                        <span style={{
-                          fontSize: 9, marginLeft: 6, padding: "1px 5px", borderRadius: 3,
-                          background: "rgba(251,191,36,0.15)", color: C.amber,
-                          border: `1px solid rgba(251,191,36,0.4)`,
-                        }}>flagged · {r.flagReason}</span>
-                      )}
-                      {!whole && <span style={{
-                        fontSize: 9, marginLeft: 6, padding: "1px 5px", borderRadius: 3,
-                        background: C.border, color: C.dim, textTransform: "uppercase",
-                      }}>{r.rawType}</span>}
-                    </div>
-                    <div style={{ display: "flex", gap: 6, flexWrap: "wrap", fontFamily: mono }}>
-                      <span style={{ fontSize: 10, padding: "1px 7px", borderRadius: 3, border: `1px solid ${opColor}`, color: opColor }}>{r.operator.name}</span>
-                      <span style={{ fontSize: 10, padding: "1px 7px", borderRadius: 3, border: `1px solid ${C.border}`, color: C.green }}>{r.terrain.name}</span>
-                      <span style={{ fontSize: 10, padding: "1px 7px", borderRadius: 3, border: `1px solid ${C.border}`, color: C.dim }}>{r.stance.name}</span>
-                      <span style={{ fontSize: 10, color: C.dim, fontStyle: "italic" }}>
-                        {r.operator.name}({r.terrain.name}, {r.stance.name})
-                      </span>
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
-          </div>
-        );
-      })}
+      {Object.keys(byClause).map(ci => (
+        <ClauseCard key={ci} ci={ci} rows={byClause[ci]} />
+      ))}
     </div>
   );
 }
@@ -279,7 +313,8 @@ function FramePanel({ register }) {
             borderRadius: 4, marginBottom: 5, fontSize: 12,
           }}>
             <div style={{ fontSize: 10, color: C.amber, fontWeight: 600 }}>
-              {f.id} {f.source === "llm" ? "· LLM" : ""} {f.trigger ? `· ${f.trigger}` : ""}
+              {f.id} {f.source === "llm" ? "· LLM" : ""}{" "}
+              {f.triggers ? `· ${f.triggers.map(t => t.type).join("+")}` : f.trigger ? `· ${f.trigger}` : ""}
             </div>
             <div style={{ margin: "3px 0", color: C.text }}>{f.text}</div>
             <div style={{ fontSize: 10, color: C.dim }}>
@@ -371,12 +406,18 @@ function AnalysisCard({ msg, onDeepRead, deepReadBusy, llmReady }) {
         {stats.newClaims} claim{stats.newClaims !== 1 ? "s" : ""} ·{" "}
         {stats.newEntities} new entit{stats.newEntities !== 1 ? "ies" : "y"} ·{" "}
         {register.frames.length} frame{register.frames.length !== 1 ? "s" : ""}
+        {stats.inertCount > 0 && (
+          <span style={{ color: C.dim }}> · {stats.inertCount} inert</span>
+        )}
+        {stats.revivedCount > 0 && (
+          <span style={{ color: C.green }}> · {stats.revivedCount} revived</span>
+        )}
         {flagCount > 0 && (
           <span style={{ color: C.amber }}> · {flagCount} flagged</span>
         )}
       </div>
 
-      <OpSummary opCounts={opCounts} total={stats.clauseRows} chromeCount={stats.chromeCount} />
+      <OpSummary opCounts={opCounts} total={stats.clauseRows} inertCount={stats.inertCount} />
 
       {stats.entityNames.length > 0 && (
         <div style={{ fontSize: 12, color: C.text, marginBottom: 8 }}>
@@ -565,7 +606,7 @@ export default function Chat2({ ollamaUrl, ollamaModels, browserModels }) {
 
   const ingestMaterial = useCallback(async (text, provenance) => {
     setStatus("Loading embedding model (first run downloads ~25 MB)…");
-    const { results, clauses, register } = await processText(text, setStatus);
+    const { results, clauses, register } = await processText(text, setStatus, graphRef.current);
 
     if (clauses.length === 0) {
       setMessages(m => [...m, {
@@ -582,18 +623,20 @@ export default function Chat2({ ollamaUrl, ollamaModels, browserModels }) {
     setGraphTick(t => t + 1);
 
     // Operator distribution over whole-clause rows.
-    const clauseRows = results.filter(r => r.rawType === "clause");
+    const clauseRows = results.filter(r => r.rawType === "clause" || r.rawType === "revived");
     const opCounts = {};
     for (const r of clauseRows) opCounts[r.operator.name] = (opCounts[r.operator.name] || 0) + 1;
-    const chromeCount = results.filter(r => r.rawType === "chrome").length;
+    const inertCount = results.filter(r => r.rawType === "inert").length;
+    const revivedCount = results.filter(r => r.rawType === "revived").length;
     const entityNames = [...new Set(results
-      .filter(r => r.rawType !== "chrome" && r.rawType !== "clause" && r.entity && !r.entity.startsWith("("))
+      .filter(r => r.rawType !== "inert" && r.rawType !== "clause" && r.rawType !== "revived"
+        && r.entity && !r.entity.startsWith("("))
       .map(r => r.entity))];
 
     setMessages(m => [...m, {
       id: nextId(), role: "assistant", kind: "analysis",
       provenance: provenance || "pasted text",
-      stats: { ...added, clauseRows: clauseRows.length, chromeCount, entityNames },
+      stats: { ...added, clauseRows: clauseRows.length, inertCount, revivedCount, entityNames },
       opCounts, results, clauses, register, clauseBase: base,
       triggerCount: register.triggerPoints?.length || 0,
       deepReadDone: false,
