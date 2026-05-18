@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef, useMemo } from "react";
 import Markdown from "./Markdown.jsx";
 import GroundedAnswer from "./Grounded.jsx";
+import Chat2 from "./Chat2.jsx";
 import { getBrowserEngine } from "./webllm.js";
 import {
   AUTO_MODEL, INTENTS,
@@ -121,7 +122,7 @@ function RoutingPill({ routing }) {
 /* ── Mode toggle — per-chat Regular / Memory switch ── */
 const MODE_TIPS = {
   regular: "Regular mode: the full conversation history is sent to the model every turn.",
-  memory: "Memory mode: every turn is distilled into a per-chat graph and fed back as a fixed-size context block — the prompt never grows with the conversation.",
+  memory: "Memory mode: sources are walked clause-by-clause through the EO classifier into a cumulative graph; questions are answered grounded in that graph.",
 };
 function ModeToggle({ mode, onChange, disabled }) {
   return (
@@ -2673,6 +2674,19 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
         onSearch={setQuery} onNew={newChat} onSelect={selectConvo} onDelete={deleteConvo}
       />
       <main style={{ flex: 1, display: "flex", flexDirection: "column", minWidth: 0 }}>
+        {mode === "memory" ? (
+          <>
+            <header style={{ display: "flex", alignItems: "center", gap: 10, padding: "12px 22px", borderBottom: `1px solid ${C.border}`, minHeight: 54 }}>
+              <div style={{ flex: 1, minWidth: 0, fontSize: 13.5, fontWeight: 600 }}>Memory</div>
+              <ModeToggle mode={mode} onChange={changeMode} disabled={busy} />
+            </header>
+            <div style={{ flex: 1, minHeight: 0 }}>
+              <Chat2 ollamaUrl={ollamaUrl} ollamaModels={ollamaModels}
+                browserModels={browserModels} ollamaUp={ollamaUp} />
+            </div>
+          </>
+        ) : (
+          <>
         <header style={{ display: "flex", alignItems: "center", gap: 10, padding: "12px 22px", borderBottom: `1px solid ${C.border}`, minHeight: 54 }}>
           <div style={{ flex: 1, minWidth: 0, fontSize: 13.5, fontWeight: 600, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
             {active ? active.title : "New chat"}
@@ -2777,6 +2791,8 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
           askWithDocs={askWithDocs} setAskWithDocs={setAskWithDocs} docCount={docCount}
           onPickDocs={() => setDocPickerOpen(true)}
         />
+          </>
+        )}
       </main>
       <LibraryModal
         open={libOpen} onClose={() => setLibOpen(false)}
