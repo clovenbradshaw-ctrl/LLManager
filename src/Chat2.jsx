@@ -120,6 +120,11 @@ function trimLoopTail(text) {
 
 const MAX_TOKENS = 1024;
 
+/* A chat post longer than this is material, not a question — it is
+   ingested as a source so the classifier can build a graph from it and
+   answers can be grounded in it, rather than stuffed into one prompt. */
+const LONG_POST_CHARS = 1500;
+
 /* Unified generation over both runtimes. Pass `onToken` to stream (it is
    called with the full text so far); omit it for a blocking call. A `format`
    JSON schema constrains Ollama output for the deep-read calls. */
@@ -835,6 +840,8 @@ export default function Chat2({ ollamaUrl, ollamaModels, browserModels }) {
     setMessages(m => [...m, {
       id: answerId, role: "assistant", kind: "answer",
       text: "", spans: uniqueSpans.slice(0, 12), streaming: true,
+      systemPrompt: system, userPrompt: prompt,
+      model: selectedModel.name, grounded: graphHasContent,
     }]);
     setStatus(graphHasContent ? "Generating grounded answer…" : "Generating answer…");
 
@@ -860,11 +867,21 @@ export default function Chat2({ ollamaUrl, ollamaModels, browserModels }) {
     const text = input.trim();
     if (!text || busy) return;
 
-    setMessages(m => [...m, { id: nextId(), role: "user", kind: "question", text }]);
     setInput("");
     setBusy(true);
     try {
-      await answerQuestion(text);
+      if (text.length > LONG_POST_CHARS) {
+        // Too long to be a question — treat the paste as a source. It is
+        // ingested into the graph so later questions are grounded in it.
+        setMessages(m => [...m, { id: nextId(), role: "user", kind: "source",
+          text, provenance: "pasted in chat" }]);
+        setMessages(m => [...m, { id: nextId(), role: "assistant", kind: "note",
+          text: "That was long, so it was added as a source — ask a question about it below." }]);
+        await ingestMaterial(text, "pasted in chat");
+      } else {
+        setMessages(m => [...m, { id: nextId(), role: "user", kind: "question", text }]);
+        await answerQuestion(text);
+      }
     } catch (e) {
       setMessages(m => [...m, { id: nextId(), role: "assistant", kind: "error",
         text: e?.message || String(e) }]);
@@ -872,7 +889,7 @@ export default function Chat2({ ollamaUrl, ollamaModels, browserModels }) {
     } finally {
       setBusy(false);
     }
-  }, [input, busy, answerQuestion]);
+  }, [input, busy, answerQuestion, ingestMaterial]);
 
   // ── Sources — ingest a file or pasted text, tagged with its provenance ──
   const addSource = useCallback(async (text, provenance) => {
@@ -953,14 +970,154 @@ export default function Chat2({ ollamaUrl, ollamaModels, browserModels }) {
     }
   }, [messages, deepReadBusy, selectedModel, ollamaUrl]);
 
+  /* Export the whole session — graph, entity definitions, every ingestion
+     pass, and each exchange with the exact system + user prompt sent to the
+     model — as a plain-text log the user can download. */
+  const exportLog = useCallback(() => {
+    const gr = graphRef.current;
+    const L = [];
+    const rule = (c = "─") => c.repeat(64);
+
+    L.push("LLM MANAGER — CHAT 2.0 SESSION LOG");
+    L.push(`Exported   ${new Date().toISOString()}`);
+    L.push(`Model      ${selectedModel ? selectedModel.name + (selectedModel.isBrowser ? " (in-browser)" : "") : "—"}`);
+    L.push(`Messages   ${messages.length}`);
+    L.push("");
+
+    L.push(rule("═"));
+    L.push("GRAPH — ENTITY DEFINITIONS");
+    L.push(rule("═"));
+    L.push(`${Object.keys(gr.entities).length} entities · ${gr.claims.length} claims · ${gr.clauses.length} clauses`);
+    L.push("");
+    for (const e of Object.values(gr.entities)) {
+      L.push(`◆ ${e.name}  [terrain: ${e.terrain}]`);
+      for (const c of e.claims) {
+        L.push(`    ${c.notation}  ${c.rawType}: ${c.value}`);
+        L.push(`      "${c.span}"  (clause ${c.clauseIndex})`);
+      }
+      for (const ed of e.edges || []) L.push(`    → ${ed.type}: ${ed.to}`);
+      L.push("");
+    }
+    if (gr.clauses.length) {
+      L.push(rule());
+      L.push("CLAUSES");
+      L.push(rule());
+      for (const c of gr.clauses) {
+        const op = c.functionalOp || c.mechanicalOp || "—";
+        L.push(`[${c.index}] (${op}${c.needsReading ? ", flagged" : ""}`
+          + `${c.salience != null ? `, salience ${c.salience.toFixed(2)}` : ""})`);
+        L.push(`    ${c.text}`);
+      }
+      L.push("");
+    }
+
+    L.push(rule("═"));
+    L.push("TRANSCRIPT");
+    L.push(rule("═"));
+    for (const m of messages) {
+      L.push("");
+      if (m.role === "user" && m.kind === "question") {
+        L.push(rule());
+        L.push("QUESTION");
+        L.push(rule());
+        L.push(m.text);
+      } else if (m.role === "user" && m.kind === "source") {
+        L.push(rule());
+        L.push(`SOURCE · ${m.provenance || "pasted text"}`);
+        L.push(rule());
+        L.push(m.text);
+      } else if (m.kind === "analysis") {
+        const s = m.stats || {};
+        L.push(rule());
+        L.push(`INGESTION · ${m.provenance}`);
+        L.push(rule());
+        L.push(`+${s.newEntities || 0} entities, +${s.newClaims || 0} claims, +${s.newClauses || 0} clauses`);
+        L.push(`clause rows: ${s.clauseRows}, inert: ${s.inertCount}, revived: ${s.revivedCount}`);
+        L.push(`operators: ${Object.entries(m.opCounts || {}).map(([k, v]) => `${k}×${v}`).join(", ") || "—"}`);
+        if (s.entityNames?.length) L.push(`entities found: ${s.entityNames.join(", ")}`);
+        L.push("");
+        L.push("clause classification:");
+        for (const r of m.results || []) {
+          if (r.rawType === "clause" || r.rawType === "revived" || r.rawType === "inert") {
+            L.push(`  [${m.clauseBase + r.clauseIndex}] ${r.rawType}`
+              + `${r.operator ? ` · ${r.operator.name}` : ""}`
+              + `${r.terrain ? `(${r.terrain.name}, ${r.stance?.name})` : ""}`);
+            L.push(`      ${(r.clause || "").trim()}`);
+          } else {
+            L.push(`  · ${r.entity} — ${r.rawType}: ${r.value}`
+              + `  [${r.operator?.name}(${r.terrain?.name}, ${r.stance?.name})]`);
+          }
+        }
+      } else if (m.kind === "answer") {
+        L.push(rule());
+        L.push("ANSWER"
+          + `${m.grounded ? " · grounded" : ""}`
+          + `${m.foldMode ? " · point-fold" : ""}`
+          + `${m.model ? ` · ${m.model}` : ""}`);
+        L.push(rule());
+        if (m.foldMode && m.foldEntity) {
+          L.push(`[FOLD] ${m.foldEntity} folded at clause ${m.foldAt + 1}`);
+          L.push("");
+        }
+        if (m.systemPrompt) {
+          L.push("[SYSTEM PROMPT]");
+          L.push(m.systemPrompt);
+          L.push("");
+        }
+        if (m.userPrompt) {
+          L.push("[USER PROMPT — exact dossier sent to the model]");
+          L.push(m.userPrompt);
+          L.push("");
+        }
+        const { thinking, answer } = splitThinking(m.text || "");
+        if (thinking) {
+          L.push("[MODEL REASONING]");
+          L.push(thinking);
+          L.push("");
+        }
+        L.push("[ANSWER]");
+        L.push(answer || m.text || "");
+        if (m.spans?.length) {
+          L.push("");
+          L.push(m.foldMode ? "[SITUATED FOLDS]" : "[RETRIEVED CONTEXT]");
+          for (const s of m.spans) {
+            L.push(`  · ${s.entity} / ${s.operator}: "${s.text}"`);
+          }
+        }
+      } else if (m.kind === "note") {
+        L.push(`NOTE: ${m.text}`);
+      } else if (m.kind === "error") {
+        L.push(`ERROR: ${m.text}`);
+      }
+    }
+
+    const blob = new Blob([L.join("\n")], { type: "text/plain" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `chat2-log-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-")}.txt`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }, [messages, selectedModel]);
+
   const g = graphRef.current;
 
   return (
     <div style={{ display: "flex", flexDirection: "column", height: "100%", background: C.bg, color: C.text }}>
       {/* Header */}
       <div style={{ padding: "12px 18px", borderBottom: `1px solid ${C.border}`, flexShrink: 0 }}>
-        <div style={{ fontSize: 14, fontWeight: 700 }}>
-          Chat 2.0 <span style={{ color: C.dim, fontWeight: 400, fontSize: 12 }}>· EO Classifier</span>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12 }}>
+          <div style={{ fontSize: 14, fontWeight: 700 }}>
+            Chat 2.0 <span style={{ color: C.dim, fontWeight: 400, fontSize: 12 }}>· EO Classifier</span>
+          </div>
+          <button
+            onClick={exportLog}
+            disabled={messages.length === 0}
+            style={btn(false, messages.length === 0)}
+            title="Download a full log — graph, ingestion, prompts and answers"
+          >
+            ⤓ Export log
+          </button>
         </div>
         <div style={{ fontSize: 11, fontFamily: mono, color: C.dim, marginTop: 3 }}>
           {graphTick >= 0 && (
