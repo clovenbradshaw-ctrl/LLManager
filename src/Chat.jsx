@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef, useMemo } from "react";
 import Markdown from "./Markdown.jsx";
+import GroundedAnswer from "./Grounded.jsx";
 import { getBrowserEngine } from "./webllm.js";
 import {
   AUTO_MODEL, INTENTS,
@@ -18,13 +19,14 @@ import {
   buildExtractPrompt, buildMutatePrompt, buildHypothesisPrompt, buildSkimPrompt,
   getHypothesisSystemPrompt, HYPOTHESIS_SKIM,
   parseEvents, detectMutationTriggers, userCorrectionTrigger, parseMutate, applyMutation, commitTier,
+  GROUNDED_SYSTEM, parseRuns,
 } from "./memory.js";
 import * as store from "./local-store.js";
 import {
   extractQuotedTitles, extractClause, clauseToEvents, shouldFallback,
   buildReviewPrompt, mergeReviewResults, parseReview, REVIEW_SCHEMA, REVIEW_SYSTEM,
 } from "./mechanical-extract.js";
-import { EVENT_SCHEMA, MUTATE_SCHEMA } from "./model-router.js";
+import { EVENT_SCHEMA, MUTATE_SCHEMA, RUNS_SCHEMA } from "./model-router.js";
 import { loadLibrary, saveLibrary, docStats } from "./library.js";
 import { ROLES, resolveRoleModel, loadRoleConfig, saveRoleConfig } from "./roles.js";
 import { logEvent, getEvents, clearEvents, subscribeEvents, installGlobalCapture } from "./event-log.js";
@@ -452,6 +454,11 @@ function MessageBubble({ msg, prevModel, onCopy, copied, onRerun, onFork, busy, 
   const showFeedback = msg.routing && !msg.routing.evalDone && !msg.routing.feedback
     && !msg.streaming && !msg.error && msg.content
     && installed.length > 1 && userMsgsAfter < 2;
+  const isGrounded = msg.grounded && Array.isArray(msg.runs) && Array.isArray(msg.spans);
+  const copyText = isGrounded
+    ? msg.content + "\n\nSources:\n" + msg.spans
+        .map(s => `${s.index}. "${s.text}" — ${s.source}`).join("\n")
+    : msg.content;
   return (
     <div style={{ padding: "10px 0 14px" }}>
       {switched && (
@@ -468,6 +475,14 @@ function MessageBubble({ msg, prevModel, onCopy, copied, onRerun, onFork, busy, 
         {msg.mem && <MemoryPill mem={msg.mem} />}
         {msg.elapsed && <span style={{ fontFamily: mono, fontSize: 10.5, color: C.dim }}>· {msg.elapsed}s</span>}
         {msg.tokens ? <span style={{ fontFamily: mono, fontSize: 10.5, color: C.dim }}>· {msg.tokens} tok</span> : null}
+        {isGrounded && (
+          <span style={{
+            display: "inline-flex", alignItems: "center", gap: 5,
+            padding: "2px 8px", borderRadius: 99,
+            background: "rgba(110,86,207,.12)", color: C.accent, border: `1px solid ${C.accent}55`,
+            fontSize: 10, fontFamily: mono, fontWeight: 600, letterSpacing: 0.3, textTransform: "uppercase",
+          }}>⬢ grounded · {msg.spans.length} span{msg.spans.length !== 1 ? "s" : ""}</span>
+        )}
         {msg.loadMs > 1500 && (
           <span title="The model was loaded from cold for this turn — most of the wait was loading weights, not generating. The next turn reuses the warm model."
             style={{ fontFamily: mono, fontSize: 10.5, color: C.orange }}>· {(msg.loadMs / 1000).toFixed(1)}s cold load</span>
@@ -477,9 +492,11 @@ function MessageBubble({ msg, prevModel, onCopy, copied, onRerun, onFork, busy, 
             style={{ fontFamily: mono, fontSize: 10.5, color: C.orange }}>· {msg.tps.toFixed(1)} tok/s ⚠</span>
         )}
       </div>
-      <div style={{ paddingLeft: 15, borderLeft: `1.5px solid ${C.border}` }}>
+      <div style={{ paddingLeft: 15, borderLeft: `1.5px solid ${isGrounded ? C.accent : C.border}` }}>
         {msg.error ? (
           <div style={{ fontSize: 13, color: C.red, whiteSpace: "pre-wrap" }}>{msg.content}</div>
+        ) : isGrounded ? (
+          <GroundedAnswer runs={msg.runs} spans={msg.spans} />
         ) : (
           <>
             <Reasoning text={msg.reasoning} streaming={msg.streaming && !msg.content} />
@@ -492,7 +509,7 @@ function MessageBubble({ msg, prevModel, onCopy, copied, onRerun, onFork, busy, 
       </div>
       {!msg.streaming && !msg.error && (
         <div style={{ display: "flex", gap: 4, paddingLeft: 13, marginTop: 8 }}>
-          <IconBtn onClick={() => onCopy(msg.content, msg.id)} active={copied === msg.id} title={copied === msg.id ? "Copied" : "Copy"} icon="copy" />
+          <IconBtn onClick={() => onCopy(copyText, msg.id)} active={copied === msg.id} title={copied === msg.id ? "Copied" : isGrounded ? "Copy answer + sources" : "Copy"} icon="copy" />
           <IconBtn onClick={() => onRerun(msg.id)} disabled={busy} title="Re-run" icon="refresh" />
           <IconBtn onClick={() => onFork(msg.id)} disabled={busy} title="Fork a new chat from here" icon="branch" />
         </div>
@@ -2345,7 +2362,7 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
     // "Ask with documents": an embedding-based pull of the most relevant
     // passages from this chat's opted-in library documents — but only from
     // documents not yet fully read; once read, the [CTX] graph carries them.
-    let docBlock = "", docSpans = [];
+    let docBlock = "", docSpans = [], groundedSpans = [];
     if (mode === "memory") {
       const docs = attachedDocs(existing);
       // Raw documents fit the window — inject them whole, every turn, so they
@@ -2372,6 +2389,7 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
         if (lk.text) {
           docBlock = docBlock ? `${docBlock}\n\n${lk.text}` : lk.text;
           docSpans = [...docSpans, ...lk.spans];
+          groundedSpans = lk.spans;
         }
         logEvent(lk.text ? "info" : "warn", "lookup",
           lk.text ? `Ask with documents — ${lk.spans.length} passage(s) from ${bigDocs.length} file(s)`
@@ -2405,6 +2423,19 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
       ];
     }
 
+    // "Ask with documents" with retrieved passages → a grounded answer: the
+    // model interprets and cites the numbered spans, the code presents them
+    // beside the response. A non-streaming structured call; spans are
+    // code-built, never minted by the model.
+    const grounded = mode === "memory" && groundedSpans.length > 0;
+    if (grounded) {
+      apiMessages = [
+        { role: "system", content: `${GROUNDED_SYSTEM}\n\n${docBlock}` },
+        { role: "user", content: text },
+      ];
+      if (memCtx) memCtx.spans = groundedSpans;
+    }
+
     const userMsg = { id: "u" + Date.now(), role: "user", content: text };
     const aId = "a" + Date.now();
     const placeholder = {
@@ -2435,7 +2466,27 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
 
     let finalContent;
     try {
-      finalContent = await runTurn(convoId, aId, chosenModel, apiMessages, { candidates, routingId: routing?.id });
+      if (grounded) {
+        const t0 = Date.now();
+        let runs;
+        try {
+          const raw = await chatOnce(chosenModel, apiMessages, RUNS_SCHEMA);
+          runs = parseRuns(raw, groundedSpans.length);
+        } catch (e) {
+          runs = [{ text: `(grounded answer failed: ${e.message})` }];
+        }
+        finalContent = runs.map(r => r.text).join("");
+        patchMsg(convoId, aId, {
+          streaming: false, grounded: true, runs, spans: groundedSpans,
+          content: finalContent,
+          elapsed: ((Date.now() - t0) / 1000).toFixed(1),
+          tokens: Math.round(finalContent.length / 4),
+        });
+        logEvent("info", "grounded",
+          `Grounded answer — ${runs.length} run(s) over ${groundedSpans.length} span(s)`);
+      } else {
+        finalContent = await runTurn(convoId, aId, chosenModel, apiMessages, { candidates, routingId: routing?.id });
+      }
     } finally {
       foregroundBusyRef.current = false;
     }
@@ -2534,6 +2585,7 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
       elapsed: undefined, tokens: undefined, routing: newRouting, mem: memBadge, prompt: apiMessages,
       dossierHash: active.mode === "memory" ? memDossierHash : undefined,
       spans: active.mode === "memory" ? memSpans : undefined,
+      grounded: undefined, runs: undefined,
     });
     // The user is waiting — pause the walk and background calls for the
     // duration of the re-run, draining anything already in flight.

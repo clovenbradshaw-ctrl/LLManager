@@ -226,6 +226,28 @@ export const OUTLINE_SCHEMA = {
   },
 };
 
+/* Grounded answer — the model's interpretation, split into cited segments.
+   Each run's text concatenates into the full answer; `cites` references the
+   numbered source spans the code supplied. */
+export const RUNS_SCHEMA = {
+  type: "object",
+  properties: {
+    runs: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: {
+          text: { type: "string" },
+          cites: { type: "array", items: { type: "integer" } },
+          ungrounded: { type: "boolean" },
+        },
+        required: ["text"],
+      },
+    },
+  },
+  required: ["runs"],
+};
+
 /* ── Task-specific callers ── */
 
 export const callRead = (a, sys, user) =>

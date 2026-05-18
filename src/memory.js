@@ -62,6 +62,30 @@ Never narrate your process. Just answer the question.`;
 export const READ_CASUAL = `You are a helpful assistant. Be concise and natural.
 Your messages are recorded in a knowledge graph.`;
 
+/* ═══ Prompt: GROUNDED (ask-with-documents) ═══
+   The model interprets; the code supplies and presents the evidence. The
+   numbered sources are the ONLY material it may draw facts from. */
+
+export const GROUNDED_SYSTEM = `Answer the question using ONLY the numbered sources in [DOCS].
+
+Return a single JSON object: { "runs": [ ... ] }.
+Each run is an object: { "text": "...", "cites": [n], "ungrounded": true }.
+
+Rules:
+- Concatenated, every run's "text" forms the full answer. Split the answer so
+  each factual claim is its own run, immediately followed by the source
+  number(s) that support it in "cites".
+- Every number in "cites" MUST be a source number shown in [DOCS]. Never
+  invent a number and never cite a source that is not listed.
+- Do NOT add facts that are not in the numbered sources. If the sources do
+  not answer the question, say so plainly.
+- If a sentence is your own inference and not supported by any source, put it
+  in its own run with "ungrounded": true and no "cites". Use this sparingly.
+- Paraphrase — do not quote the sources at length; the user sees them already.
+- Keep the whole answer concise. Never restate these instructions or tags.
+
+Return ONLY the JSON object. No prose outside it, no code fences.`;
+
 /* ═══ Prompt: EXTRACT (background) ═══ */
 
 export const EXTRACT_SYSTEM = `Extract new knowledge from this exchange as a JSON array.
@@ -712,12 +736,21 @@ export async function lookupDocuments(query, docs, { topK = 6 } = {}) {
   if (!top.length) top = dedup(scored).slice(0, topK); // general question — openings
 
   const lines = top.map((r, i) => `${i + 1}: [${r.confidence}] "${r.text.trim()}"`);
-  const spans = top.map(r => ({
-    entity: r.docTitle || r.docId,
-    kind: "passage",
-    text: r.text.length > 220 ? r.text.slice(0, 220) + "…" : r.text,
-    source: `${r.docTitle || "document"} · passage ${r.index + 1} [${r.confidence}]`,
-  }));
+  // Spans are first-class evidence — numbered, code-built, displayed beside the
+  // answer. The model cites these numbers; it never mints span text.
+  const spans = top.map((r, i) => {
+    const t = r.text.trim();
+    return {
+      index: i + 1,
+      entity: r.docTitle || r.docId,   // back-compat for PromptView
+      kind: "passage",
+      text: t.length > 400 ? t.slice(0, 400) + "…" : t,
+      source: r.docTitle || "document",
+      passageIndex: r.index,
+      status: r.confidence === "partial" ? "walking" : "sig",
+      similarity: r.score || 0,
+    };
+  });
   return { text: lines.length ? `[DOCS]\n${lines.join("\n")}\n[/DOCS]` : "", spans };
 }
 
@@ -1171,6 +1204,38 @@ export function parseEvents(out) {
     const parsed = JSON.parse(raw);
     return Array.isArray(parsed) ? parsed.filter(e => e && typeof e === "object" && e.op) : [];
   } catch { return []; }
+}
+
+/* Parse a grounded answer into runs. `spanCount` bounds valid citation
+   numbers — any cite outside [1, spanCount] is dropped. On malformed output
+   the whole reply collapses into one uncited run so the answer still renders. */
+export function parseRuns(out, spanCount = 0) {
+  const raw = typeof out === "string" ? out : "";
+  let obj = out;
+  if (typeof out === "string") {
+    let s = out.replace(/```json/gi, "").replace(/```/g, "").trim();
+    const a = s.indexOf("{"), b = s.lastIndexOf("}");
+    if (a !== -1 && b !== -1) s = s.slice(a, b + 1);
+    try { obj = JSON.parse(s); } catch { obj = null; }
+  }
+  const list = Array.isArray(obj) ? obj : (obj && Array.isArray(obj.runs) ? obj.runs : null);
+  if (!list) return [{ text: raw.trim() || "(no answer)" }];
+
+  const runs = [];
+  for (const r of list) {
+    if (!r || typeof r.text !== "string" || !r.text) continue;
+    const run = { text: r.text };
+    if (r.ungrounded === true) {
+      run.ungrounded = true;
+    } else if (Array.isArray(r.cites)) {
+      const cites = r.cites
+        .map(n => Number(n))
+        .filter(n => Number.isInteger(n) && n >= 1 && n <= spanCount);
+      if (cites.length) run.cites = cites;
+    }
+    runs.push(run);
+  }
+  return runs.length ? runs : [{ text: raw.trim() || "(no answer)" }];
 }
 
 export function parseMutate(out) {
