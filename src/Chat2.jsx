@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import {
   OPERATORS, OP_COLORS, processText, emptyGraph, appendToGraph,
-  buildDossier, runSecondPass, looksLikeQuestion, GROUNDED_SYSTEM,
+  buildDossier, runSecondPass, reclassifyFlags, looksLikeQuestion, GROUNDED_SYSTEM,
 } from "./eo-classifier.js";
 import { initRouter, callModel } from "./model-router.js";
 
@@ -90,6 +90,13 @@ function ClauseDetail({ results }) {
                       {whole ? <em style={{ color: C.dim }}>whole clause</em>
                         : <><strong style={{ color: "#fff" }}>{r.entity}</strong>
                           <span style={{ color: C.dim }}> → "{r.value}"</span></>}
+                      {whole && r.needsReading && (
+                        <span style={{
+                          fontSize: 9, marginLeft: 6, padding: "1px 5px", borderRadius: 3,
+                          background: "rgba(251,191,36,0.15)", color: C.amber,
+                          border: `1px solid rgba(251,191,36,0.4)`,
+                        }}>flagged · {r.flagReason}</span>
+                      )}
                       {!whole && <span style={{
                         fontSize: 9, marginLeft: 6, padding: "1px 5px", borderRadius: 3,
                         background: C.border, color: C.dim, textTransform: "uppercase",
@@ -147,10 +154,63 @@ function FramePanel({ register }) {
   );
 }
 
+/* ── Flagged clauses — where the surface and the function diverge ── */
+function FlagPanel({ register }) {
+  const flags = register.flags || [];
+  if (flags.length === 0) return null;
+  return (
+    <div style={{ marginTop: 8 }}>
+      <div style={{ fontSize: 9, textTransform: "uppercase", letterSpacing: "0.1em", color: C.amber, marginBottom: 6 }}>
+        Flagged clauses — {flags.length} · surface ≠ function
+      </div>
+      {flags.map((f, i) => {
+        const reclassified = f.functionalOp && f.functionalOp !== f.mechanicalOp;
+        const opColor = OP_COLORS[f.functionalOp] || OP_COLORS[f.mechanicalOp] || "#666";
+        return (
+          <div key={i} style={{
+            padding: "7px 9px", background: "rgba(251,191,36,0.06)",
+            border: `1px solid ${reclassified ? opColor : "rgba(251,191,36,0.4)"}`,
+            borderLeft: `3px solid ${reclassified ? opColor : C.amber}`,
+            borderRadius: 4, marginBottom: 5, fontSize: 12,
+          }}>
+            <div style={{ fontSize: 10, color: C.amber, fontFamily: mono }}>
+              c{f.clauseIndex + 1} · flagged: {f.reason}
+            </div>
+            <div style={{ margin: "3px 0", color: C.text, fontStyle: "italic" }}>
+              "{f.text.length > 140 ? f.text.slice(0, 140) + "…" : f.text}"
+            </div>
+            <div style={{ fontSize: 11, fontFamily: mono }}>
+              {reclassified ? (
+                <span>
+                  <s style={{ color: C.dim }}>{f.mechanicalOp}</s>
+                  <span style={{ color: C.dim }}> → </span>
+                  <strong style={{ color: opColor }}>{f.functionalOp}</strong>
+                  <span style={{ color: C.text }}>: {f.functionalReason}</span>
+                </span>
+              ) : f.functionalOp ? (
+                <span style={{ color: C.green }}>
+                  {f.mechanicalOp} holds — confirmed by reading
+                  {f.functionalReason ? `: ${f.functionalReason}` : ""}
+                </span>
+              ) : (
+                <span style={{ color: C.dim }}>
+                  {f.mechanicalOp} — the shadow flagged this; run a deep read to interpret
+                </span>
+              )}
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 /* ── A single analysis card (assistant turn for ingested material) ── */
 function AnalysisCard({ msg, onDeepRead, deepReadBusy, llmReady }) {
   const [showDetail, setShowDetail] = useState(false);
   const { stats, opCounts, results, register, triggerCount } = msg;
+  const flagCount = register.flags?.length || 0;
+  const canDeepRead = (triggerCount > 0 || flagCount > 0) && !msg.deepReadDone;
 
   return (
     <div style={{
@@ -165,6 +225,9 @@ function AnalysisCard({ msg, onDeepRead, deepReadBusy, llmReady }) {
         {stats.newClaims} claim{stats.newClaims !== 1 ? "s" : ""} ·{" "}
         {stats.newEntities} new entit{stats.newEntities !== 1 ? "ies" : "y"} ·{" "}
         {register.frames.length} frame{register.frames.length !== 1 ? "s" : ""}
+        {flagCount > 0 && (
+          <span style={{ color: C.amber }}> · {flagCount} flagged</span>
+        )}
       </div>
 
       <OpSummary opCounts={opCounts} total={stats.clauseRows} chromeCount={stats.chromeCount} />
@@ -177,19 +240,23 @@ function AnalysisCard({ msg, onDeepRead, deepReadBusy, llmReady }) {
       )}
 
       <FramePanel register={register} />
+      <FlagPanel register={register} />
 
       <div style={{ display: "flex", gap: 8, marginTop: 10, flexWrap: "wrap" }}>
         <button onClick={() => setShowDetail(s => !s)} style={btn(false)}>
           {showDetail ? "Hide" : "Show"} per-clause analysis
         </button>
-        {triggerCount > 0 && !msg.deepReadDone && (
+        {canDeepRead && (
           <button
             onClick={() => onDeepRead(msg.id)}
             disabled={deepReadBusy || !llmReady}
-            title={!llmReady ? "No model available" : `${triggerCount} trigger points`}
+            title={!llmReady ? "No model available"
+              : `${triggerCount} trigger point${triggerCount !== 1 ? "s" : ""}, ${flagCount} flagged clause${flagCount !== 1 ? "s" : ""}`}
             style={btn(true, deepReadBusy || !llmReady)}
           >
-            {deepReadBusy ? "Reading…" : `Deep read (${triggerCount} triggers)`}
+            {deepReadBusy ? "Reading…"
+              : `Deep read (${triggerCount} trigger${triggerCount !== 1 ? "s" : ""}` +
+                (flagCount > 0 ? `, ${flagCount} flag${flagCount !== 1 ? "s" : ""}` : "") + ")"}
           </button>
         )}
         {msg.deepReadDone && (
@@ -314,7 +381,7 @@ export default function Chat2({ ollamaUrl, ollamaUp }) {
     setMessages(m => [...m, {
       id: nextId(), role: "assistant", kind: "analysis",
       stats: { ...added, clauseRows: clauseRows.length, chromeCount, entityNames },
-      opCounts, results, clauses, register,
+      opCounts, results, clauses, register, clauseBase: base,
       triggerCount: register.triggerPoints?.length || 0,
       deepReadDone: false,
     }]);
@@ -391,9 +458,20 @@ export default function Chat2({ ollamaUrl, ollamaUp }) {
     try {
       await runSecondPass(msg.register, (sys, user) =>
         callModel(a, sys, user, { temperature: 0.4, maxTokens: 300 }), setStatus);
+      // Functional reclassification of the flagged clauses — the LLM names
+      // the operator that is actually functioning where surface and function
+      // diverged. The result is written back into the cumulative graph.
+      const changed = await reclassifyFlags(
+        msg.register, msg.clauses, graphRef.current, msg.clauseBase,
+        (sys, user) => callModel(a, sys, user, { temperature: 0.2, maxTokens: 200 }),
+        setStatus);
+      setGraphTick(t => t + 1);
       setMessages(m => m.map(x => x.id === msgId
         ? { ...x, register: { ...msg.register }, deepReadDone: true } : x));
-      setStatus("Deep read complete — LLM hypotheses added to the register.");
+      const flagCount = msg.register.flags?.length || 0;
+      setStatus(flagCount > 0
+        ? `Deep read complete — ${changed.length}/${flagCount} flagged clause${flagCount !== 1 ? "s" : ""} reclassified.`
+        : "Deep read complete — LLM hypotheses added to the register.");
     } catch (e) {
       setStatus(`Deep read failed: ${e?.message || e}`);
     } finally {

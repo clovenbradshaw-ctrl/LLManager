@@ -333,8 +333,9 @@ export async function processText(rawText, onProgress) {
   const clauses = splitClauses(text);
   const corefStack = [];
   const results = [];
-  const register = { frames: [], history: [], clauseVecs: [], triggerPoints: [] };
+  const register = { frames: [], history: [], clauseVecs: [], triggerPoints: [], flags: [] };
   let frameCounter = 0;
+  let prevWholeOp = null;
 
   for (let i = 0; i < clauses.length; i++) {
     if (onProgress) onProgress(`Reading clause ${i + 1}/${clauses.length}…`);
@@ -435,11 +436,37 @@ export async function processText(rawText, onProgress) {
       register.frames = register.frames.filter(f => f.strength > 0.1 || i - f.generatedAt < 4);
     }
 
+    // ── Flag clauses where the mechanical surface and the function diverge ──
+    // The centroid scores the surface; the trigger machinery (the "shadow")
+    // notices a mismatch the centroid cannot explain. A flag marks the spot
+    // for closer reading — no LLM call yet.
+    let flagReason = null;
+    if (frameEvents.some(e => e.type === "surprise") && op.name === "DEF") {
+      // DEF at a surprise point: a clause scoring as a plain factual report
+      // while it actually reframes everything.
+      flagReason = "surprise+DEF";
+    } else if (trigger && trigger.reason === "drift" && op.name === prevWholeOp) {
+      // The text drifted but the operator did not — surface held, function moved.
+      flagReason = "drift+static";
+    } else if (trigger && trigger.reason === "silence") {
+      // No frame is tracking this region; the classification may be unanchored.
+      flagReason = "silence";
+    }
+    if (flagReason) {
+      register.flags.push({
+        clauseIndex: i, mechanicalOp: op.name, reason: flagReason, text: clause,
+        functionalOp: null, functionalReason: null,
+      });
+      register.history.push({ event: "flagged", at: i, text: `${op.name} · ${flagReason}` });
+    }
+    prevWholeOp = op.name;
+
     results.push({
       clauseIndex: i, clause: extraction.clause, entity: "(whole clause)",
       value: clause.slice(0, 60) + (clause.length > 60 ? "…" : ""),
       span: clause, rawType: "clause", operator: op, terrain: te, stance: st,
       vec: clauseVec, frameEvents,
+      needsReading: !!flagReason, flagReason, mechanicalOp: op.name,
     });
   }
 
@@ -466,7 +493,11 @@ export async function appendToGraph(graph, results, clauseBase) {
     if (!seenClauses.has(r.clauseIndex) &&
         (r.rawType === "clause" || r.rawType === "chrome")) {
       if (!graph.clauses.some(c => c.index === globalIndex)) {
-        graph.clauses.push({ index: globalIndex, text: r.clause, vec: r.vec || null });
+        graph.clauses.push({
+          index: globalIndex, text: r.clause, vec: r.vec || null,
+          needsReading: !!r.needsReading, flagReason: r.flagReason || null,
+          mechanicalOp: r.mechanicalOp || null, functionalOp: null,
+        });
       }
       seenClauses.add(r.clauseIndex);
     }
@@ -648,6 +679,95 @@ export async function runSecondPass(register, llm, onProgress) {
     }
   }
   return llmFrames;
+}
+
+/* ── Functional reclassification — the LLM names what the centroid missed ──
+
+   The shadow found the flagged clauses; the LLM only looks at one in context
+   and says which operator is actually functioning. The disagreement is
+   written back into the graph and logged in the register as `reclassified`. */
+
+export const RECLASSIFY_SYSTEM =
+  `You are classifying the FUNCTION of a clause in context. The mechanical `
+  + `classifier tagged it by surface form, but a surprise, drift or silence `
+  + `signal suggests its function diverges from its surface. Given the `
+  + `surrounding text and the active interpretive frames, what is the clause `
+  + `actually DOING?\n\n`
+  + `The operators:\n`
+  + `NUL - noting absence or restraint\n`
+  + `SIG - directing attention to something notable\n`
+  + `INS - something new comes into existence\n`
+  + `SEG - drawing a boundary, separating\n`
+  + `CON - connecting across a boundary\n`
+  + `SYN - combining into an emergent whole\n`
+  + `DEF - stating a fact (may still be the correct call)\n`
+  + `EVA - rendering judgment, evaluating\n`
+  + `REC - replacing the entire frame of understanding\n\n`
+  + `Respond ONLY as JSON, no backticks: {"operator":"...","reason":"...under 20 words"}`;
+
+/* llm is an async (system, user) => string. clauses is the local clause
+   array for this block; graph/clauseBase are optional — when supplied, the
+   functional operator is written back onto the cumulative graph's clause. */
+export async function reclassifyFlags(register, clauses, graph, clauseBase, llm, onProgress) {
+  const flags = register.flags || [];
+  const validOps = new Set(Object.keys(OPERATORS));
+  const changed = [];
+
+  for (let f = 0; f < flags.length; f++) {
+    const flag = flags[f];
+    if (flag.functionalOp) continue; // already read
+    if (onProgress) onProgress(`Reading flagged clause ${f + 1}/${flags.length} [${flag.reason}]…`);
+
+    const ci = flag.clauseIndex;
+    const start = Math.max(0, ci - 2);
+    const end = Math.min(clauses.length - 1, ci + 2);
+    const context = [];
+    for (let c = start; c <= end; c++) context.push(`[${c + 1}] ${clauses[c]}`);
+
+    const frameContext = register.frames
+      .filter(fr => fr.generatedAt <= ci)
+      .map(fr => `- ${fr.text} (strength ${Math.round((fr.strength || 0) * 100)}%)`)
+      .join("\n") || "(no active frames)";
+
+    const user = `ACTIVE FRAMES:\n${frameContext}\n\nCONTEXT:\n${context.join("\n")}\n\n`
+      + `The mechanical classifier tagged the clause below as ${flag.mechanicalOp} `
+      + `(flagged: ${flag.reason}).\n\nCLASSIFY THIS CLAUSE:\n[${ci + 1}] "${flag.text}"`;
+
+    try {
+      const raw = await llm(RECLASSIFY_SYSTEM, user);
+      let parsed;
+      try { parsed = JSON.parse(String(raw).replace(/```json|```/g, "").trim()); }
+      catch { parsed = null; }
+      const operator = parsed && String(parsed.operator || "").trim().toUpperCase();
+      if (!operator || !validOps.has(operator)) {
+        register.history.push({ event: "reclassify_failed", at: ci, text: flag.mechanicalOp });
+        continue;
+      }
+      flag.functionalOp = operator;
+      flag.functionalReason = String(parsed.reason || "").trim();
+      flag.confirmed = operator === flag.mechanicalOp;
+
+      if (graph && Number.isFinite(clauseBase)) {
+        const gc = graph.clauses.find(c => c.index === clauseBase + ci);
+        if (gc) gc.functionalOp = operator;
+      }
+
+      if (flag.confirmed) {
+        register.history.push({
+          event: "flag_confirmed", at: ci, text: `${operator} holds — ${flag.functionalReason}`,
+        });
+      } else {
+        register.history.push({
+          event: "reclassified", at: ci, mechanicalOp: flag.mechanicalOp,
+          functionalOp: operator, text: flag.functionalReason,
+        });
+        changed.push(flag);
+      }
+    } catch (e) {
+      register.history.push({ event: "reclassify_failed", at: ci, text: e.message });
+    }
+  }
+  return changed;
 }
 
 /* ── Heuristic: is this message a question for the graph, or new material? ──
