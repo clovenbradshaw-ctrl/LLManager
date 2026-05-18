@@ -49,6 +49,12 @@ const MEM_MODEL_KEY = "llmanager.memorymodel.v1";
    background memory walk) reuse the loaded weights instead of paying it again. */
 const KEEP_ALIVE = "30m";
 
+/* Reasoning models emit a <think> block before answering. For a background
+   extraction or a schema-constrained call that reasoning is wasted work — and
+   when generation is also grammar-constrained to a JSON schema it slows
+   decoding by orders of magnitude. chatOnce disables it for these families. */
+const isThinkingModel = (m) => /qwen3|qwq|deepseek-r1|magistral|gpt-oss/i.test(m || "");
+
 /* Context quantization: cap the history so Ollama re-processes a smaller
    prompt. Keeps the most recent messages and truncates very long ones. */
 const HISTORY_MSG_LIMIT = 6;
@@ -1660,6 +1666,7 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
         body: JSON.stringify({
           model, messages: apiMessages, stream: false, keep_alive: KEEP_ALIVE,
           options: { temperature: 0 },
+          ...(isThinkingModel(model) ? { think: false } : {}),
           ...(format ? { format } : {}),
         }),
         signal: ctrl.signal,
