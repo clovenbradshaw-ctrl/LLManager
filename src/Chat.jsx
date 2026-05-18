@@ -55,6 +55,13 @@ const KEEP_ALIVE = "30m";
    decoding by orders of magnitude. chatOnce disables it for these families. */
 const isThinkingModel = (m) => /qwen3|qwq|deepseek-r1|magistral|gpt-oss/i.test(m || "");
 
+/* A model generating below this rate is mis-sized for the machine — surface a
+   hint instead of letting a 120s abort read as a silent failure. */
+const SLOW_TPS = 1;
+const slowModelNote = (model) =>
+  `${model} is generating far too slowly on this machine — calls will keep timing out. Switch to a smaller model (for example llama3.2:3b or qwen2.5:3b), and set a lighter background model so the document walk isn't run on a heavy model.`;
+
+
 /* Context quantization: cap the history so Ollama re-processes a smaller
    prompt. Keeps the most recent messages and truncates very long ones. */
 const HISTORY_MSG_LIMIT = 6;
@@ -498,6 +505,13 @@ function MessageBubble({ msg, prevModel, onCopy, copied, onRerun, onFork, busy, 
             style={{ fontFamily: mono, fontSize: 10.5, color: C.orange }}>· {msg.tps.toFixed(1)} tok/s ⚠</span>
         )}
       </div>
+      {msg.slow && (
+        <div style={{
+          margin: "0 0 8px", padding: "6px 10px", borderRadius: 6,
+          background: "rgba(214,140,69,.12)", border: `1px solid ${C.orange}55`,
+          fontFamily: mono, fontSize: 11, color: C.orange, lineHeight: 1.5,
+        }}>⚠ {msg.slow}</div>
+      )}
       <div style={{ paddingLeft: 15, borderLeft: `1.5px solid ${isGrounded ? C.accent : C.border}` }}>
         {msg.error ? (
           <div style={{ fontSize: 13, color: C.red, whiteSpace: "pre-wrap" }}>{msg.content}</div>
@@ -1730,6 +1744,7 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
           content, reasoning, streaming: false, error: false, model: useModel,
           elapsed: ((Date.now() - t0) / 1000).toFixed(1), tokens: usage.tokens,
           loadMs: usage.loadMs, tps: usage.tps,
+          slow: usage.tps != null && usage.tps < SLOW_TPS ? slowModelNote(useModel) : undefined,
         });
         setConvos(prev => prev.map(c => c.id === convoId ? { ...c, model: useModel, updatedAt: Date.now() } : c));
         abortRef.current = null;
@@ -2481,19 +2496,22 @@ export default function Chat({ ollamaUrl, ollamaModels = [], browserModels = [],
     try {
       if (grounded) {
         const t0 = Date.now();
-        let runs;
+        let runs, slow;
         try {
           const raw = await chatOnce(chosenModel, apiMessages, RUNS_SCHEMA);
           runs = parseRuns(raw, groundedSpans.length);
         } catch (e) {
           runs = [{ text: `(grounded answer failed: ${e.message})` }];
+          if (/did not respond within|aborted/i.test(e.message || "")) slow = slowModelNote(chosenModel);
         }
         finalContent = runs.map(r => r.text).join("");
+        const elapsedSec = (Date.now() - t0) / 1000;
+        const tokens = Math.round(finalContent.length / 4);
+        if (!slow && elapsedSec > 20 && tokens / elapsedSec < SLOW_TPS) slow = slowModelNote(chosenModel);
         patchMsg(convoId, aId, {
           streaming: false, grounded: true, runs, spans: groundedSpans,
-          content: finalContent,
-          elapsed: ((Date.now() - t0) / 1000).toFixed(1),
-          tokens: Math.round(finalContent.length / 4),
+          content: finalContent, slow,
+          elapsed: elapsedSec.toFixed(1), tokens,
         });
         logEvent("info", "grounded",
           `Grounded answer — ${runs.length} run(s) over ${groundedSpans.length} span(s)`);
