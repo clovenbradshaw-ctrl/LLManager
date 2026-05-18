@@ -84,6 +84,42 @@ const CHAT_SYSTEM =
   + "would help, mention that the user can add a source — a text file or pasted "
   + "text — to get answers grounded in their own material.";
 
+/* Small models love to fall into a loop — emitting the same phrase over
+   and over until the token budget runs out. Detect that by scanning the
+   tail of the text for a short unit that repeats back-to-back, so the
+   stream can be cut off instead of replaying nonsense. */
+function looksLooping(text) {
+  if (text.length < 120) return false;
+  const tail = text.slice(-800);
+  for (let unit = 3; unit <= 160 && unit * 4 <= tail.length; unit++) {
+    const seg = tail.slice(-unit);
+    if (!seg.trim()) continue;
+    let reps = 1, pos = tail.length - unit;
+    while (pos - unit >= 0 && tail.slice(pos - unit, pos) === seg) {
+      reps++; pos -= unit;
+      if (reps >= 4) return true;
+    }
+  }
+  return false;
+}
+
+/* Once a loop is cut off, the tail is still N copies of the repeated
+   unit — strip the extra copies so only one clean instance remains. */
+function trimLoopTail(text) {
+  for (let unit = 3; unit <= 160 && unit * 4 <= text.length; unit++) {
+    const seg = text.slice(-unit);
+    if (!seg.trim()) continue;
+    let reps = 1, pos = text.length - unit;
+    while (pos - unit >= 0 && text.slice(pos - unit, pos) === seg) {
+      reps++; pos -= unit;
+    }
+    if (reps >= 4) return text.slice(0, pos + unit).trimEnd();
+  }
+  return text;
+}
+
+const MAX_TOKENS = 1024;
+
 /* Unified generation over both runtimes. Pass `onToken` to stream (it is
    called with the full text so far); omit it for a blocking call. A `format`
    JSON schema constrains Ollama output for the deep-read calls. */
@@ -100,27 +136,41 @@ async function generate({ model, isBrowser, ollamaUrl, system, user, format, onT
         onToken(null, `Loading ${model} — ${report.text || pct + "%"}`);
       }
     });
+    const params = {
+      temperature: format ? 0 : 0.3,
+      frequency_penalty: 0.6, presence_penalty: 0.3,
+      max_tokens: MAX_TOKENS,
+    };
     if (onToken) {
       const chunks = await engine.chat.completions.create({
-        messages, stream: true, temperature: format ? 0 : 0.3,
+        messages, stream: true, ...params,
       });
       let raw = "";
       for await (const ch of chunks) {
         const d = ch.choices?.[0]?.delta?.content || "";
-        if (d) { raw += d; onToken(raw, null); }
+        if (d) {
+          raw += d;
+          onToken(raw, null);
+          if (looksLooping(raw)) {
+            await engine.interruptGenerate();
+            raw = trimLoopTail(raw);
+            break;
+          }
+        }
       }
       return raw;
     }
-    const reply = await engine.chat.completions.create({
-      messages, temperature: format ? 0 : 0.3,
-    });
+    const reply = await engine.chat.completions.create({ messages, ...params });
     return reply.choices?.[0]?.message?.content || "";
   }
 
   // Ollama
   const body = {
     model, messages, stream: !!onToken, keep_alive: "30m",
-    options: { temperature: format ? 0 : 0.3, num_ctx: 8192 },
+    options: {
+      temperature: format ? 0 : 0.3, num_ctx: 8192,
+      repeat_penalty: 1.3, num_predict: MAX_TOKENS,
+    },
   };
   if (format) body.format = format;
   const r = await fetch(`${ollamaUrl}/api/chat`, {
@@ -149,6 +199,7 @@ async function generate({ model, isBrowser, ollamaUrl, system, user, format, onT
       const c = j.message?.content || "";
       if (c) { raw += c; onToken(raw, null); }
     }
+    if (looksLooping(raw)) { await reader.cancel(); raw = trimLoopTail(raw); break; }
   }
   return raw;
 }
