@@ -291,8 +291,10 @@ function extractClause(text, corefStack) {
      philosophical text. They are imperfect seeds — false positives are fine,
      they exist to feed salience and the fold, not to be final readings. */
 
-  // Proposition: X is/are/was/were Y
-  const propP = /(?:^|[.;]\s+)([A-Z][^.;]{0,50}?)\s+(?:is|are|was|were)\s+((?:not\s+)?[^.;]{5,80}?)(?:\.|;|$)/gm;
+  // Proposition: X is/are/was/were Y — tolerant of punctuation right after
+  // the copula ("is, of course,"), lowercase clause starts, long predicates,
+  // and dash / relative-clause terminators, so essayistic prose is not missed.
+  const propP = /([A-Za-z][^.;()]{3,70}?)\s+(?:is|are|was|were)\b[\s,:]+(?:(?:of course|also|simply|merely|now|indeed|essentially|precisely|always|never|in fact)[,\s]+)?((?:not\s+|no\s+)?[^.;()]{5,110}?)(?=[.;)}\]]|\s+[-–—]\s+|,\s+(?:which|incidentally|and|but)\b|$)/gi;
   let pm;
   while ((pm = propP.exec(text)) !== null) {
     const subj = pm[1].trim();
@@ -300,6 +302,20 @@ function extractClause(text, corefStack) {
     if (pred.length > 4 && subj.length > 2) {
       claims.push({ entity: subj, value: pred, span: pm[0].trim(), rawType: "proposition" });
     }
+  }
+
+  // Predicative "X as the Y" — an appositive that asserts what X amounts to.
+  const asP = /\b([A-Za-z][\w'’-]+(?:\s+[\w'’-]+){0,4}?)\s+as\s+(the\s+[^.;()]{6,90}?)(?=[.;)}\]]|\s+[-–—]\s+|$)/gi;
+  let asm;
+  while ((asm = asP.exec(text)) !== null) {
+    claims.push({ entity: asm[1].trim(), value: asm[2].trim(), span: asm[0].trim(), rawType: "proposition" });
+  }
+
+  // Parenthetical gloss: Name (explanation) — the gloss defines the name.
+  const parenP = /([A-Za-z][\w'’-]+(?:\s+[\w'’-]+){0,5})\s*\(([^()]{8,220}?)[)}\]]/g;
+  let prm;
+  while ((prm = parenP.exec(text)) !== null) {
+    claims.push({ entity: prm[1].trim(), value: prm[2].trim(), span: prm[0].trim(), rawType: "definition" });
   }
 
   // Causal: X produces/creates/generates/leads to Y
