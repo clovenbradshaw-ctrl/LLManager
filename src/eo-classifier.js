@@ -1359,3 +1359,247 @@ export async function askAboutEntity(graph, entityName, question, upToClause, ll
     folds,
   };
 }
+
+/* ── The reading pass — the LLM reclassifies propositions on all three faces ──
+
+   The shadow tags every claim by centroid distance; that is a guess. The
+   reading pass sends the propositional claims to the LLM in context, in
+   batches, and gets back the operator, site and stance read in context — plus
+   a one-line function description of what the proposition does in the
+   argument. A Link-site reading names the two things it connects, and that
+   pair becomes its own graph node. */
+
+const PROPOSITIONAL = new Set(["proposition", "causal", "contrast", "definition"]);
+
+const READING_SYSTEM =
+  `Classify each proposition's FUNCTION in context. Return all three EO faces.\n\n`
+  + `OPERATOR (what kind of change):\n`
+  + `NUL(absence/restraint) SIG(flagging/attention) INS(creating new) `
+  + `SEG(boundary/separation) CON(connecting across) SYN(merging into whole) `
+  + `DEF(stating fact) EVA(judging) REC(replacing entire framework)\n\n`
+  + `SITE (where it occurs):\n`
+  + `Void(ambient/background) Entity(specific thing) Kind(type/category) `
+  + `Field(relational environment) Link(specific connection between two) `
+  + `Network(system/architecture) Atmosphere(interpretive mood) `
+  + `Lens(analytical frame) Paradigm(worldview)\n\n`
+  + `STANCE (how it resolves):\n`
+  + `Clearing(dissolving) Dissecting(analyzing) Unraveling(deconstructing) `
+  + `Tending(maintaining) Binding(connecting) Tracing(mapping patterns) `
+  + `Cultivating(producing conditions) Making(building) Composing(designing structures)\n\n`
+  + `If the site is Link, name the two linked things as "a::b" in the link field.\n\n`
+  + `Respond ONLY as a JSON array, no backticks:\n`
+  + `[{"n":1,"op":"EVA","site":"Link","stance":"Dissecting","link":"altman::trust",`
+  + `"fn":"judges whether Altman can be trusted with the mission"}]`;
+
+/* Read every still-unread propositional claim in the graph. llm is async
+   (system, user) => string; gate (optional) is awaited before each batch so
+   the pass yields the single LLM to a question. Returns an array of readings;
+   applyReadings writes them back into the graph. */
+export async function readPropositions(graph, register, llm, onProgress, gate) {
+  const props = graph.claims.filter(c => PROPOSITIONAL.has(c.rawType) && !c.fn);
+  if (props.length === 0) return [];
+
+  const batchSize = 8;
+  const batchCount = Math.ceil(props.length / batchSize);
+  const validOps = new Set(Object.keys(OPERATORS));
+  const validSites = new Set(Object.keys(TERRAINS));
+  const validStances = new Set(Object.keys(STANCES));
+  const activeFrames = (register && register.frames ? register.frames : [])
+    .filter(f => f.strength > 0.2).map(f => f.text).slice(0, 3).join("; ");
+  const readings = [];
+
+  for (let b = 0; b < batchCount; b++) {
+    const batch = props.slice(b * batchSize, b * batchSize + batchSize);
+    if (onProgress) onProgress(`Reading propositions — batch ${b + 1}/${batchCount}…`);
+    if (gate) await gate();
+
+    const body = batch.map((prop, i) => {
+      const prev = graph.clauses.find(c => c.index === prop.clauseIndex - 1);
+      const next = graph.clauses.find(c => c.index === prop.clauseIndex + 1);
+      let ctx = "";
+      if (prev) ctx += `[before] ${prev.text.slice(0, 100)}\n`;
+      ctx += `[${i + 1}] ${prop.span.slice(0, 150)}\n`;
+      ctx += `  mechanical: ${prop.operator}(${prop.site}, ${prop.resolution})`;
+      if (next) ctx += `\n[after] ${next.text.slice(0, 100)}`;
+      return ctx;
+    }).join("\n\n");
+    const user = (activeFrames ? `ACTIVE READING: ${activeFrames}\n\n` : "")
+      + `PROPOSITIONS:\n${body}`;
+
+    let parsed;
+    try {
+      const raw = await llm(READING_SYSTEM, user);
+      parsed = JSON.parse(String(raw).replace(/```json|```/g, "").trim());
+    } catch {
+      continue; // a failed batch leaves those propositions on the shadow tags
+    }
+    if (!Array.isArray(parsed)) continue;
+
+    for (const r of parsed) {
+      const prop = batch[(r.n || 0) - 1];
+      if (!prop) continue;
+      const readOp = validOps.has(String(r.op || "").toUpperCase())
+        ? String(r.op).toUpperCase() : prop.operator;
+      const readSite = validSites.has(r.site) ? r.site : prop.site;
+      const readStance = validStances.has(r.stance) ? r.stance : prop.resolution;
+      readings.push({
+        clauseIndex: prop.clauseIndex, span: prop.span, entity: prop.entity,
+        value: prop.value, rawType: prop.rawType,
+        mechanicalOp: prop.operator, mechanicalSite: prop.site, mechanicalStance: prop.resolution,
+        readOp, readSite, readStance,
+        readLink: r.link ? String(r.link).toLowerCase().trim() : null,
+        fn: String(r.fn || "").trim(),
+        reclassified: readOp !== prop.operator || readSite !== prop.site
+          || readStance !== prop.resolution,
+      });
+    }
+  }
+  return readings;
+}
+
+/* Write readings back into the graph: each claim is reclassified on all three
+   faces (the mechanical tags preserved for comparison), Link-site readings
+   spawn edge entities keyed to the pair, then every ledger is rebuilt. */
+export async function applyReadings(graph, readings) {
+  for (const reading of readings) {
+    const entity = graph.entities[String(reading.entity || "").toLowerCase()];
+    if (!entity) continue;
+    const claim = entity.claims.find(c =>
+      c.clauseIndex === reading.clauseIndex && c.span === reading.span);
+    if (!claim) continue;
+
+    claim.mechanicalOp = claim.mechanicalOp || claim.operator;
+    claim.mechanicalSite = claim.mechanicalSite || claim.site;
+    claim.mechanicalStance = claim.mechanicalStance || claim.resolution;
+    claim.operator = reading.readOp;
+    claim.site = reading.readSite;
+    claim.resolution = reading.readStance;
+    claim.fn = reading.fn || claim.fn || "";
+    claim.notation = `${reading.readOp}(${reading.readSite}, ${reading.readStance})`;
+    claim.reclassified = reading.reclassified;
+
+    // A Link reading describes a connection between two things — the pair is
+    // its own graph node, with the operator as the kind of link.
+    if (reading.readSite === "Link" && reading.readLink) {
+      const linkKey = reading.readLink;
+      const link = graph.entities[linkKey] || (graph.entities[linkKey] = {
+        name: reading.readLink, terrain: "Link", claims: [], edges: [],
+        mentions: [], ledgers: {}, isRelation: true, isLink: true,
+      });
+      if (!link.claims.some(c =>
+        c.clauseIndex === reading.clauseIndex && c.span === reading.span)) {
+        const linkClaim = {
+          entity: reading.readLink, value: reading.value, span: reading.span,
+          rawType: reading.rawType, operator: reading.readOp, site: "Link",
+          resolution: reading.readStance,
+          notation: `${reading.readOp}(Link, ${reading.readStance})`,
+          clauseIndex: reading.clauseIndex, fn: reading.fn,
+        };
+        link.claims.push(linkClaim);
+        graph.claims.push(linkClaim);
+        link.mentions.push(reading.clauseIndex);
+      }
+    }
+  }
+
+  rebuildLedgers(graph);
+
+  // Embed any newly spawned Link entities so they join retrieval.
+  for (const [key, entity] of Object.entries(graph.entities)) {
+    if (graph.vectors[key] || entity.claims.length === 0) continue;
+    const text = `${entity.name}: ${entity.claims.map(c => c.value).join(", ")}`;
+    graph.vectors[key] = await embed(text.slice(0, 200));
+  }
+}
+
+/* Rebuild every entity's per-site ledger from its current claims. The reading
+   pass moves claims between sites, so the commit history is regenerated from
+   scratch; the fold cache, keyed by claim-set hash, is dropped. */
+export function rebuildLedgers(graph) {
+  for (const entity of Object.values(graph.entities)) {
+    entity.ledgers = {};
+    const bySite = {};
+    for (const claim of entity.claims) {
+      (bySite[claim.site] = bySite[claim.site] || []).push(claim);
+    }
+    for (const [site, claims] of Object.entries(bySite)) {
+      claims.sort((a, b) => a.clauseIndex - b.clauseIndex);
+      const ledger = { commits: [], currentHash: null };
+      const accumulated = [];
+      for (const claim of claims) {
+        accumulated.push(claim);
+        const hash = siteHash(accumulated);
+        if (hash === ledger.currentHash) continue;
+        const opDistribution = {};
+        for (const c of accumulated) {
+          opDistribution[c.operator] = (opDistribution[c.operator] || 0) + 1;
+        }
+        const prevOps = ledger.commits.length
+          ? Object.keys(ledger.commits[ledger.commits.length - 1].opDistribution) : [];
+        const newOps = Object.keys(opDistribution).filter(op => !prevOps.includes(op));
+        ledger.commits.push({
+          hash, parent: ledger.currentHash, clauseIndex: claim.clauseIndex,
+          added: {
+            operator: claim.operator, rawType: claim.rawType,
+            value: claim.value, fn: claim.fn || null,
+          },
+          claimCount: accumulated.length, opDistribution, shift: newOps.length > 0,
+        });
+        ledger.currentHash = hash;
+      }
+      entity.ledgers[site] = ledger;
+    }
+  }
+  graph.folds = {}; // claims moved between sites — the fold cache is stale
+}
+
+/* ── Reading log — the graph as a per-entity, per-site commit log ──
+
+   For every entity and Link node, each site ledger is printed as a sequence
+   of commits — hash, clause, operator, the claim added — with SHIFT markers
+   where a new operator category entered, the operator trajectory, and the
+   cached fold. Below it, the aggregating hypotheses. This is the readable
+   record of how each understanding was first defined, redefined, and folded. */
+export function readingLog(graph) {
+  if (!graph) return "(no graph)";
+  const lines = [];
+  const ents = Object.entries(graph.entities || {})
+    .sort((a, b) => b[1].claims.length - a[1].claims.length);
+
+  lines.push(`READING LOG — ${ents.length} entities · ${(graph.claims || []).length} claims `
+    + `· ${(graph.clauses || []).length} clauses · ${(graph.frames || []).length} hypotheses`);
+  lines.push("=".repeat(70), "");
+
+  for (const [key, ent] of ents) {
+    const ledgers = ent.ledgers || {};
+    if (Object.keys(ledgers).length === 0) continue;
+    lines.push(ent.name + (ent.isLink ? "   [link]" : ent.isRelation ? "   [relation]" : ""));
+    for (const [site, ledger] of Object.entries(ledgers)) {
+      lines.push(`  ledger@${site}:`);
+      const traj = [];
+      for (const cm of ledger.commits) {
+        traj.push(cm.added.operator);
+        const val = String(cm.added.value || "").replace(/\s+/g, " ").slice(0, 72);
+        lines.push(`    ${cm.hash}  c${String(cm.clauseIndex + 1).padEnd(4)} `
+          + `${String(cm.added.operator).padEnd(3)}  ${cm.added.rawType}: ${val}`
+          + (cm.shift ? "   <- SHIFT" : ""));
+        if (cm.added.fn) lines.push(`           fn: ${cm.added.fn}`);
+      }
+      if (traj.length > 1) lines.push(`    trajectory: ${traj.join(" -> ")}`);
+      const fold = graph.folds && graph.folds[`${key}::${site}::${ledger.currentHash}`];
+      if (fold && fold.text) lines.push(`    fold: "${fold.text}"`);
+    }
+    lines.push("");
+  }
+
+  const frames = graph.frames || [];
+  if (frames.length) {
+    lines.push("HYPOTHESES (aggregating)", "-".repeat(70));
+    for (const f of frames) {
+      lines.push(`  [${f.source || "mechanical"}] c${(f.generatedAt || 0) + 1} `
+        + `· strength ${Math.round((f.strength || 0) * 100)}%`);
+      lines.push(`    ${f.text}`);
+    }
+  }
+  return lines.join("\n");
+}

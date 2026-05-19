@@ -2,7 +2,7 @@ import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import {
   OPERATORS, OP_COLORS, processText, emptyGraph, appendToGraph,
   buildDossier, runSecondPass, reclassifyFlags, GROUNDED_SYSTEM,
-  askAboutEntity, foldFrames,
+  askAboutEntity, foldFrames, readPropositions, applyReadings, readingLog,
 } from "./eo-classifier.js";
 import { getBrowserEngine } from "./webllm.js";
 import { logEvent } from "./event-log.js";
@@ -740,6 +740,19 @@ function GraphPanel({ graph, onClose }) {
     }, `llmanager-graph-${stamp}.json`);
   };
 
+  const exportLog = () => {
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+    const blob = new Blob([readingLog(graph)], { type: "text/plain" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `llmanager-reading-log-${stamp}.txt`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  };
+
   return (
     <div onClick={onClose} style={{
       position: "fixed", inset: 0, background: "rgba(0,0,0,.62)", zIndex: 60,
@@ -753,6 +766,7 @@ function GraphPanel({ graph, onClose }) {
         <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "13px 16px",
           borderBottom: `1px solid ${C.border}` }}>
           <div style={{ fontSize: 13, fontWeight: 700, flex: 1 }}>Graph objects</div>
+          <button onClick={exportLog} style={btn(false)}>Export log</button>
           <button onClick={exportGraph} style={btn(true)}>Export JSON</button>
           <button onClick={onClose} style={{ background: "transparent", border: "none",
             color: C.dim, cursor: "pointer", fontSize: 15 }}>✕</button>
@@ -1071,23 +1085,32 @@ export default function Chat2({ ollamaUrl, ollamaModels, browserModels }) {
       // The walk added LLM frames — re-fold them so point-based folds see the
       // aggregating hypotheses the deep read produced.
       foldFrames(graphRef.current, reg, analysisMsg.clauseBase);
+      // Reading pass — the LLM reclassifies extracted propositions on all
+      // three faces (operator, site, stance), spawns Link entities, and
+      // rebuilds the ledgers from the corrected classifications.
+      const readings = await readPropositions(graphRef.current, reg, llm, setStatus, walkGate);
+      if (readings.length) await applyReadings(graphRef.current, readings);
       setGraphTick(t => t + 1);
       setMessages(m => m.map(x => x.id === analysisMsg.id
         ? { ...x, register: { ...reg }, deepReadDone: true } : x));
 
       const newFrames = reg.frames.slice(framesBefore);
+      const reread = readings.filter(r => r.reclassified).length;
       logEvent("ok", "deep-read",
         `Deep reading walk complete — ${newFrames.length} aggregating hypothes`
-        + `${newFrames.length !== 1 ? "es" : "is"}, ${changed.length} reclassified`,
+        + `${newFrames.length !== 1 ? "es" : "is"}, ${changed.length} flag`
+        + ` reclassified, ${readings.length} proposition${readings.length !== 1 ? "s" : ""} read`
+        + ` (${reread} re-tagged)`,
         null,
         [
           ...newFrames.map(f => `hypothesis: ${f.text}`),
           ...changed.map(f => `reclassified c${f.clauseIndex + 1}: ${f.mechanicalOp} → ${f.functionalOp}`),
+          ...readings.filter(r => r.reclassified).map(r =>
+            `read c${r.clauseIndex + 1}: ${r.mechanicalOp}(${r.mechanicalSite}) → ${r.readOp}(${r.readSite})`),
         ]);
-      setStatus(flagCount > 0
-        ? `Deep reading walk complete — ${changed.length}/${flagCount} flagged clause`
-          + `${flagCount !== 1 ? "s" : ""} reclassified.`
-        : "Deep reading walk complete — aggregating hypotheses added to the register.");
+      setStatus(`Deep reading walk complete — ${newFrames.length} hypothes`
+        + `${newFrames.length !== 1 ? "es" : "is"}, ${changed.length} flag`
+        + ` reclassified, ${readings.length} proposition${readings.length !== 1 ? "s" : ""} read.`);
     } catch (e) {
       logEvent("error", "deep-read", `Deep reading walk failed: ${e?.message || e}`);
       setStatus(`Deep reading walk failed: ${e?.message || e}`);
