@@ -82,6 +82,52 @@ const CHAT_SYSTEM =
   + "would help, mention that the user can add a source — a text file or pasted "
   + "text — to get answers grounded in their own material.";
 
+/* Small models love to fall into a loop — emitting the same phrase over
+   and over until the token budget runs out. Detect that by scanning the
+   tail of the text for a short unit that repeats back-to-back, so the
+   stream can be cut off instead of replaying nonsense. */
+function looksLooping(text) {
+  if (text.length < 120) return false;
+  const tail = text.slice(-800);
+  for (let unit = 3; unit <= 160 && unit * 4 <= tail.length; unit++) {
+    const seg = tail.slice(-unit);
+    if (!seg.trim()) continue;
+    let reps = 1, pos = tail.length - unit;
+    while (pos - unit >= 0 && tail.slice(pos - unit, pos) === seg) {
+      reps++; pos -= unit;
+      if (reps >= 4) return true;
+    }
+  }
+  return false;
+}
+
+/* Once a loop is cut off, the tail is still N copies of the repeated
+   unit — strip the extra copies so only one clean instance remains. */
+function trimLoopTail(text) {
+  for (let unit = 3; unit <= 160 && unit * 4 <= text.length; unit++) {
+    const seg = text.slice(-unit);
+    if (!seg.trim()) continue;
+    let reps = 1, pos = text.length - unit;
+    while (pos - unit >= 0 && text.slice(pos - unit, pos) === seg) {
+      reps++; pos -= unit;
+    }
+    if (reps >= 4) return text.slice(0, pos + unit).trimEnd();
+  }
+  return text;
+}
+
+function ordinal(n) {
+  const s = ["th", "st", "nd", "rd"], v = n % 100;
+  return n + (s[(v - 20) % 10] || s[v] || s[0]);
+}
+
+const MAX_TOKENS = 1024;
+
+/* A chat post longer than this is material, not a question — it is
+   ingested as a source so the classifier can build a graph from it and
+   answers can be grounded in it, rather than stuffed into one prompt. */
+const LONG_POST_CHARS = 2500;
+
 /* Unified generation over both runtimes. Pass `onToken` to stream (it is
    called with the full text so far); omit it for a blocking call. A `format`
    JSON schema constrains Ollama output for the deep-read calls. */
@@ -98,27 +144,41 @@ async function generate({ model, isBrowser, ollamaUrl, system, user, format, onT
         onToken(null, `Loading ${model} — ${report.text || pct + "%"}`);
       }
     });
+    const params = {
+      temperature: format ? 0 : 0.3,
+      frequency_penalty: 0.6, presence_penalty: 0.3,
+      max_tokens: MAX_TOKENS,
+    };
     if (onToken) {
       const chunks = await engine.chat.completions.create({
-        messages, stream: true, temperature: format ? 0 : 0.3,
+        messages, stream: true, ...params,
       });
       let raw = "";
       for await (const ch of chunks) {
         const d = ch.choices?.[0]?.delta?.content || "";
-        if (d) { raw += d; onToken(raw, null); }
+        if (d) {
+          raw += d;
+          onToken(raw, null);
+          if (looksLooping(raw)) {
+            await engine.interruptGenerate();
+            raw = trimLoopTail(raw);
+            break;
+          }
+        }
       }
       return raw;
     }
-    const reply = await engine.chat.completions.create({
-      messages, temperature: format ? 0 : 0.3,
-    });
+    const reply = await engine.chat.completions.create({ messages, ...params });
     return reply.choices?.[0]?.message?.content || "";
   }
 
   // Ollama
   const body = {
     model, messages, stream: !!onToken, keep_alive: "30m",
-    options: { temperature: format ? 0 : 0.3, num_ctx: 8192 },
+    options: {
+      temperature: format ? 0 : 0.3, num_ctx: 8192,
+      repeat_penalty: 1.3, num_predict: MAX_TOKENS,
+    },
   };
   if (format) body.format = format;
   const r = await fetch(`${ollamaUrl}/api/chat`, {
@@ -147,8 +207,31 @@ async function generate({ model, isBrowser, ollamaUrl, system, user, format, onT
       const c = j.message?.content || "";
       if (c) { raw += c; onToken(raw, null); }
     }
+    if (looksLooping(raw)) { await reader.cancel(); raw = trimLoopTail(raw); break; }
   }
   return raw;
+}
+
+/* Split a model reply into its hidden <think> reasoning and the visible
+   answer. Reasoning models (Qwen3 and friends) emit a <think>…</think>
+   block that should not appear inline in the answer. Handles partial
+   streaming: an unclosed <think> means the model is still reasoning. */
+function splitThinking(text) {
+  if (!text) return { thinking: "", answer: "", reasoning: false };
+  let thinking = "", answer = text, reasoning = false;
+  const open = answer.indexOf("<think>");
+  if (open !== -1) {
+    const close = answer.indexOf("</think>", open);
+    if (close === -1) {
+      thinking = answer.slice(open + 7);
+      answer = answer.slice(0, open);
+      reasoning = true;
+    } else {
+      thinking = answer.slice(open + 7, close);
+      answer = answer.slice(0, open) + answer.slice(close + 8);
+    }
+  }
+  return { thinking: thinking.trim(), answer: answer.trim(), reasoning };
 }
 
 const mono = `'SF Mono','Menlo','Consolas',monospace`;
@@ -487,6 +570,9 @@ function FoldColumn({ msg }) {
 
 /* ── A grounded answer card ── */
 function AnswerCard({ msg }) {
+  const [showThink, setShowThink] = useState(false);
+  const { thinking, answer, reasoning } = splitThinking(msg.text);
+  const thinkingOnly = reasoning && !answer;
   return (
     <div style={{
       display: "grid",
@@ -503,8 +589,32 @@ function AnswerCard({ msg }) {
             ◆ {msg.foldEntity} folded at clause {msg.foldAt + 1}
           </div>
         )}
-        {msg.text || (msg.streaming ? <span style={{ color: C.dim }}>Generating…</span> : "")}
-        {msg.streaming && msg.text && <span style={{ color: C.accent }}>▍</span>}
+        {thinking && (
+          <div style={{ marginBottom: answer ? 8 : 0 }}>
+            <button
+              onClick={() => setShowThink(s => !s)}
+              style={{
+                fontSize: 10, fontFamily: mono, color: C.dim,
+                background: "none", border: "none", padding: 0, cursor: "pointer",
+              }}
+            >
+              {showThink ? "▾" : "▸"} {msg.streaming && thinkingOnly ? "Thinking…" : "Reasoning"}
+            </button>
+            {showThink && (
+              <div style={{
+                marginTop: 4, padding: "6px 8px", fontSize: 12, lineHeight: 1.55,
+                color: C.dim, background: C.s2, borderRadius: 4,
+                borderLeft: `2px solid ${C.border}`,
+              }}>
+                {thinking}
+              </div>
+            )}
+          </div>
+        )}
+        {answer || (msg.streaming
+          ? <span style={{ color: C.dim }}>{thinkingOnly ? "" : "Generating…"}</span>
+          : "")}
+        {msg.streaming && (answer || thinkingOnly) && <span style={{ color: C.accent }}>▍</span>}
       </div>
       {msg.foldMode ? (msg.spans.length >= 0 && <FoldColumn msg={msg} />) : (
       msg.spans.length > 0 && (
@@ -705,6 +815,7 @@ export default function Chat2({ ollamaUrl, ollamaModels, browserModels }) {
 
   const graphRef = useRef(emptyGraph());
   const clauseBaseRef = useRef(0);
+  const postSeqRef = useRef(0); // ordinal for chat posts ingested as sources
   const scrollRef = useRef(null);
   const [graphTick, setGraphTick] = useState(0); // forces stat re-render
   const [showGraph, setShowGraph] = useState(false);
@@ -865,7 +976,10 @@ export default function Chat2({ ollamaUrl, ollamaModels, browserModels }) {
       }
 
       system = GROUNDED_SYSTEM;
-      prompt = `${ctx}\n\n${docs}\n\n${convo}QUESTION: ${text}`;
+      prompt = `${ctx}\n\n${docs}\n\n`
+        + `[NOTE] The numbered [DOCS] passages are listed in the order they `
+        + `were received in this conversation — lower numbers came first.\n\n`
+        + `${convo}QUESTION: ${text}`;
     } else {
       // No sources yet — answer as an ordinary assistant.
       system = CHAT_SYSTEM;
@@ -876,6 +990,8 @@ export default function Chat2({ ollamaUrl, ollamaModels, browserModels }) {
     setMessages(m => [...m, {
       id: answerId, role: "assistant", kind: "answer",
       text: "", spans: uniqueSpans.slice(0, 12), streaming: true,
+      systemPrompt: system, userPrompt: prompt,
+      model: selectedModel.name, grounded: graphHasContent,
     }]);
     setStatus(graphHasContent ? "Generating grounded answer…" : "Generating answer…");
 
@@ -890,8 +1006,9 @@ export default function Chat2({ ollamaUrl, ollamaModels, browserModels }) {
       },
     });
 
+    const hasAnswer = splitThinking(final).answer || final.trim();
     setMessages(m => m.map(x => x.id === answerId
-      ? { ...x, text: final.trim() || "(the model returned an empty response)", streaming: false }
+      ? { ...x, text: hasAnswer ? final.trim() : "(the model returned an empty response)", streaming: false }
       : x));
     setStatus("Ready.");
   }, [messages, selectedModel, ollamaUrl, graphHasContent]);
@@ -900,11 +1017,26 @@ export default function Chat2({ ollamaUrl, ollamaModels, browserModels }) {
     const text = input.trim();
     if (!text || busy) return;
 
-    setMessages(m => [...m, { id: nextId(), role: "user", kind: "question", text }]);
     setInput("");
     setBusy(true);
     try {
-      await answerQuestion(text);
+      if (text.length > LONG_POST_CHARS) {
+        // Too long to be a question — treat the paste as a source. It is
+        // ingested into the graph so later questions are grounded in it.
+        // The ordinal records where in the conversation it arrived.
+        const seq = ++postSeqRef.current;
+        const prov = `chat post #${seq}`;
+        setMessages(m => [...m, { id: nextId(), role: "user", kind: "source",
+          text, provenance: prov }]);
+        setMessages(m => [...m, { id: nextId(), role: "assistant", kind: "note",
+          text: `That was long, so it was added as a source — "${prov}", `
+            + `the ${ordinal(seq)} post received in this conversation. `
+            + `Ask a question about it below.` }]);
+        await ingestMaterial(text, prov);
+      } else {
+        setMessages(m => [...m, { id: nextId(), role: "user", kind: "question", text }]);
+        await answerQuestion(text);
+      }
     } catch (e) {
       setMessages(m => [...m, { id: nextId(), role: "assistant", kind: "error",
         text: e?.message || String(e) }]);
@@ -912,7 +1044,7 @@ export default function Chat2({ ollamaUrl, ollamaModels, browserModels }) {
     } finally {
       setBusy(false);
     }
-  }, [input, busy, answerQuestion]);
+  }, [input, busy, answerQuestion, ingestMaterial]);
 
   // ── Sources — ingest a file or pasted text, tagged with its provenance ──
   const addSource = useCallback(async (text, provenance) => {
@@ -993,6 +1125,136 @@ export default function Chat2({ ollamaUrl, ollamaModels, browserModels }) {
     }
   }, [messages, deepReadBusy, selectedModel, ollamaUrl]);
 
+  /* Export the whole session — graph, entity definitions, every ingestion
+     pass, and each exchange with the exact system + user prompt sent to the
+     model — as a plain-text log the user can download. */
+  const exportLog = useCallback(() => {
+    const gr = graphRef.current;
+    const L = [];
+    const rule = (c = "─") => c.repeat(64);
+
+    L.push("LLM MANAGER — CHAT 2.0 SESSION LOG");
+    L.push(`Exported   ${new Date().toISOString()}`);
+    L.push(`Model      ${selectedModel ? selectedModel.name + (selectedModel.isBrowser ? " (in-browser)" : "") : "—"}`);
+    L.push(`Messages   ${messages.length}`);
+    L.push("");
+
+    L.push(rule("═"));
+    L.push("GRAPH — ENTITY DEFINITIONS");
+    L.push(rule("═"));
+    L.push(`${Object.keys(gr.entities).length} entities · ${gr.claims.length} claims · ${gr.clauses.length} clauses`);
+    L.push("");
+    for (const e of Object.values(gr.entities)) {
+      L.push(`◆ ${e.name}  [terrain: ${e.terrain}]`);
+      for (const c of e.claims) {
+        L.push(`    ${c.notation}  ${c.rawType}: ${c.value}`);
+        L.push(`      "${c.span}"  (clause ${c.clauseIndex})`);
+      }
+      for (const ed of e.edges || []) L.push(`    → ${ed.type}: ${ed.to}`);
+      L.push("");
+    }
+    if (gr.clauses.length) {
+      L.push(rule());
+      L.push("CLAUSES");
+      L.push(rule());
+      for (const c of gr.clauses) {
+        const op = c.functionalOp || c.mechanicalOp || "—";
+        L.push(`[${c.index}] (${op}${c.needsReading ? ", flagged" : ""}`
+          + `${c.salience != null ? `, salience ${c.salience.toFixed(2)}` : ""})`);
+        L.push(`    ${c.text}`);
+      }
+      L.push("");
+    }
+
+    L.push(rule("═"));
+    L.push("TRANSCRIPT");
+    L.push(rule("═"));
+    for (const m of messages) {
+      L.push("");
+      if (m.role === "user" && m.kind === "question") {
+        L.push(rule());
+        L.push("QUESTION");
+        L.push(rule());
+        L.push(m.text);
+      } else if (m.role === "user" && m.kind === "source") {
+        L.push(rule());
+        L.push(`SOURCE · ${m.provenance || "pasted text"}`);
+        L.push(rule());
+        L.push(m.text);
+      } else if (m.kind === "analysis") {
+        const s = m.stats || {};
+        L.push(rule());
+        L.push(`INGESTION · ${m.provenance}`);
+        L.push(rule());
+        L.push(`+${s.newEntities || 0} entities, +${s.newClaims || 0} claims, +${s.newClauses || 0} clauses`);
+        L.push(`clause rows: ${s.clauseRows}, inert: ${s.inertCount}, revived: ${s.revivedCount}`);
+        L.push(`operators: ${Object.entries(m.opCounts || {}).map(([k, v]) => `${k}×${v}`).join(", ") || "—"}`);
+        if (s.entityNames?.length) L.push(`entities found: ${s.entityNames.join(", ")}`);
+        L.push("");
+        L.push("clause classification:");
+        for (const r of m.results || []) {
+          if (r.rawType === "clause" || r.rawType === "revived" || r.rawType === "inert") {
+            L.push(`  [${m.clauseBase + r.clauseIndex}] ${r.rawType}`
+              + `${r.operator ? ` · ${r.operator.name}` : ""}`
+              + `${r.terrain ? `(${r.terrain.name}, ${r.stance?.name})` : ""}`);
+            L.push(`      ${(r.clause || "").trim()}`);
+          } else {
+            L.push(`  · ${r.entity} — ${r.rawType}: ${r.value}`
+              + `  [${r.operator?.name}(${r.terrain?.name}, ${r.stance?.name})]`);
+          }
+        }
+      } else if (m.kind === "answer") {
+        L.push(rule());
+        L.push("ANSWER"
+          + `${m.grounded ? " · grounded" : ""}`
+          + `${m.foldMode ? " · point-fold" : ""}`
+          + `${m.model ? ` · ${m.model}` : ""}`);
+        L.push(rule());
+        if (m.foldMode && m.foldEntity) {
+          L.push(`[FOLD] ${m.foldEntity} folded at clause ${m.foldAt + 1}`);
+          L.push("");
+        }
+        if (m.systemPrompt) {
+          L.push("[SYSTEM PROMPT]");
+          L.push(m.systemPrompt);
+          L.push("");
+        }
+        if (m.userPrompt) {
+          L.push("[USER PROMPT — exact dossier sent to the model]");
+          L.push(m.userPrompt);
+          L.push("");
+        }
+        const { thinking, answer } = splitThinking(m.text || "");
+        if (thinking) {
+          L.push("[MODEL REASONING]");
+          L.push(thinking);
+          L.push("");
+        }
+        L.push("[ANSWER]");
+        L.push(answer || m.text || "");
+        if (m.spans?.length) {
+          L.push("");
+          L.push(m.foldMode ? "[SITUATED FOLDS]" : "[RETRIEVED CONTEXT]");
+          for (const s of m.spans) {
+            L.push(`  · ${s.entity} / ${s.operator}: "${s.text}"`);
+          }
+        }
+      } else if (m.kind === "note") {
+        L.push(`NOTE: ${m.text}`);
+      } else if (m.kind === "error") {
+        L.push(`ERROR: ${m.text}`);
+      }
+    }
+
+    const blob = new Blob([L.join("\n")], { type: "text/plain" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `chat2-log-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-")}.txt`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }, [messages, selectedModel]);
+
   const g = graphRef.current;
 
   return (
@@ -1015,6 +1277,14 @@ export default function Chat2({ ollamaUrl, ollamaModels, browserModels }) {
               : <span style={{ color: C.orange }}>no model available — load one in the Chat or Settings tab</span>}
           </div>
         </div>
+        <button
+          onClick={exportLog}
+          disabled={messages.length === 0}
+          style={btn(false, messages.length === 0)}
+          title="Download a full log — graph, ingestion, prompts and answers"
+        >
+          ⤓ Export log
+        </button>
         <button onClick={() => setShowGraph(true)} style={btn(false)}>
           Graph ({Object.keys(g.entities).length})
         </button>
