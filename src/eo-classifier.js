@@ -193,8 +193,25 @@ function restoreAbbreviations(text) {
 
 function splitClauses(text) {
   text = protectAbbreviations(text);
-  return text.split(/(?<=[.!?;])\s+|(?<=:)\s+(?=[“"A-Z])/)
-    .map(c => restoreAbbreviations(c.trim()))
+  // Neutralise list-separator semicolons before splitting — a semicolon
+  // inside parentheses, or followed by a lowercase continuation, separates
+  // items in one long sentence (Žižek's catalogues), it is not a clause
+  // break. Masked semicolons are restored after the split.
+  let depth = 0, masked = "";
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if ("([{".includes(ch)) depth++;
+    else if (")]}".includes(ch)) depth = Math.max(0, depth - 1);
+    if (ch === ";") {
+      const after = text.slice(i + 1).match(/^\s*(\S)/);
+      const listSep = depth > 0 || (after && /[a-z]/.test(after[1]));
+      masked += listSep ? "" : ch;
+    } else {
+      masked += ch;
+    }
+  }
+  return masked.split(/(?<=[.!?;])\s+|(?<=:)\s+(?=[“"A-Z])/)
+    .map(c => restoreAbbreviations(c.replace(//g, ";").trim()))
     .filter(c => c.length > 8);
 }
 
@@ -220,6 +237,33 @@ function isRealName(name) {
   if (c.split(/\s+/).length === 1 &&
       ["President", "Mr", "Mrs", "Dr", "Image", "Credit", "Quiz"].includes(c)) return false;
   return true;
+}
+
+/* Reduce a person name to a comparison key — drop a leading honorific and any
+   trailing apposition ("Senator Jon Ossoff, Democrat of Georgia" → "jon
+   ossoff") so the graph does not fragment one person into several entities. */
+function canonicalName(name) {
+  let n = String(name || "").split(",")[0].trim();
+  n = n.replace(/^(?:mr|mrs|ms|dr|sen|rep|gov|prof|senator|president|representative|governor|professor)\.?\s+/i, "");
+  return n.trim().toLowerCase();
+}
+
+/* Attribute a quote to its speaker — a "NAME said" / "said NAME" pattern next
+   to the quote marks overrides the coreference-stack default, which is only a
+   guess (and wrong when several names crowd the clause). */
+function quoteSpeaker(text, start, end, corefStack) {
+  const verbs = "said|says|added|noted|wrote|told|recalled|argued|asked|explained|continued|insisted|warned";
+  const NAME = "[A-Z][\\w.'’-]+(?:\\s+[A-Z][\\w.'’-]+){0,2}";
+  const before = text.slice(Math.max(0, start - 70), start);
+  const after = text.slice(end, end + 70);
+  const m = before.match(new RegExp(`(${NAME})\\s*,?\\s*(?:${verbs})\\b[\\s,:—-]*$`))
+    || after.match(new RegExp(`^[\\s,:—-]*(?:${verbs})\\s+(${NAME})`))
+    || after.match(new RegExp(`^[\\s,:—-]*(${NAME})\\s+(?:${verbs})\\b`));
+  if (m) {
+    const name = cleanName(m[1]);
+    if (isRealName(name)) return name;
+  }
+  return corefStack[0] || "?";
 }
 
 /* ── Per-clause extraction (compromise NLP + domain regex) ── */
@@ -276,7 +320,8 @@ function extractClause(text, corefStack) {
   const quoteP = /[“"]([^"”]{10,})[”"]/g;
   let qm;
   while ((qm = quoteP.exec(text)) !== null) {
-    claims.push({ entity: corefStack[0] || "?", value: qm[1].trim(), span: qm[0].trim(), rawType: "quote" });
+    const speaker = quoteSpeaker(text, qm.index, qm.index + qm[0].length, corefStack);
+    claims.push({ entity: speaker, value: qm[1].trim(), span: qm[0].trim(), rawType: "quote" });
   }
 
   const ordP = /the\s+(youngest|oldest|eldest)\s+of\s+(\w+)/gi;
@@ -343,18 +388,14 @@ function extractClause(text, corefStack) {
     claims.push({ entity: dfm[1].trim(), value: dfm[2].trim(), span: dfm[0].trim(), rawType: "definition" });
   }
 
-  // Relationship-as-entity — when two known people co-occur in a clause, the
-  // clause says something about the LINK between them, not either alone. The
-  // pair gets its own graph key ("alice::bob", sorted) and accumulates claims
-  // at sites exactly like an entity, so it can be folded the same way.
-  if (people.length >= 2) {
-    const uniq = [...new Set(people)];
-    for (let pi = 0; pi < uniq.length; pi++) {
-      for (let pj = pi + 1; pj < uniq.length; pj++) {
-        const pair = [uniq[pi], uniq[pj]].sort().join("::");
-        claims.push({ entity: pair, value: text.slice(0, 80), span: text, rawType: "relation" });
-      }
-    }
+  // Relationship-as-entity — only when EXACTLY two people occupy the clause
+  // is it plausibly about the link between them. Three or more co-occurring
+  // names are a list, not a web of pairwise relationships; emitting every
+  // combination there is noise, so the pair link is skipped.
+  const uniqPeople = [...new Set(people)];
+  if (uniqPeople.length === 2) {
+    const pair = [uniqPeople[0], uniqPeople[1]].sort().join("::");
+    claims.push({ entity: pair, value: text.slice(0, 80), span: text, rawType: "relation" });
   }
 
   // Drop a `kind` claim repeated verbatim inside this clause — the same
@@ -787,19 +828,46 @@ export async function appendToGraph(graph, results, clauseBase, register) {
 
     if (r.rawType === "clause" || r.rawType === "revived" || r.rawType === "inert") continue;
 
-    const key = r.entity.toLowerCase();
+    let key = r.entity.toLowerCase();
     if (!key || key === "?" || key.startsWith("(")) continue;
+
+    // Entity resolution — fold honorific / apposition / surname variants of
+    // one person into a single node ("Mr. Ossoff", "Senator Jon Ossoff,
+    // Democrat of Georgia" and "Jon Ossoff" are the same entity). Skipped for
+    // relation/link keys, which are intentionally pair-keyed.
+    const incomingCanon = canonicalName(r.entity);
+    if (!graph.entities[key] && r.rawType !== "relation" && !key.includes("::")) {
+      for (const [ek, e] of Object.entries(graph.entities)) {
+        if (e.isRelation || e.isLink || ek.includes("::")) continue;
+        const ec = e._canon || canonicalName(e.name);
+        if (!incomingCanon || !ec) continue;
+        const ct = incomingCanon.split(/\s+/), et = ec.split(/\s+/);
+        const sameTail = ct[ct.length - 1] === et[et.length - 1];
+        if (ec === incomingCanon
+            || (sameTail && (ct.length === 1 || et.length === 1)
+                && Math.max(ct.length, et.length) <= 4)) {
+          key = ek;
+          break;
+        }
+      }
+    }
 
     if (!graph.entities[key]) {
       graph.entities[key] = {
-        name: r.entity, terrain: r.terrain.name, claims: [], edges: [],
-        mentions: [], ledgers: {}, isRelation: r.rawType === "relation",
+        name: r.entity.split(",")[0].trim() || r.entity, terrain: r.terrain.name,
+        claims: [], edges: [], mentions: [], ledgers: {},
+        isRelation: r.rawType === "relation", _canon: incomingCanon,
       };
       newEntities++;
     }
     const ent = graph.entities[key];
     if (!ent.mentions) ent.mentions = [];
     if (!ent.ledgers) ent.ledgers = {};
+    // On a merge, keep the fuller name — more tokens, no trailing apposition.
+    if (incomingCanon.split(/\s+/).length > String(ent._canon || "").split(/\s+/).length) {
+      ent.name = r.entity.split(",")[0].trim() || ent.name;
+      ent._canon = incomingCanon;
+    }
 
     // Every appearance is a mention — recorded even when the claim itself is
     // dropped as a duplicate, so a fold can see where an entity recurs.
