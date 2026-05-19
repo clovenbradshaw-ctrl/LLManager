@@ -269,7 +269,61 @@ function extractClause(text, corefStack) {
     claims.push({ entity: corefStack[0] || "?", value: om[0], span: om[0], rawType: "rank" });
   }
 
-  return { people, places, orgs, claims, clause: text };
+  /* ── Argumentative structure ──
+     The patterns above were built for news; these catch the propositions,
+     causal claims, contrasts and definitions that carry essayistic and
+     philosophical text. They are imperfect seeds — false positives are fine,
+     they exist to feed salience and the fold, not to be final readings. */
+
+  // Proposition: X is/are/was/were Y
+  const propP = /(?:^|[.;]\s+)([A-Z][^.;]{0,50}?)\s+(?:is|are|was|were)\s+((?:not\s+)?[^.;]{5,80}?)(?:\.|;|$)/gm;
+  let pm;
+  while ((pm = propP.exec(text)) !== null) {
+    const subj = pm[1].trim();
+    const pred = pm[2].trim();
+    if (pred.length > 4 && subj.length > 2) {
+      claims.push({ entity: subj, value: pred, span: pm[0].trim(), rawType: "proposition" });
+    }
+  }
+
+  // Causal: X produces/creates/generates/leads to Y
+  const causeP = /([A-Za-z][^.;]{0,50}?)\s+(?:produces?|creates?|generates?|enables?|leads?\s+to|results?\s+in|gives?\s+rise\s+to)\s+([^.;]{5,80}?)(?:\.|;|$)/gi;
+  let cm;
+  while ((cm = causeP.exec(text)) !== null) {
+    claims.push({ entity: cm[1].trim(), value: cm[2].trim(), span: cm[0].trim(), rawType: "causal" });
+  }
+
+  // Contrastive: not X but Y / X rather than Y
+  const contrastP = /(?:not\s+(.{3,40}?)\s+but\s+(.{3,40}?)(?:\.|;|,|$))|(?:(.{3,40}?)\s+rather\s+than\s+(.{3,40}?)(?:\.|;|,|$))/gi;
+  let crm;
+  while ((crm = contrastP.exec(text)) !== null) {
+    const neg = (crm[1] || crm[4] || "").trim();
+    const pos = (crm[2] || crm[3] || "").trim();
+    if (neg && pos) {
+      claims.push({ entity: pos, value: `not ${neg}`, span: crm[0].trim(), rawType: "contrast" });
+    }
+  }
+
+  // Definitional: X means Y / X refers to Y / by X I mean Y
+  const defnP = /(?:by\s+)?["“”']?([A-Za-z][^.;"“”]{2,40}?)["“”']?\s+(?:means?|refers?\s+to|signifies?|denotes?)\s+([^.;]{5,60}?)(?:\.|;|$)/gi;
+  let dfm;
+  while ((dfm = defnP.exec(text)) !== null) {
+    claims.push({ entity: dfm[1].trim(), value: dfm[2].trim(), span: dfm[0].trim(), rawType: "definition" });
+  }
+
+  // Drop a `kind` claim repeated verbatim inside this clause — the same
+  // entity+kind generated more than once carries no extra information.
+  const seenKinds = new Set();
+  const deduped = claims.filter(c => {
+    if (c.rawType === "kind") {
+      const k = `${c.entity}::${c.value}`;
+      if (seenKinds.has(k)) return false;
+      seenKinds.add(k);
+    }
+    return true;
+  });
+
+  return { people, places, orgs, claims: deduped, clause: text };
 }
 
 /* ── Hypothesis register — when to pause and read interpretively ──
@@ -279,7 +333,7 @@ function extractClause(text, corefStack) {
    volatility, a clause that surprises an active frame, a long silence with
    no frame confirmed, a dense claim cluster, or two frames converging.
    Returns an array of reason objects, or null. */
-function shouldRead(register, clauseIndex, clauseVec, extraction) {
+function shouldRead(register, clauseIndex, clauseVec, extraction, results) {
   const reasons = [];
 
   if (register.clauseVecs.length >= 8) {
@@ -320,6 +374,27 @@ function shouldRead(register, clauseIndex, clauseVec, extraction) {
     }
   }
 
+  // Operator mode shift — the dominant operator of the recent window differs
+  // from the window before it. This catches argumentative turns (DEF→EVA→REC)
+  // that leave the vocabulary, and so the embedding drift, unchanged.
+  if (register.clauseVecs.length >= 12 && Array.isArray(results)) {
+    const clauseResults = results.filter(r => r.rawType === "clause" && r.operator);
+    const recent = clauseResults.slice(-6);
+    const prior = clauseResults.slice(-12, -6);
+    if (recent.length >= 3 && prior.length >= 3) {
+      const mode = (arr) => {
+        const counts = {};
+        for (const r of arr) counts[r.operator.name] = (counts[r.operator.name] || 0) + 1;
+        return Object.entries(counts).sort((a, b) => b[1] - a[1])[0]?.[0];
+      };
+      const recentMode = mode(recent);
+      const priorMode = mode(prior);
+      if (recentMode && priorMode && recentMode !== priorMode) {
+        reasons.push({ type: "mode_shift", from: priorMode, to: recentMode });
+      }
+    }
+  }
+
   return reasons.length > 0 ? reasons : null;
 }
 
@@ -332,29 +407,45 @@ function shouldRead(register, clauseIndex, clauseVec, extraction) {
 function salience(clause, clauseVec, extraction, register, entityVecs) {
   let score = 0;
 
-  score += extraction.claims.length * 0.2;
+  // Propositional claims assert argumentative structure — they matter far
+  // more than bare entity tags. `kind` claims still count, just much less.
+  const propClaims = extraction.claims.filter(c =>
+    c.rawType === "proposition" || c.rawType === "causal"
+    || c.rawType === "contrast" || c.rawType === "definition"
+    || c.rawType === "quote");
+  const kindClaims = extraction.claims.filter(c => c.rawType === "kind");
+  score += propClaims.length * 0.25;
+  score += kindClaims.length * 0.05;
 
   let bestEntitySim = 0;
   for (const vec of entityVecs) {
     const sim = cosineSim(clauseVec, vec);
     if (sim > bestEntitySim) bestEntitySim = sim;
   }
-  score += bestEntitySim * 0.3;
+  score += bestEntitySim * 0.15; // reduced — proximity is weaker evidence
 
   let bestFrameSim = 0;
   for (const frame of register.frames) {
     const sim = cosineSim(clauseVec, frame.vec);
     if (sim > bestFrameSim) bestFrameSim = sim;
   }
-  score += bestFrameSim * 0.25;
+  score += bestFrameSim * 0.2;
 
   const words = clause.split(/\s+/);
-  const stops = /^(the|this|that|with|from|have|been|will|would|could|should|they|their|them|these|those|into|onto|upon|also|just|than|then|when|what|which|where|who|whom|whose|more|most|some|such|each|every|both|were|does|done|here|there|about|after|before|under|over|between|through|during|without|within|along|among|against|toward|across|behind|beyond|above|below)$/i;
+  const stops = /^(the|this|that|with|from|have|been|will|would|could|should|they|their|them|these|those|into|onto|upon|also|just|than|then|when|what|which|where|who|whom|whose|more|most|some|such|each|every|both|were|does|done|here|there|about|after|before|under|over|between|through|during|without|within|along|among|against|toward|across|behind|beyond|above|below|a|an|and|but|for|nor|yet|so|or|is|are|was|it|its|not)$/i;
   const contentWords = words.filter(w => w.length > 3 && !stops.test(w));
-  score += (words.length > 0 ? contentWords.length / words.length : 0) * 0.15;
+  const lexDensity = words.length > 0 ? contentWords.length / words.length : 0;
+  score += lexDensity * 0.15;
 
-  if (words.length < 6) score *= 0.5;
-  if (words.length < 3) score *= 0.3;
+  // Copula density — "is/are/means" assertions are structurally load-bearing
+  // in argumentative text even when the vocabulary is plain.
+  const copulas = (clause.match(/\b(?:is|are|was|were|means?|becomes?)\b/gi) || []).length;
+  score += Math.min(copulas * 0.08, 0.16);
+
+  // Short clauses are discounted but no longer killed — a five-word thesis
+  // ("Every mind is partial") must survive to be classified.
+  if (words.length < 6) score *= 0.6;
+  if (words.length < 3) score *= 0.4;
 
   return score;
 }
@@ -458,7 +549,7 @@ export async function processText(rawText, onProgress, priorGraph) {
     }
 
     // ── Trigger function replaces metronome ──
-    const triggers = shouldRead(register, i, clauseVec, extraction);
+    const triggers = shouldRead(register, i, clauseVec, extraction, results);
 
     if (triggers) {
       const recentVecs = register.clauseVecs.slice(-4).map(c => c.vec);
@@ -529,6 +620,7 @@ export async function processText(rawText, onProgress, priorGraph) {
       if (triggers.some(t => t.type === "surprise") && op.name === "DEF") flagReasons.push("surprise+DEF");
       if (triggers.some(t => t.type === "density")) flagReasons.push("density");
       if (triggers.some(t => t.type === "silence")) flagReasons.push("silence");
+      if (triggers.some(t => t.type === "mode_shift")) flagReasons.push("mode_shift");
     }
     const needsReading = flagReasons.length > 0;
     if (needsReading) {
@@ -653,8 +745,22 @@ export async function appendToGraph(graph, results, clauseBase, register) {
     if (!key || key === "?" || key.startsWith("(")) continue;
 
     if (!graph.entities[key]) {
-      graph.entities[key] = { name: r.entity, terrain: r.terrain.name, claims: [], edges: [] };
+      graph.entities[key] = { name: r.entity, terrain: r.terrain.name, claims: [], edges: [], mentions: [] };
       newEntities++;
+    }
+    const ent = graph.entities[key];
+    if (!ent.mentions) ent.mentions = [];
+
+    // Every appearance is a mention — recorded even when the claim itself is
+    // dropped as a duplicate, so a fold can see where an entity recurs.
+    ent.mentions.push(globalIndex);
+
+    // A `kind` claim ("X is a person") repeats at every mention and carries
+    // almost no information — keep only the first per entity+value. The
+    // mention list above still tracks where the entity appeared.
+    if (r.rawType === "kind"
+        && ent.claims.some(c => c.rawType === "kind" && c.value === r.value)) {
+      continue;
     }
 
     const claim = {
@@ -663,12 +769,17 @@ export async function appendToGraph(graph, results, clauseBase, register) {
       notation: `${r.operator.name}(${r.terrain.name}, ${r.stance.name})`,
       clauseIndex: globalIndex,
     };
-    graph.entities[key].claims.push(claim);
+    ent.claims.push(claim);
     graph.claims.push(claim);
 
     if (r.rawType === "relationship" && r.value) {
-      graph.entities[key].edges.push({ to: r.value, type: r.relType || "related", span: r.span });
+      ent.edges.push({ to: r.value, type: r.relType || "related", span: r.span });
     }
+  }
+
+  // Mentions sorted and de-duplicated across the whole graph.
+  for (const ent of Object.values(graph.entities)) {
+    if (ent.mentions) ent.mentions = [...new Set(ent.mentions)].sort((a, b) => a - b);
   }
 
   // Embed entities for retrieval.

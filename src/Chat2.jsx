@@ -163,6 +163,13 @@ let msgSeq = 0;
 const nextId = () => `m${++msgSeq}`;
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
+/* Flag-reason colours — a mode shift (an argumentative turn) reads green and
+   distinct from the surface≠function flags. */
+const FLAG_COLORS = {
+  "drift+static": C.amber, "surprise+DEF": C.red,
+  density: C.accent, silence: C.dim, mode_shift: C.green,
+};
+
 /* ── Operator distribution bar for an analysis card ── */
 function OpSummary({ opCounts, total, inertCount }) {
   return (
@@ -261,13 +268,18 @@ function ClauseCard({ ci, rows }) {
               {isWhole && r.needsReading && r.flagReasons && r.flagReasons.length > 0 && (
                 <div style={{ marginTop: 4, display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap", fontSize: 10 }}>
                   <span style={{ color: C.amber }}>⚑</span>
-                  {r.flagReasons.map((reason, k) => (
-                    <span key={k} style={{
-                      padding: "1px 5px", borderRadius: 3, fontSize: 9,
-                      background: "rgba(251,191,36,0.12)", color: C.amber,
-                      textTransform: "uppercase", letterSpacing: "0.05em",
-                    }}>{reason}</span>
-                  ))}
+                  {r.flagReasons.map((reason, k) => {
+                    const fc = FLAG_COLORS[reason] || C.amber;
+                    const ms = reason === "mode_shift" && r.triggers
+                      ? r.triggers.find(t => t.type === "mode_shift") : null;
+                    return (
+                      <span key={k} style={{
+                        padding: "1px 5px", borderRadius: 3, fontSize: 9,
+                        background: fc + "1f", color: fc,
+                        textTransform: "uppercase", letterSpacing: "0.05em",
+                      }}>{ms ? `mode_shift ${ms.from}→${ms.to}` : reason}</span>
+                    );
+                  })}
                   <span style={{ color: C.dim, fontStyle: "italic" }}>
                     {r.mechanicalOp} — flagged for deep read
                   </span>
