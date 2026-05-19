@@ -664,6 +664,10 @@ function GraphEntityRow({ entity }) {
         <span style={{ color: C.dim, fontSize: 10, width: 12, flexShrink: 0 }}>{open ? "▾" : "▸"}</span>
         <span style={{ flex: 1, fontSize: 12, fontWeight: 600, color: C.text, minWidth: 0,
           overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{entity.name}</span>
+        {entity.isRelation && (
+          <span style={{ fontSize: 9, fontFamily: mono, color: C.accent, flexShrink: 0,
+            border: `1px solid ${C.accent}`, borderRadius: 3, padding: "0 4px" }}>link</span>
+        )}
         <span style={{ fontSize: 10, fontFamily: mono, color: C.dim, flexShrink: 0 }}>{entity.terrain}</span>
         <span style={{ fontSize: 10, fontFamily: mono, color: C.accent, flexShrink: 0 }}>
           {entity.claims.length} claim{entity.claims.length !== 1 ? "s" : ""}
@@ -689,6 +693,25 @@ function GraphEntityRow({ entity }) {
           {entity.edges.map((e, i) => (
             <div key={`e${i}`} style={{ fontSize: 11, fontFamily: mono, color: C.dim }}>
               → {e.to} ({e.type})
+            </div>
+          ))}
+          {entity.ledgers && Object.entries(entity.ledgers).map(([site, ledger]) => (
+            <div key={`l${site}`} style={{ marginTop: 6 }}>
+              <div style={{ fontSize: 9, fontFamily: mono, color: C.green,
+                textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 2 }}>
+                @ {site} — ledger ({ledger.commits.length} commit{ledger.commits.length !== 1 ? "s" : ""})
+              </div>
+              {ledger.commits.map((cm, i) => (
+                <div key={i} style={{ fontSize: 10.5, fontFamily: mono, lineHeight: 1.5, color: C.dim }}>
+                  <span style={{ color: C.accent }}>{cm.hash}</span>{" "}
+                  c{cm.clauseIndex + 1}{" "}
+                  <span style={{ color: OP_COLORS[cm.added.operator] || C.dim }}>{cm.added.operator}</span>{" "}
+                  {cm.added.rawType}: <span style={{ color: C.text }}>
+                    {(cm.added.value || "").slice(0, 70)}
+                  </span>
+                  {cm.shift && <span style={{ color: C.green, fontWeight: 700 }}> ← SHIFT</span>}
+                </div>
+              ))}
             </div>
           ))}
         </div>
@@ -952,14 +975,18 @@ export default function Chat2({ ollamaUrl, ollamaModels, browserModels }) {
     const uniqueSpans = [];
 
     if (graphHasContent) {
-      setStatus("Retrieving context from the graph…");
+      setStatus("Folding entities into a situated dossier…");
       const retrievalQuery = (text.split(/\s+/).length < 5 && prevQ)
         ? `${prevQ.text} ${text}` : text;
 
-      // The dossier IS the context — entities, claims and passages pulled from
-      // the structured graph for this question. The chat history and the raw
-      // source text are never sent wholesale.
-      const { ctx, docs, spans } = await buildDossier(graphRef.current, retrievalQuery);
+      // The dossier IS the context — entities folded into situated readings,
+      // and passages pulled from the structured graph for this question. The
+      // chat history and the raw source text are never sent wholesale.
+      const dossierLlm = (sys, user) => generate({
+        model: selectedModel.name, isBrowser: selectedModel.isBrowser, ollamaUrl,
+        system: sys, user,
+      });
+      const { ctx, docs, spans } = await buildDossier(graphRef.current, retrievalQuery, dossierLlm);
 
       // Dedup spans for the evidence column.
       const seen = new Set();

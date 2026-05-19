@@ -109,6 +109,22 @@ function averageVec(vecs) {
   return avg;
 }
 
+/* Deterministic fingerprint of a claim sequence at one site. The fold is a
+   pure function of its claims, so identical claim sequences hash identically
+   and can share a cached fold — content-addressing for understanding. */
+export function siteHash(claims) {
+  const content = [...claims]
+    .sort((a, b) => a.clauseIndex - b.clauseIndex)
+    .map(c => `${c.clauseIndex}:${c.operator}:${c.rawType}:${c.value}`)
+    .join("|");
+  let hash = 0;
+  for (let i = 0; i < content.length; i++) {
+    hash = ((hash << 5) - hash) + content.charCodeAt(i);
+    hash |= 0;
+  }
+  return (hash >>> 0).toString(16).padStart(8, "0");
+}
+
 /* The text's own volatility — the average clause-to-clause drift, measured
    over sliding windows. The trigger machinery calibrates against this so a
    naturally restless text is not flagged on every clause. */
@@ -309,6 +325,20 @@ function extractClause(text, corefStack) {
   let dfm;
   while ((dfm = defnP.exec(text)) !== null) {
     claims.push({ entity: dfm[1].trim(), value: dfm[2].trim(), span: dfm[0].trim(), rawType: "definition" });
+  }
+
+  // Relationship-as-entity — when two known people co-occur in a clause, the
+  // clause says something about the LINK between them, not either alone. The
+  // pair gets its own graph key ("alice::bob", sorted) and accumulates claims
+  // at sites exactly like an entity, so it can be folded the same way.
+  if (people.length >= 2) {
+    const uniq = [...new Set(people)];
+    for (let pi = 0; pi < uniq.length; pi++) {
+      for (let pj = pi + 1; pj < uniq.length; pj++) {
+        const pair = [uniq[pi], uniq[pj]].sort().join("::");
+        claims.push({ entity: pair, value: text.slice(0, 80), span: text, rawType: "relation" });
+      }
+    }
   }
 
   // Drop a `kind` claim repeated verbatim inside this clause — the same
@@ -709,7 +739,7 @@ export async function processText(rawText, onProgress, priorGraph) {
 /* ── Cumulative graph — accumulates material across chat turns ── */
 
 export function emptyGraph() {
-  return { entities: {}, claims: [], clauses: [], vectors: {}, frames: [] };
+  return { entities: {}, claims: [], clauses: [], vectors: {}, frames: [], folds: {} };
 }
 
 /* Fold one processed block into the cumulative graph. clauseBase keeps
@@ -745,11 +775,15 @@ export async function appendToGraph(graph, results, clauseBase, register) {
     if (!key || key === "?" || key.startsWith("(")) continue;
 
     if (!graph.entities[key]) {
-      graph.entities[key] = { name: r.entity, terrain: r.terrain.name, claims: [], edges: [], mentions: [] };
+      graph.entities[key] = {
+        name: r.entity, terrain: r.terrain.name, claims: [], edges: [],
+        mentions: [], ledgers: {}, isRelation: r.rawType === "relation",
+      };
       newEntities++;
     }
     const ent = graph.entities[key];
     if (!ent.mentions) ent.mentions = [];
+    if (!ent.ledgers) ent.ledgers = {};
 
     // Every appearance is a mention — recorded even when the claim itself is
     // dropped as a duplicate, so a fold can see where an entity recurs.
@@ -771,6 +805,28 @@ export async function appendToGraph(graph, results, clauseBase, register) {
     };
     ent.claims.push(claim);
     graph.claims.push(claim);
+
+    // Site ledger — a git-like commit history of the claim sequence at this
+    // entity+site. Each commit fingerprints the state and records which claim
+    // arrived; `shift` marks where a new operator category enters, the visual
+    // signal that understanding is changing, not just accumulating.
+    const ledger = ent.ledgers[claim.site]
+      || (ent.ledgers[claim.site] = { commits: [], currentHash: null });
+    const siteClaims = ent.claims.filter(c => c.site === claim.site);
+    const newHash = siteHash(siteClaims);
+    if (newHash !== ledger.currentHash) {
+      const prevDist = ledger.commits.length
+        ? ledger.commits[ledger.commits.length - 1].opDistribution : {};
+      const opDistribution = {};
+      for (const c of siteClaims) opDistribution[c.operator] = (opDistribution[c.operator] || 0) + 1;
+      ledger.commits.push({
+        hash: newHash, parent: ledger.currentHash, clauseIndex: claim.clauseIndex,
+        added: { operator: claim.operator, rawType: claim.rawType, value: claim.value },
+        claimCount: siteClaims.length, opDistribution,
+        shift: Object.keys(opDistribution).some(op => !(op in prevDist)),
+      });
+      ledger.currentHash = newHash;
+    }
 
     if (r.rawType === "relationship" && r.value) {
       ent.edges.push({ to: r.value, type: r.relType || "related", span: r.span });
@@ -822,7 +878,7 @@ export function foldFrames(graph, register, clauseBase) {
 
 /* ── Retrieval — build a grounded dossier for a question ── */
 
-export async function buildDossier(graph, query) {
+export async function buildDossier(graph, query, llm) {
   if (!graph || Object.keys(graph.entities).length === 0) {
     return { ctx: "[CTX]\n(graph empty)\n[/CTX]", docs: "", spans: [] };
   }
@@ -845,19 +901,53 @@ export async function buildDossier(graph, query) {
   entityScored.sort((a, b) => b.sim - a.sim);
 
   const entityCount = Math.min(Math.max(3, Math.ceil(Object.keys(graph.entities).length / 4)), 8);
+  const topKeys = entityScored.slice(0, entityCount)
+    .map(s => s.key).filter(k => graph.entities[k]);
+
+  const lastClause = graph.clauses.length
+    ? graph.clauses.reduce((mx, c) => Math.max(mx, c.index), 0) : 0;
+
+  // Fold each top entity at every site it occupies — the dossier is built
+  // from situated readings, not raw tagged spans. Folds are cached by their
+  // claim-set hash, so repeat questions over the same graph cost nothing.
+  if (llm) {
+    const jobs = [];
+    for (const key of topKeys) {
+      const sites = [...new Set(graph.entities[key].claims.map(c => c.site))];
+      for (const site of sites) jobs.push(foldAt(graph, key, site, lastClause, llm));
+    }
+    if (jobs.length) await Promise.all(jobs);
+  }
+
   let ctx = "[CTX]\n";
-  for (const { key } of entityScored.slice(0, entityCount)) {
+  for (const key of topKeys) {
     const entity = graph.entities[key];
-    if (!entity) continue;
     let block = `E: ${entity.name} | ${entity.terrain}`;
-    for (const claim of entity.claims.slice(0, 4)) {
-      block += `\n  ${claim.operator}: ${claim.value} @"${claim.span.slice(0, 60)}"`;
-      spans.push({ text: claim.span, entity: entity.name, operator: claim.operator });
+    const sites = [...new Set(entity.claims.map(c => c.site))];
+    for (const site of sites) {
+      const windowed = entity.claims.filter(c => c.site === site && c.clauseIndex <= lastClause);
+      const fold = windowed.length >= 2
+        ? graph.folds?.[`${key}::${site}::${siteHash(windowed)}`] : null;
+      if (fold && fold.text) {
+        block += `\n  @${site}: ${fold.text}`;
+        spans.push({ text: fold.text, entity: entity.name, operator: `fold@${site}`, site });
+      } else {
+        // Fallback — raw top claims when the site is too thin to fold (or no
+        // model was supplied to compute folds).
+        for (const claim of windowed.slice(0, 2)) {
+          block += `\n  ${claim.operator}: ${claim.value} @"${claim.span.slice(0, 60)}"`;
+          spans.push({ text: claim.span, entity: entity.name, operator: claim.operator });
+        }
+      }
     }
     for (const edge of entity.edges.slice(0, 2)) block += `\n  → ${edge.to} (${edge.type})`;
     ctx += block + "\n\n";
   }
   ctx += "[/CTX]";
+
+  // Retrieval now matches against fold vectors — what the system understands
+  // about an entity, not just its name.
+  if (llm) updateEntityVectors(graph);
 
   // Score clauses (embedding + keyword overlap).
   const clauseScored = [];
@@ -1073,70 +1163,135 @@ export function looksLikeQuestion(text, graphHasContent) {
   return false;
 }
 
-/* ── Point-based entity folds — situated, windowed compression ──
+/* ── Point-based folds — situated, windowed compression ──
 
-   A fold is never global. foldEntityAt compresses an entity's claims UP TO a
-   point in the text, from one site's perspective, into a single committed
-   reading — what the entity SEEMS TO BE at that moment, not what it is overall.
+   A fold is never global. foldAt compresses the claims at one site of one
+   graph key UP TO a point in the text into a single committed reading — what
+   the subject SEEMS TO BE at that moment, not what it is overall.
 
-   The same entity folded at the same site at successive points is a reading
-   diary: the sequence is the arc. The same entity folded at different sites at
-   one point produces readings that disagree, and that disagreement is where
-   the text is doing its most interesting work.
+   The function does not care what it is folding. The key may name an entity,
+   a relationship ("plato::socrates"), a section, or the whole document — the
+   operation is the same: situated compression of accumulated claims into one
+   sentence, from one vantage point, at one moment.
+
+   Folded at successive points, the same key+site is a reading diary: the
+   sequence is the arc. Folded at different sites at one point, the readings
+   disagree, and that disagreement is where the text does its hardest work.
+
+   The fold is cached by the content hash of its claim set — a fold is a pure
+   function of its claims, so identical claim sequences share a fold and a
+   fold at an earlier window is never invalidated.
 
    llm is an async (system, user) => string. */
 
-export async function foldEntityAt(graph, entityKey, site, upToClause, llm) {
-  const entity = graph.entities[entityKey];
-  if (!entity) return null;
+export async function foldAt(graph, graphKey, site, upToClause, llm) {
+  const node = graph.entities[graphKey];
+  if (!node) return null;
 
   // Only claims from clauses up to this point, at this site.
-  const windowedClaims = entity.claims
-    .filter(c => c.clauseIndex <= upToClause && c.site === site);
-  if (windowedClaims.length < 2) return null;
+  const windowed = node.claims
+    .filter(c => c.clauseIndex <= upToClause && c.site === site)
+    .sort((a, b) => a.clauseIndex - b.clauseIndex);
+  if (windowed.length < 2) return null;
 
-  // The interpretive frames active at this point.
-  const activeFrames = (graph.frames || [])
-    .filter(f => f.generatedAt <= upToClause && f.strength > 0.2);
+  if (!graph.folds) graph.folds = {};
+  const hash = siteHash(windowed);
+  const cacheKey = `${graphKey}::${site}::${hash}`;
+  if (graph.folds[cacheKey]) return graph.folds[cacheKey];
 
-  // The ambient operator distribution up to this point.
+  // Operator distribution and chronological trajectory.
   const opDist = {};
-  for (const c of windowedClaims) {
+  const opTraj = [];
+  for (const c of windowed) {
     opDist[c.operator] = (opDist[c.operator] || 0) + 1;
+    opTraj.push(c.operator);
   }
 
-  const claimText = windowedClaims
-    .map(c => `[c${c.clauseIndex + 1}] ${c.operator}: ${c.value} @"${c.span.slice(0, 60)}"`)
+  // Rank claims for the prompt — propositions and causal claims carry the
+  // argument; `kind` claims carry almost nothing.
+  const weight = { proposition: 4, causal: 4, contrast: 3, definition: 3, quote: 2, relation: 3, kind: 0 };
+  const ranked = [...windowed].sort((a, b) => (weight[b.rawType] || 1) - (weight[a.rawType] || 1));
+  const claimText = ranked.slice(0, 8)
+    .map(c => `[c${c.clauseIndex + 1}] ${c.operator} ${c.rawType}: ${c.value}`)
     .join("\n");
 
+  // Interpretive frames active at this point that mention the subject.
+  const activeFrames = (graph.frames || [])
+    .filter(f => f.generatedAt <= upToClause && f.strength > 0.2
+      && f.text.toLowerCase().includes(String(node.name).toLowerCase()));
   const frameText = activeFrames.length > 0
-    ? "\nACTIVE READING:\n" + activeFrames.map(f => `- ${f.text}`).join("\n")
+    ? "\nACTIVE HYPOTHESES:\n" + activeFrames.map(f => `- ${f.text}`).join("\n")
     : "";
+  const trajText = opTraj.length > 3 ? `\nOPERATOR TRAJECTORY: ${opTraj.join(" → ")}` : "";
 
   const siteDefinition = TERRAINS[site] || site;
-
   const system =
-    "Compress these claims into understanding FROM THIS SITE'S PERSPECTIVE "
-    + "at this point in the text.\n\n"
+    "Compress these claims into one sentence of situated understanding, read "
+    + "FROM THIS SITE'S PERSPECTIVE at this point in the text.\n\n"
     + `SITE: ${site} — ${siteDefinition}\n\n`
-    + "This is what the text has revealed SO FAR. Not what is true overall. "
-    + "What does this entity SEEM TO BE at this moment, read from this site?\n\n"
-    + "One sentence. Under 30 words. Present tense. No hedging, no \"seems to\" "
-    + "— commit to the reading the text has earned at this point.";
+    + `This is what the text has established up to clause ${upToClause + 1}. Not `
+    + "what is true overall. What does the text THINK about this subject at this "
+    + "moment, from this vantage point?\n\n"
+    + "Attend to the operator trajectory: if the operators shifted (DEF→EVA→REC) "
+    + "the text's stance toward the subject is CHANGING — capture that motion, "
+    + "not just the final position.\n\n"
+    + "One sentence. Under 30 words. Present tense. Commit to the reading the "
+    + "text has earned at this point.";
 
-  const response = await llm(system, `Entity: ${entity.name}\n\n${claimText}${frameText}`);
+  const response = await llm(system,
+    `SUBJECT: ${node.name}\n\nCLAIMS:\n${claimText}${trajText}${frameText}`);
   const text = String(response || "").trim();
 
-  return {
-    entity: entity.name,
+  const fold = {
+    entity: graphKey,
+    name: node.name,
     site,
     atClause: upToClause,
+    hash,
     text,
     vec: text ? await embed(text) : null,
-    claimCount: windowedClaims.length,
-    sources: windowedClaims.map(c => c.clauseIndex),
+    claims: windowed.map(c => c.clauseIndex),
+    claimCount: windowed.length,
+    mentions: (node.mentions || []).filter(m => m <= upToClause),
     opDistribution: opDist,
+    opTrajectory: opTraj,
+    isRelation: !!node.isRelation,
+    cachedAt: Date.now(),
   };
+  graph.folds[cacheKey] = fold;
+  return fold;
+}
+
+/* Compare an entity's situated reading at two points — two folds, two
+   vectors, one cosine distance. The distance is how much the understanding
+   changed; the texts are how; the operator distributions are why. */
+export async function foldComparison(graph, graphKey, site, clauseA, clauseB, llm) {
+  const foldA = await foldAt(graph, graphKey, site, clauseA, llm);
+  const foldB = await foldAt(graph, graphKey, site, clauseB, llm);
+  if (!foldA || !foldB) return null;
+  return {
+    entity: graphKey, site,
+    early: { at: clauseA, text: foldA.text, opDistribution: foldA.opDistribution },
+    late: { at: clauseB, text: foldB.text, opDistribution: foldB.opDistribution },
+    drift: foldA.vec && foldB.vec ? 1 - cosineSim(foldA.vec, foldB.vec) : null,
+  };
+}
+
+/* Overwrite each entity's retrieval vector with the fold vector of its
+   most-occupied site, when one is cached. Association retrieval then matches
+   against what the system UNDERSTANDS about an entity, not just its name and
+   raw claim text. Call after a fold pass (e.g. at the end of buildDossier). */
+export function updateEntityVectors(graph) {
+  if (!graph.folds) return;
+  for (const [key, entity] of Object.entries(graph.entities)) {
+    const siteCounts = {};
+    for (const c of entity.claims) siteCounts[c.site] = (siteCounts[c.site] || 0) + 1;
+    const topSite = Object.entries(siteCounts).sort((a, b) => b[1] - a[1])[0]?.[0];
+    if (!topSite) continue;
+    const siteClaims = entity.claims.filter(c => c.site === topSite);
+    const fold = graph.folds[`${key}::${topSite}::${siteHash(siteClaims)}`];
+    if (fold && fold.vec) graph.vectors[key] = fold.vec;
+  }
 }
 
 /* Answer a question about one entity from its situated folds at a point in the
@@ -1158,7 +1313,7 @@ export async function askAboutEntity(graph, entityName, question, upToClause, ll
     onProgress(`Folding ${entity.name} at ${occupiedSites.length} site${occupiedSites.length !== 1 ? "s" : ""}…`);
   }
   const folds = (await Promise.all(
-    occupiedSites.map(site => foldEntityAt(graph, entityKey, site, upToClause, llm))
+    occupiedSites.map(site => foldAt(graph, entityKey, site, upToClause, llm))
   )).filter(Boolean);
 
   const entityHypotheses = (graph.frames || [])
